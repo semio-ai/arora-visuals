@@ -21,7 +21,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::math::Affine3A;
 use bevy::mesh::morph::{MorphAttributes, MorphWeights};
 use bevy::mesh::{Indices, PrimitiveTopology};
-use bevy::picking::events::{Pointer, Press};
+use bevy::picking::events::PointerPress;
 use bevy::picking::mesh_picking::ray_cast::{ray_mesh_intersection, Backfaces};
 use bevy::prelude::*;
 
@@ -43,7 +43,7 @@ pub struct Picks(pub Vec<Picked>);
 
 /// Resolve a press to a pick or a miss ([module docs](self)).
 pub fn on_press(
-    press: On<Pointer<Press>>,
+    press: On<PointerPress>,
     instances: Query<&EntityInstance, Without<Superseded>>,
     cameras: Query<(&Camera, &GlobalTransform)>,
     elements: ElementMeshes,
@@ -53,7 +53,7 @@ pub fn on_press(
     if press.entity != press.original_event_target() {
         return;
     }
-    let position = press.pointer_location.position;
+    let position = press.pointer.position;
     let mut under: Vec<(&EntityInstance, &Camera, &GlobalTransform)> = instances
         .iter()
         .filter(|instance| instance.ready)

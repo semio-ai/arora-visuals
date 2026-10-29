@@ -19,7 +19,11 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, ensure, Context, Result};
+// Without anyhow's `Context`: Bevy's prelude carries a `ContextExt` offering the
+// same `context`/`with_context`, so a bare call here is ambiguous. Add context
+// through `anyhow::Error::new(e).context(..)`, which is inherent rather than a
+// trait method and keeps the source chain the formatted form would flatten.
+use anyhow::{bail, ensure, Result};
 use bevy::app::{PluginsState, ScheduleRunnerPlugin};
 use bevy::asset::{AssetMetaCheck, AssetPlugin};
 use bevy::image::TextureFormatPixelInfo;
@@ -166,11 +170,43 @@ fn frame_to_image(data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
     for row in data.chunks_exact(padded_row) {
         pixels.extend_from_slice(&row[..unpadded_row]);
     }
-    RgbaImage::from_raw(width, height, pixels).context("readback buffer mismatch")
+    RgbaImage::from_raw(width, height, pixels)
+        .ok_or_else(|| anyhow::anyhow!("readback buffer mismatch"))
 }
 
 /// Saves a captured frame as PNG.
 pub fn save_png(img: &RgbaImage, path: &std::path::Path) -> Result<()> {
-    img.save_with_format(path, image::ImageFormat::Png)
-        .with_context(|| format!("failed to save PNG to {}", path.display()))
+    img.save_with_format(path, image::ImageFormat::Png).map_err(|e| {
+        anyhow::Error::new(e).context(format!("failed to save PNG to {}", path.display()))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A caller deciding what to do about a failed save needs the cause, not a
+    /// sentence containing it: whether the disk is full, the directory is gone
+    /// or the path is unwritable are different situations with different
+    /// answers. Formatting the error into a message reads the same and leaves
+    /// nothing to branch on, so the chain is asserted rather than assumed.
+    #[test]
+    fn a_failed_save_keeps_the_image_error_it_failed_with() {
+        let img = RgbaImage::new(1, 1);
+        let unwritable = std::path::Path::new("/does/not/exist/frame.png");
+
+        let error = save_png(&img, unwritable).expect_err("a missing directory cannot be written");
+
+        assert!(
+            error.to_string().contains("frame.png"),
+            "the message should name the path: {error}"
+        );
+        let cause = error
+            .downcast_ref::<image::ImageError>()
+            .expect("the image error is preserved, not formatted away");
+        assert!(
+            matches!(cause, image::ImageError::IoError(_)),
+            "a missing directory is an IO failure: {cause:?}"
+        );
+    }
 }

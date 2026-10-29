@@ -39,7 +39,7 @@ animatable with the thing it moves.
 
 A module that names a Bevy type binds **every** consumer of this crate to one
 Bevy minor version. Bevy's derives produce concrete types, so a `Component`
-from 0.19 and one from 0.20 are unrelated types that cannot meet; a version
+from one minor and one from the next are unrelated types that cannot meet; a
 skew is a wall of trait errors. Upgrading Bevy therefore stops being something
 any one repo can do alone.
 
@@ -49,7 +49,9 @@ It is not worth paying for code that needs no Bevy type. **A module that can
 stay free of Bevy should stay free of Bevy.** `tone` is the standing proof:
 colour science, no imports at all, no lockstep.
 
-Bevy 0.19 is the current line, matching Vizij.
+Bevy 0.20 is the current line. A consumer arrives at it as part of adopting
+this crate rather than as a step it can take separately, which is what keeps
+the upgrade off the schedule of a repo that has not adopted it yet.
 
 ## What is here
 
