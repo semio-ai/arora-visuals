@@ -1,17 +1,29 @@
-//! The selection outline: each selected element traced in line gizmos over the
-//! instance it belongs to.
+//! Feature-edge selection marking: each selected element traced in line gizmos
+//! over the instance it belongs to.
 //!
-//! **Line gizmos rather than a wireframe, because wireframes are unavailable
-//! on WebGL2** — so this is the portable answer rather than a stylistic one,
-//! and selection is not a concept any one product owns.
+//! The edges are the element mesh's, as three.js's `EdgesGeometry` finds them:
+//! the boundary, plus the creases where two adjacent triangles turn by more
+//! than [`CREASE_DEGREES`]. They are computed once per mesh from its base
+//! triangles and cached; each frame their ends are placed where the mesh
+//! actually draws them, morphs applied, for the same reason a pick casts over
+//! the drawn mesh. Selecting a group marks every element mesh under it.
 //!
-//! The outline is the element mesh's feature edges, as three.js's
-//! `EdgesGeometry` finds them: the boundary, plus the creases where two
-//! adjacent triangles turn by more than [`CREASE_DEGREES`]. They are computed
-//! once per mesh from its base triangles and cached; each frame their ends are
-//! placed where the mesh actually draws them, morphs applied, for the same
-//! reason a pick casts over the drawn mesh. Selecting a group outlines every
-//! element mesh under it.
+//! # This is not a silhouette outline, and the difference is not cosmetic
+//!
+//! **Feature edges approximate a silhouette only on geometry that is nearly
+//! flat and has few creases.** On the 2D shapes of a face they land on the
+//! shape's edge and read as an outline. On a curved 3D body every crease above
+//! the threshold is drawn too, and the result reads as a wireframe over the
+//! object rather than a line around it.
+//!
+//! A silhouette outline — one line around the whole of what is selected, which
+//! is what the Studio scene draws — is a different mechanism: render the
+//! selection to a mask, dilate it, composite the difference. It is not here.
+//! A consumer that wants it needs to write it, and should not reach for this
+//! expecting it.
+//!
+//! Line gizmos are used because WebGL2 has no wireframe, which settles *how*
+//! edges get drawn. It does not make edges the right thing to draw.
 
 use std::collections::HashMap;
 use std::sync::Arc;

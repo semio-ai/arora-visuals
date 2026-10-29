@@ -64,7 +64,7 @@ Bevy 0.19 is the current line, matching Vizij.
 | `instance` | `EntityInstance` — one entity being drawn: its GLB, its bindings, its camera, whether it is on screen yet | `bevy_ecs` |
 | `drawn` | when an instance is actually drawable, behind `view` | the whole engine |
 | `pick` | a pointer press resolved over the mesh **as drawn**, behind `view` | the whole engine |
-| `glow` | the selection outline, behind `view` | the whole engine |
+| `glow` | feature-edge selection marking, behind `view` | the whole engine |
 | `snapshot` | headless offscreen render and pixel readback, behind `snapshot` | the whole engine |
 
 Two features gate the modules that build a real Bevy app, because nothing
@@ -77,8 +77,14 @@ about itself is a proxy, and a proxy can be right while the picture is wrong.**
 `drawn` exists because a mesh that is created, passes culling and is counted
 among the visible may still have no compiled pipeline. `pick` exists because
 Bevy's mesh picking casts base vertices and so misses anything a morph moved.
-`glow` exists because WebGL2 has no wireframe. None of those is about what the
-asset is.
+`glow` exists because WebGL2 has no wireframe, which settles how edges get
+drawn. None of those is about what the asset is.
+
+**`glow` is not a silhouette outline**, and that limit is worth stating because
+the two look alike on one kind of geometry and not the other. Feature edges
+approximate a silhouette on nearly flat meshes with few creases — a face's 2D
+shapes — and read as a wireframe over a curved 3D body. One line around the
+whole of what is selected is a mask-and-dilate pass, and it is not here.
 
 It exists because **a frame is the only artifact that answers the question a
 renderer is asked.** Every cheaper signal is a proxy that can be right while
