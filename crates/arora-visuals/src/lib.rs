@@ -29,8 +29,16 @@
 //! standing example: colour science, no imports, no lockstep. **A module that
 //! can stay free of Bevy should stay free of Bevy.**
 
+pub mod hold;
 pub mod meta;
+#[cfg(feature = "snapshot")]
+pub mod snapshot;
+pub mod target;
 pub mod tone;
+pub mod value;
 
-pub use meta::{AssetMeta, Binding, Element, FeatureKind, glb_json_chunk};
+pub use hold::{HoldTarget, Holds};
+pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
+pub use target::OffscreenTarget;
 pub use tone::ToneMapping;
+pub use value::Decoded;

@@ -39,10 +39,30 @@ Bevy 0.19 is the current line, matching Vizij.
 
 ## What is here
 
-| module | what it is | Bevy? |
+| module | what it is | Bevy |
 | -- | -- | -- |
-| `meta` | the `RobotData` glTF extension, read out of a GLB's JSON chunk: elements, the animatables bound to them, and the asset's bounds | `bevy_math` only |
-| `tone` | three.js's tone curves (r170) at exposure 1, so an asset authored against a three renderer reads the same under Bevy | no |
+| `meta` | the `RobotData` glTF extension, read out of a GLB's JSON chunk: elements, the animatables bound to them, and the asset's bounds | `bevy_math` |
+| `hold` | an authoring lock: rig outputs held against the device that writes them, per instance and per component | `bevy_ecs` |
+| `target` | `OffscreenTarget` — where a view draws when it does not draw to a window | `bevy_asset`, `bevy_image` |
+| `value` | `Decoded` — a feature value in the two shapes a renderer applies | none |
+| `tone` | three.js's tone curves (r170) at exposure 1, so an asset authored against a three renderer reads the same under Bevy | none |
+| `snapshot` | headless offscreen render and pixel readback, behind the `snapshot` feature | the whole engine |
+
+`snapshot` is gated because it is the only module here that builds a real
+`DefaultPlugins` app, and nothing smaller will do that. Off, the crate resolves
+186 dependencies; on, 331. A consumer that wants the asset parse should not pay
+for an engine to get it.
+
+It exists because **a frame is the only artifact that answers the question a
+renderer is asked.** Every cheaper signal is a proxy that can be right while
+the picture is wrong — a mesh that spawns, passes culling and is counted among
+the visible still draws nothing if its material has no shader.
+
+`hold` is shared for a subtler reason than most of this. **A hold is the view
+declining a write, not the device pausing**, so a release shows the device's
+current value at once rather than resuming from where the hold began. Two
+implementations of a lock would disagree about that one point first, and the
+disagreement would surface only as values jumping on release.
 
 `meta` is shared for a reason that has nothing to do with what an asset is:
 **Bevy's glTF loader parses the extensions it knows and drops the rest**, so

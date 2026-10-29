@@ -6,6 +6,14 @@ license = { workspace = true }
 repository = { workspace = true }
 description = "The shared layer above Bevy for Semio assets: asset semantics, data modelling and interaction primitives that every Semio renderer needs."
 
+[features]
+default = []
+# The headless capture harness. Off by default because it is the only thing
+# here that needs a whole Bevy app — `DefaultPlugins`, the render stack, winit
+# and a PNG encoder — and a consumer that wants the asset parse should not pay
+# for an engine to get it.
+snapshot = ["dep:bevy", "dep:image"]
+
 # Dependencies are added by the module that needs them, never ahead of one. A
 # module that needs no Bevy type must not import one: that is what keeps it out
 # of the version lockstep the workspace manifest describes, and `tone` is the
@@ -16,12 +24,34 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 
-# `bevy_math` rather than the `bevy` facade, because `meta` needs the vector
-# and matrix types and nothing else of Bevy's. Naming the sub-crate directly is
-# what guarantees those are the *same* types the consumer's Bevy uses: this is
-# the crate `bevy::math` re-exports, so there is no second glam in the tree to
-# unify against.
+# Bevy by sub-crate, never the facade. Naming the sub-crate is what guarantees
+# these are the *same* types a consumer's Bevy uses — they are the crates
+# `bevy::asset`, `bevy::ecs` and so on re-export, so there is no second copy in
+# the tree to unify against — and it keeps the rest of the engine out of a
+# build that only wants the parse.
+#
+# `meta` takes the vector and matrix types; `target` takes an image handle;
+# `hold` takes the `Resource` derive. `tone` and `value` take nothing.
+bevy_asset = { workspace = true }
+bevy_ecs = { workspace = true }
+bevy_image = { workspace = true }
 bevy_math = { workspace = true }
+
+# `snapshot` only.
+bevy = { workspace = true, optional = true, features = [
+  "default_app",
+  "std",
+  "async_executor",
+  "multi_threaded",
+  "bevy_asset",
+  "bevy_render",
+  "bevy_core_pipeline",
+  "bevy_camera",
+  "bevy_image",
+  "bevy_window",
+  "bevy_winit",
+] }
+image = { workspace = true, optional = true }
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }

@@ -21,7 +21,21 @@ log = "0.4"
 # crate and the app embedding it is a wall of trait errors, not a warning.
 # 0.19 is what Vizij is on; moving is a coordinated operation across every
 # repo that depends on this one.
+# Named crate by crate rather than through the `bevy` facade, so a module
+# takes exactly what it needs and the rest of the engine stays out of a
+# consumer's build. They must all be the same minor as each other and as the
+# consumer's Bevy, which is what the note above is about.
+bevy_asset = "0.19"
+bevy_ecs = "0.19"
+bevy_image = "0.19"
 bevy_math = "0.19"
+
+# The whole engine, for `snapshot` alone: it builds a real `DefaultPlugins` app
+# and nothing smaller will do that. Gated for exactly that reason.
+bevy = { version = "0.19", default-features = false }
+# PNG only. bevy_image's own `image` unifies with this one, so every codec
+# named here ships in anything that links both.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 opt-level = "s"
