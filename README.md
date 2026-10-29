@@ -39,9 +39,22 @@ Bevy 0.19 is the current line, matching Vizij.
 
 ## What is here
 
-| module | what it is |
-| -- | -- |
-| `tone` | three.js's tone curves (r170) at exposure 1, so an asset authored against a three renderer reads the same under Bevy |
+| module | what it is | Bevy? |
+| -- | -- | -- |
+| `meta` | the `RobotData` glTF extension, read out of a GLB's JSON chunk: elements, the animatables bound to them, and the asset's bounds | `bevy_math` only |
+| `tone` | three.js's tone curves (r170) at exposure 1, so an asset authored against a three renderer reads the same under Bevy | no |
+
+`meta` is shared for a reason that has nothing to do with what an asset is:
+**Bevy's glTF loader parses the extensions it knows and drops the rest**, so
+every Semio asset read in Rust needs its own pass over the JSON chunk. It
+already reads both feature models — the web's whole-feature `translation` and
+Studio's per-axis `translation.x` — which is most of why one parse can serve
+two products.
+
+A consumer with its own extension alongside `RobotData` calls `glb_json_chunk`
+once and hands the same JSON to both parses. It composes rather than extends:
+it owns a struct holding an `AssetMeta` and its own parse, so neither can grow
+a dependency on the other.
 
 ## Consumers
 

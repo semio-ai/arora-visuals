@@ -11,6 +11,9 @@ repository = "https://github.com/semio-ai/arora-visuals"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The facade only. A library records what happened and leaves the choice of
+# where it goes to whatever binary ends up embedding it.
+log = "0.4"
 
 # Every consumer of this workspace must build against the same Bevy minor.
 # Bevy's derives produce concrete types, so a `Component` from 0.19 and one
@@ -18,7 +21,7 @@ serde_json = "1"
 # crate and the app embedding it is a wall of trait errors, not a warning.
 # 0.19 is what Vizij is on; moving is a coordinated operation across every
 # repo that depends on this one.
-bevy = { version = "0.19", default-features = false }
+bevy_math = "0.19"
 
 [profile.release]
 opt-level = "s"

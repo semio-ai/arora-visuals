@@ -11,3 +11,17 @@ description = "The shared layer above Bevy for Semio assets: asset semantics, da
 # of the version lockstep the workspace manifest describes, and `tone` is the
 # standing proof that the rule is satisfiable.
 [dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+log = { workspace = true }
+
+# `bevy_math` rather than the `bevy` facade, because `meta` needs the vector
+# and matrix types and nothing else of Bevy's. Naming the sub-crate directly is
+# what guarantees those are the *same* types the consumer's Bevy uses: this is
+# the crate `bevy::math` re-exports, so there is no second glam in the tree to
+# unify against.
+bevy_math = { workspace = true }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

@@ -29,6 +29,8 @@
 //! standing example: colour science, no imports, no lockstep. **A module that
 //! can stay free of Bevy should stay free of Bevy.**
 
+pub mod meta;
 pub mod tone;
 
+pub use meta::{AssetMeta, Binding, Element, FeatureKind, glb_json_chunk};
 pub use tone::ToneMapping;
