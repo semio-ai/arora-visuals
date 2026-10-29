@@ -1,0 +1,26 @@
+[workspace]
+members = ["crates/arora-visuals"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/semio-ai/arora-visuals"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Every consumer of this workspace must build against the same Bevy minor.
+# Bevy's derives produce concrete types, so a `Component` from 0.19 and one
+# from 0.20 are unrelated types that cannot meet — a version skew between this
+# crate and the app embedding it is a wall of trait errors, not a warning.
+# 0.19 is what Vizij is on; moving is a coordinated operation across every
+# repo that depends on this one.
+bevy = { version = "0.19", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
