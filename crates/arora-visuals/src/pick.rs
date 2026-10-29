@@ -67,26 +67,35 @@ pub fn on_press(
                 .then_some((instance, camera, transform))
         })
         .collect();
-    under.sort_by_key(|(_, camera, _)| std::cmp::Reverse(camera.order));
-    for (instance, camera, transform) in &under {
+    // Every element of every instance under the pointer, with the order of
+    // the camera it was seen through. Collected across instances rather than
+    // resolved one instance at a time: where several share a camera they
+    // share a ray, and the nearest of all of them is the pick.
+    let mut hits: Vec<(isize, f32)> = Vec::new();
+    let mut hit_of: Vec<(usize, &String)> = Vec::new();
+    for (index, (instance, camera, transform)) in under.iter().enumerate() {
         let Ok(ray) = camera.viewport_to_world(transform, position) else {
             continue;
         };
-        let nearest = instance
-            .bindings
-            .elements
-            .iter()
-            .filter_map(|(id, targets)| Some((id, elements.drawn(targets)?.hit(ray)?)))
-            .min_by(|a, b| a.1.total_cmp(&b.1));
-        if let Some((element_id, _)) = nearest {
-            log::info!("{}: picked element {element_id}", instance.id);
-            picks.0.push(Picked {
-                instance_id: instance.id.clone(),
-                element_id: Some(element_id.clone()),
-            });
-            return;
+        for (id, targets) in &instance.bindings.elements {
+            let Some(distance) = elements.drawn(targets).and_then(|mesh| mesh.hit(ray)) else {
+                continue;
+            };
+            hits.push((camera.order, distance));
+            hit_of.push((index, id));
         }
     }
+    if let Some(won) = winner(&hits) {
+        let (index, element_id) = hit_of[won];
+        let instance = under[index].0;
+        log::info!("{}: picked element {element_id}", instance.id);
+        picks.0.push(Picked {
+            instance_id: instance.id.clone(),
+            element_id: Some(element_id.clone()),
+        });
+        return;
+    }
+    under.sort_by_key(|(_, camera, _)| std::cmp::Reverse(camera.order));
     if let Some((instance, _, _)) = under.first() {
         log::info!("{}: a press on no element", instance.id);
         picks.0.push(Picked {
@@ -94,6 +103,25 @@ pub fn on_press(
             element_id: None,
         });
     }
+}
+
+/// Which hit wins, among `(camera order, distance along that camera's ray)`.
+///
+/// **Two instances sharing a camera share a ray, so their distances are
+/// comparable and the nearest wins. Two on different cameras are not** — the
+/// distances run from different origins along different rays, so comparing
+/// them is meaningless and the higher camera order decides instead, as it
+/// does on screen.
+///
+/// A view that gives every instance its own camera therefore resolves by
+/// order alone, which is the same answer it got before this distinguished the
+/// two cases. A view with one camera over a whole world resolves by depth,
+/// which is the only answer that is right there.
+fn winner(hits: &[(isize, f32)]) -> Option<usize> {
+    hits.iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)))
+        .map(|(index, _)| index)
 }
 
 /// The element meshes as drawn: what a pick casts over and a selection
@@ -199,6 +227,36 @@ pub fn morphed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Instances on one camera resolve by depth, which is what a world with a
+    /// single camera over it needs and what resolving one instance at a time
+    /// cannot do.
+    #[test]
+    fn sharing_a_camera_the_nearest_wins() {
+        assert_eq!(winner(&[(0, 9.0), (0, 2.0), (0, 5.0)]), Some(1));
+        // Order within the slice must not decide it: the same hits in the
+        // other order pick the same one.
+        assert_eq!(winner(&[(0, 2.0), (0, 9.0), (0, 5.0)]), Some(0));
+    }
+
+    /// Across cameras the order decides, because the distances are measured
+    /// along different rays and cannot be compared at all.
+    #[test]
+    fn across_cameras_the_higher_order_wins_however_far() {
+        assert_eq!(
+            winner(&[(0, 0.1), (3, 100.0)]),
+            Some(1),
+            "a far hit on a camera drawn over a near one still wins"
+        );
+        // The nearest of the topmost camera's hits, and not merely the last
+        // of them: order alone would answer 1 here.
+        assert_eq!(winner(&[(5, 1.0), (5, 4.0), (2, 0.01)]), Some(0));
+    }
+
+    #[test]
+    fn nothing_hit_is_no_pick() {
+        assert_eq!(winner(&[]), None);
+    }
 
     fn delta(x: f32, y: f32) -> MorphAttributes {
         MorphAttributes::new(Vec3::new(x, y, 0.0), Vec3::ZERO, Vec3::ZERO)
