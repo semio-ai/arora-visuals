@@ -60,17 +60,38 @@ Bevy 0.19 is the current line, matching Vizij.
 | `target` | `OffscreenTarget` — where a view draws when it does not draw to a window | `bevy_asset`, `bevy_image` |
 | `value` | `Decoded` — a feature value in the two shapes a renderer applies | none |
 | `tone` | three.js's tone curves (r170) at exposure 1, so an asset authored against a three renderer reads the same under Bevy | none |
-| `snapshot` | headless offscreen render and pixel readback, behind the `snapshot` feature | the whole engine |
+| `binding` | `SceneBinding` — where an animatable lands once the scene has spawned | `bevy_ecs` |
+| `instance` | `EntityInstance` — one entity being drawn: its GLB, its bindings, its camera, whether it is on screen yet | `bevy_ecs` |
+| `drawn` | when an instance is actually drawable, behind `view` | the whole engine |
+| `pick` | a pointer press resolved over the mesh **as drawn**, behind `view` | the whole engine |
+| `glow` | the selection outline, behind `view` | the whole engine |
+| `snapshot` | headless offscreen render and pixel readback, behind `snapshot` | the whole engine |
 
-`snapshot` is gated because it is the only module here that builds a real
-`DefaultPlugins` app, and nothing smaller will do that. Off, the crate resolves
-186 dependencies; on, 331. A consumer that wants the asset parse should not pay
-for an engine to get it.
+Two features gate the modules that build a real Bevy app, because nothing
+smaller will do what they do. The crate resolves 186 dependencies with neither,
+337 with `view`, 346 with both. A consumer that wants the asset parse should
+not pay for an engine to get it.
+
+The three behind `view` share one reason to exist: **what a renderer reports
+about itself is a proxy, and a proxy can be right while the picture is wrong.**
+`drawn` exists because a mesh that is created, passes culling and is counted
+among the visible may still have no compiled pipeline. `pick` exists because
+Bevy's mesh picking casts base vertices and so misses anything a morph moved.
+`glow` exists because WebGL2 has no wireframe. None of those is about what the
+asset is.
 
 It exists because **a frame is the only artifact that answers the question a
 renderer is asked.** Every cheaper signal is a proxy that can be right while
 the picture is wrong — a mesh that spawns, passes culling and is counted among
 the visible still draws nothing if its material has no shader.
+
+`EntityInstance` is what a product does *not* have to put in it that matters.
+Where values come from and where an instance stands are both real and both
+belong to a consumer — and in an ECS they do not have to be in this struct to
+be on this entity. A renderer puts its own `Rig` and `Slot` beside it and
+queries `(&EntityInstance, &Rig)`; this crate queries `&EntityInstance` and
+never learns what a rig is. That is what keeps a rig's *form* — a direct joint
+rig, an IK rig — out of the shared layer entirely.
 
 `hold` is shared for a subtler reason than most of this. **A hold is the view
 declining a write, not the device pausing**, so a release shows the device's

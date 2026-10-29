@@ -48,15 +48,27 @@
 //! standing example: colour science, no imports, no lockstep. **A module that
 //! can stay free of Bevy should stay free of Bevy.**
 
+pub mod binding;
+#[cfg(feature = "view")]
+pub mod drawn;
+#[cfg(feature = "view")]
+pub mod glow;
 pub mod hold;
+pub mod instance;
 pub mod meta;
+#[cfg(feature = "view")]
+pub mod pick;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
 pub mod target;
 pub mod tone;
 pub mod value;
 
+pub use binding::{ElementTargets, SceneBinding, SceneBindings};
 pub use hold::{HoldTarget, Holds};
+pub use instance::{ClearCamera, EntityInstance, Superseded, ViewOf, CLEAR_ORDER};
+#[cfg(feature = "view")]
+pub use pick::{Picked, Picks};
 pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 pub use target::OffscreenTarget;
 pub use tone::ToneMapping;

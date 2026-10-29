@@ -13,6 +13,11 @@ default = []
 # and a PNG encoder — and a consumer that wants the asset parse should not pay
 # for an engine to get it.
 snapshot = ["dep:bevy", "dep:image"]
+# The parts of a view that need the render stack: knowing when an instance is
+# actually drawable, picking over the mesh as drawn, and the selection
+# outline. Off by default for the same reason as `snapshot` — a consumer that
+# wants the asset parse should not build a renderer to get it.
+view = ["dep:bevy"]
 
 # Dependencies are added by the module that needs them, never ahead of one. A
 # module that needs no Bevy type must not import one: that is what keeps it out
@@ -50,6 +55,17 @@ bevy = { workspace = true, optional = true, features = [
   "bevy_image",
   "bevy_window",
   "bevy_winit",
+  # `view`: the morph-aware pick casts over morphed positions and needs the
+  # material pipeline cache to know what has compiled; the outline draws line
+  # gizmos, which is the portable answer where WebGL2 has no wireframe.
+  "bevy_pbr",
+  "bevy_mesh",
+  "bevy_scene",
+  "morph",
+  "bevy_picking",
+  "mesh_picking",
+  "bevy_gizmos",
+  "bevy_gizmos_render",
 ] }
 image = { workspace = true, optional = true }
 
