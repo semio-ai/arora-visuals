@@ -18,8 +18,22 @@ unlit materials. A robot scene is perspective, lit and shadowed.
 
 **The moment this crate contains an up-axis, a camera convention or a lighting
 model, it has excluded one of its two consumers.** The same line applies to
-vocabulary: the concepts here are element, controllable, instance and view. A
-type named for a face has already chosen a side.
+vocabulary: the concepts here are element, controllable, entity instance and
+view. A type named for a face has already chosen a side.
+
+**An entity is Model + Behavior running on one engine instance, and entities
+nest** — a robot entity contains the entity on its screen. That is the Arora
+architecture's definition, and it is why a screen showing another asset is a
+modelling relationship rather than something a renderer invents.
+
+**Take care naming anything near it.** "Entity" means something different at
+three other places in the stack: Arora's key grammar makes the *joint* the
+entity (`robot1/joint1.position`), which is what this crate calls an element;
+Studio splits it into `entityId` for the model and `entityInstanceId` for the
+occurrence; and Bevy's `Entity` is the ECS id, which appears as a field inside
+the very types that would carry the name. "Binding" is spoken for the same way
+— at the architecture level it pairs an entity with an engine instance, not an
+animatable with the thing it moves.
 
 ## Two costs, and which to pay
 

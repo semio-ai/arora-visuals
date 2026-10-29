@@ -15,8 +15,27 @@
 //! or a lighting model, it has excluded one of the two.**
 //!
 //! The same line applies to vocabulary. The concepts here are element,
-//! controllable, instance and view. A type or a field named for a face has
-//! already decided which consumer it serves.
+//! controllable, entity instance and view. A type or a field named for a face
+//! has already decided which consumer it serves.
+//!
+//! **An entity is Model + Behavior running on one engine instance, and
+//! entities nest** — a robot entity contains the entity on its screen. That is
+//! the Arora architecture's definition and the one this crate follows, because
+//! containment is what a screen showing another asset *is*, rather than
+//! something a renderer invents.
+//!
+//! **Take care naming anything near it.** "Entity" means something different
+//! at three other places in the stack: Arora's key grammar makes the *joint*
+//! the entity (`robot1/joint1.position` → namespace `robot1`, entity
+//! `joint1`), which is what this crate calls an [`Element`](meta::Element);
+//! Studio splits it into `entityId` for the model and `entityInstanceId` for
+//! the occurrence; and Bevy's `Entity` is the ECS id, which appears as a field
+//! inside the very types that would carry the name. "Entity instance" names
+//! the live occurrence, which no other reading claims.
+//!
+//! "Binding" is spoken for in the same way: at the architecture level it pairs
+//! an entity with an engine instance. What this crate joins is an animatable
+//! to the thing it moves, which is a different relation at a different level.
 //!
 //! # What it costs to be here
 //!
