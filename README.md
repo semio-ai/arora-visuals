@@ -67,6 +67,8 @@ the upgrade off the schedule of a repo that has not adopted it yet.
 | `drawn` | when an instance is actually drawable, behind `view` | the whole engine |
 | `pick` | a pointer press resolved over the mesh **as drawn**, behind `view` | the whole engine |
 | `glow` | feature-edge selection marking, behind `view` | the whole engine |
+| `outline` | the selection outline: one line around the whole of what is selected, drawn over whatever stands in front of it, behind `view` | the whole engine |
+| `select` | what is selected, and which element meshes a selection covers, behind `view` | the whole engine |
 | `snapshot` | headless offscreen render and pixel readback, behind `snapshot` | the whole engine |
 
 Two features gate the modules that build a real Bevy app, because nothing
@@ -86,7 +88,8 @@ drawn. None of those is about what the asset is.
 the two look alike on one kind of geometry and not the other. Feature edges
 approximate a silhouette on nearly flat meshes with few creases — a face's 2D
 shapes — and read as a wireframe over a curved 3D body. One line around the
-whole of what is selected is a mask-and-dilate pass, and it is not here.
+whole of what is selected is a mask-and-dilate pass, and that is `outline`.
+Both read the same selections.
 
 It exists because **a frame is the only artifact that answers the question a
 renderer is asked.** Every cheaper signal is a proxy that can be right while

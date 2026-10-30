@@ -17,10 +17,8 @@
 //! object rather than a line around it.
 //!
 //! A silhouette outline — one line around the whole of what is selected, which
-//! is what the Studio scene draws — is a different mechanism: render the
-//! selection to a mask, dilate it, composite the difference. It is not here.
-//! A consumer that wants it needs to write it, and should not reach for this
-//! expecting it.
+//! is what the Studio scene draws — is a different mechanism, and it is
+//! [`crate::outline`]. Both read the same [`Selections`].
 //!
 //! Line gizmos are used because WebGL2 has no wireframe, which settles *how*
 //! edges get drawn. It does not make edges the right thing to draw.
@@ -32,9 +30,9 @@ use bevy::gizmos::config::{GizmoConfig, GizmoConfigGroup, GizmoLineConfig};
 use bevy::mesh::Indices;
 use bevy::prelude::*;
 
-use crate::binding::ElementTargets;
 use crate::instance::{EntityInstance, Superseded};
 use crate::pick::ElementMeshes;
+use crate::select::{covered, Selections};
 
 /// The angle two adjacent triangles turn by for their shared edge to be
 /// outlined — the authoring app's glow threshold.
@@ -75,13 +73,6 @@ impl Plugin for GlowPlugin {
 #[derive(Default, Reflect, GizmoConfigGroup)]
 struct SelectionGlow;
 
-/// The selected elements of each instance, by instance id.
-///
-/// Kept apart from the instances so a selection survives an instance's
-/// reload: what a person selected is their state, not the asset's.
-#[derive(Resource, Default)]
-pub struct Selections(pub HashMap<String, Vec<String>>);
-
 /// Each mesh's feature edges, found on first selection.
 #[derive(Resource, Default)]
 struct FeatureEdges(HashMap<AssetId<Mesh>, Arc<Vec<[u32; 2]>>>);
@@ -103,21 +94,7 @@ fn draw_glow(
             continue;
         };
         for id in selected {
-            let Some(targets) = instance.bindings.elements.get(id) else {
-                continue;
-            };
-            let outlined: Vec<&ElementTargets> = if targets.mesh.is_some() {
-                vec![targets]
-            } else {
-                instance.bindings
-                    .elements
-                    .values()
-                    .filter(|element| {
-                        element.mesh.is_some() && descends(element.node, targets.node, &parents)
-                    })
-                    .collect()
-            };
-            for element in outlined {
+            for element in covered(instance, id, &parents) {
                 let Some((mesh_id, mesh)) = elements.mesh(element) else {
                     continue;
                 };
@@ -146,19 +123,6 @@ fn draw_glow(
                     gizmos.line(Vec3::from(*a), Vec3::from(*b), GLOW);
                 }
             }
-        }
-    }
-}
-
-/// Whether `entity` is `ancestor` or lies under it.
-fn descends(mut entity: Entity, ancestor: Entity, parents: &Query<&ChildOf>) -> bool {
-    loop {
-        if entity == ancestor {
-            return true;
-        }
-        match parents.get(entity) {
-            Ok(parent) => entity = parent.parent(),
-            Err(_) => return false,
         }
     }
 }

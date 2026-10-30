@@ -57,7 +57,11 @@ pub mod hold;
 pub mod instance;
 pub mod meta;
 #[cfg(feature = "view")]
+pub mod outline;
+#[cfg(feature = "view")]
 pub mod pick;
+#[cfg(feature = "view")]
+pub mod select;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
 pub mod target;
