@@ -11,19 +11,30 @@ use bevy::prelude::*;
 use crate::binding::ElementTargets;
 use crate::instance::EntityInstance;
 
-/// One selected element, and the colour it asks to be shown in, if any.
+/// How a selection asks to be shown. Anything it leaves unset is the view's
+/// own, so a selection can ask for a colour alone and keep the view's width.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Highlight {
+    pub colour: Option<Color>,
+    /// The line's width, in logical pixels.
+    pub width: Option<f32>,
+    /// How strongly the selection itself is filled, from not at all to solid.
+    pub fill: Option<f32>,
+}
+
+/// One selected element, and how it asks to be shown, if it asks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selection {
     pub element: String,
-    pub colour: Option<Color>,
+    pub highlight: Option<Highlight>,
 }
 
 impl Selection {
-    /// An element selected with no colour of its own.
+    /// An element selected with no highlight of its own.
     pub fn of(element: impl Into<String>) -> Self {
         Self {
             element: element.into(),
-            colour: None,
+            highlight: None,
         }
     }
 }
@@ -36,19 +47,19 @@ impl Selection {
 pub struct Selections(pub HashMap<String, Vec<Selection>>);
 
 impl Selections {
-    /// The colour the whole selection is shown in, when it has one: the colour
-    /// of the one selected element that brings a colour. With none, or with
-    /// several, there is no single colour to choose, and a view falls back to
-    /// its own — Studio's rule, which keeps two highlight colours from fighting
+    /// The highlight the whole selection is shown with, when it has one: that
+    /// of the one selected element that brings a highlight. With none, or with
+    /// several, there is no single highlight to choose, and a view falls back
+    /// to its own — Studio's rule, which keeps two highlights from fighting
     /// over one outline.
-    pub fn colour(&self) -> Option<Color> {
-        let mut colours = self
+    pub fn highlight(&self) -> Option<Highlight> {
+        let mut asking = self
             .0
             .values()
             .flatten()
-            .filter_map(|selection| selection.colour);
-        match (colours.next(), colours.next()) {
-            (Some(colour), None) => Some(colour),
+            .filter_map(|selection| selection.highlight);
+        match (asking.next(), asking.next()) {
+            (Some(highlight), None) => Some(highlight),
             _ => None,
         }
     }
@@ -92,38 +103,45 @@ fn descends(mut entity: Entity, ancestor: Entity, parents: &Query<&ChildOf>) -> 
 mod tests {
     use super::*;
 
-    fn selections(colours: &[Option<Color>]) -> Selections {
-        let entries = colours
+    fn selections(highlights: &[Option<Highlight>]) -> Selections {
+        let entries = highlights
             .iter()
             .enumerate()
-            .map(|(index, colour)| Selection {
+            .map(|(index, highlight)| Selection {
                 element: format!("element-{index}"),
-                colour: *colour,
+                highlight: *highlight,
             })
             .collect();
         Selections(HashMap::from([("robot".to_string(), entries)]))
     }
 
+    fn coloured(colour: Color) -> Option<Highlight> {
+        Some(Highlight {
+            colour: Some(colour),
+            ..default()
+        })
+    }
+
     #[test]
-    fn one_coloured_element_colours_the_selection() {
-        let red = Color::srgb(1.0, 0.0, 0.0);
-        assert_eq!(selections(&[Some(red)]).colour(), Some(red));
+    fn one_highlighted_element_highlights_the_selection() {
+        let red = coloured(Color::srgb(1.0, 0.0, 0.0));
+        assert_eq!(selections(&[red]).highlight(), red);
         assert_eq!(
-            selections(&[None, Some(red), None]).colour(),
-            Some(red),
-            "uncoloured elements do not compete",
+            selections(&[None, red, None]).highlight(),
+            red,
+            "elements that bring no highlight do not compete",
         );
     }
 
-    /// Two colours have no single answer, even when they are the same colour:
-    /// the rule counts elements asking, not distinct colours, as Studio does.
+    /// Two highlights have no single answer, even when they are the same: the
+    /// rule counts elements asking, not distinct highlights, as Studio does.
     #[test]
-    fn several_or_no_colours_leave_the_view_to_choose() {
-        let red = Color::srgb(1.0, 0.0, 0.0);
-        let blue = Color::srgb(0.0, 0.0, 1.0);
-        assert_eq!(selections(&[]).colour(), None);
-        assert_eq!(selections(&[None, None]).colour(), None);
-        assert_eq!(selections(&[Some(red), Some(blue)]).colour(), None);
-        assert_eq!(selections(&[Some(red), Some(red)]).colour(), None);
+    fn several_or_no_highlights_leave_the_view_to_choose() {
+        let red = coloured(Color::srgb(1.0, 0.0, 0.0));
+        let blue = coloured(Color::srgb(0.0, 0.0, 1.0));
+        assert_eq!(selections(&[]).highlight(), None);
+        assert_eq!(selections(&[None, None]).highlight(), None);
+        assert_eq!(selections(&[red, blue]).highlight(), None);
+        assert_eq!(selections(&[red, red]).highlight(), None);
     }
 }

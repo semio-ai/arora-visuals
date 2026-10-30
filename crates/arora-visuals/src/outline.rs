@@ -45,7 +45,7 @@ use bevy::shader::ShaderRef;
 use crate::instance::{EntityInstance, Superseded};
 #[cfg(test)]
 use crate::select::Selection;
-use crate::select::{covered, Selections};
+use crate::select::{covered, Highlight, Selections};
 
 /// The render layer the mask camera draws, and only selected meshes are on.
 pub const OUTLINE_LAYER: usize = 30;
@@ -54,7 +54,8 @@ pub const OUTLINE_LAYER: usize = 30;
 #[derive(Component, Clone, Copy, Debug)]
 pub struct OutlineView {
     /// The colour of a selection that brings none of its own; see
-    /// [`Selections::colour`] for when one does.
+    /// [`Selections::highlight`] for when one does. The same holds for the
+    /// width and the fill.
     pub colour: Color,
     /// The line's width, in logical pixels.
     pub width: f32,
@@ -220,13 +221,15 @@ fn attach_outline(
     }
 }
 
-/// What the shader is given: the selection's own colour if it has one, the
-/// view's otherwise, and the width scaled to physical pixels.
-fn uniform(settings: &OutlineView, colour: Option<Color>, scale: f32) -> OutlineUniform {
+/// What the shader is given: whatever the selection's highlight sets, the
+/// view's own for whatever it leaves unset, and the width scaled to physical
+/// pixels.
+fn uniform(settings: &OutlineView, highlight: Option<Highlight>, scale: f32) -> OutlineUniform {
+    let highlight = highlight.unwrap_or_default();
     OutlineUniform {
-        colour: LinearRgba::from(colour.unwrap_or(settings.colour)).to_vec4(),
-        width: settings.width * scale,
-        fill: settings.fill,
+        colour: LinearRgba::from(highlight.colour.unwrap_or(settings.colour)).to_vec4(),
+        width: highlight.width.unwrap_or(settings.width) * scale,
+        fill: highlight.fill.unwrap_or(settings.fill),
         ..default()
     }
 }
@@ -316,7 +319,7 @@ fn fit_outline(
         // resize counts, because it replaces the mask the material binds.
         let wanted = uniform(
             settings,
-            selections.colour(),
+            selections.highlight(),
             camera.target_scaling_factor().unwrap_or(1.0),
         );
         let stale = materials.get(&parts.material).is_some_and(|material| {
@@ -426,6 +429,36 @@ mod tests {
             world.get::<RenderLayers>(bare).is_none(),
             "a mesh that had no layers has none again",
         );
+    }
+
+    /// A highlight that sets only a colour keeps the view's width and fill:
+    /// what a selection leaves unset is the view's, not a default of its own.
+    #[test]
+    fn a_highlight_overrides_only_what_it_sets() {
+        let view = OutlineView {
+            colour: Color::WHITE,
+            width: 3.0,
+            fill: 0.2,
+        };
+        let red = Color::srgb(1.0, 0.0, 0.0);
+        let shown = uniform(
+            &view,
+            Some(Highlight {
+                colour: Some(red),
+                ..default()
+            }),
+            2.0,
+        );
+        assert_eq!(shown.colour, LinearRgba::from(red).to_vec4());
+        assert_eq!(
+            shown.width, 6.0,
+            "the view's width, scaled to physical pixels"
+        );
+        assert_eq!(shown.fill, 0.2);
+
+        let own = uniform(&view, None, 1.0);
+        assert_eq!(own.colour, LinearRgba::WHITE.to_vec4());
+        assert_eq!(own.width, 3.0);
     }
 
     /// Reselecting what is already selected changes nothing, so a selection
