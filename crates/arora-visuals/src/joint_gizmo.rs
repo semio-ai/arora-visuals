@@ -227,13 +227,17 @@ macro_rules! range_material {
 
             /// Over everything, as every gizmo handle is: a joint's control
             /// sits inside the link it moves by construction.
+            ///
+            /// Back faces stay culled, as Bevy has them by default. With no
+            /// depth test the tube's far side would draw through its near
+            /// side, and the two sets of diagonal stripes would cross into a
+            /// hatch.
             fn specialize(
                 _pipeline: &MaterialPipeline,
                 descriptor: &mut RenderPipelineDescriptor,
                 _layout: &MeshVertexBufferLayoutRef,
                 _key: MaterialPipelineKey<Self>,
             ) -> Result<(), SpecializedMeshPipelineError> {
-                descriptor.primitive.cull_mode = None;
                 if let Some(depth) = descriptor.depth_stencil.as_mut() {
                     depth.depth_compare = Some(CompareFunction::Always);
                     depth.depth_write_enabled = Some(false);
