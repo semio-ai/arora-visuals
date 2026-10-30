@@ -88,6 +88,10 @@ pub struct JointGizmo {
     pub offset: Transform,
     /// Pose the body from `value`. Without it the gizmo only keeps `value`.
     pub apply: bool,
+    /// What the host calls this gizmo — the animatable it drives, say: the
+    /// name it goes by in the [overlay](crate::overlay), where an entity id
+    /// would mean nothing.
+    pub key: String,
 }
 
 impl JointGizmo {
@@ -117,6 +121,7 @@ impl JointGizmo {
             size: GizmoSize::World(0.2),
             offset: Self::default_offset(motion, axis),
             apply: true,
+            key: String::new(),
         }
     }
 
@@ -358,7 +363,7 @@ pub(crate) fn frame(gizmo: &JointGizmo, parent: &GlobalTransform, rest: &Transfo
 }
 
 /// Where a sliding joint's bar runs, from one end of the travel to the other.
-fn bar_ends(gizmo: &JointGizmo, frame: &JointFrame) -> (Vec3, Vec3) {
+pub(crate) fn bar_ends(gizmo: &JointGizmo, frame: &JointFrame) -> (Vec3, Vec3) {
     (
         frame.centre + frame.axis * (gizmo.min - gizmo.rest),
         frame.centre + frame.axis * (gizmo.max - gizmo.rest),

@@ -160,6 +160,9 @@ pub struct TransformGizmo {
     pub colours: [Color; 3],
     /// Write each drag onto the target. Without it the gizmo only reports.
     pub apply: bool,
+    /// What the host calls this gizmo: the name it goes by in the
+    /// [overlay](crate::overlay), where an entity id would mean nothing.
+    pub key: String,
 }
 
 impl TransformGizmo {
@@ -181,6 +184,7 @@ impl TransformGizmo {
                 Color::srgb_u8(0x3b, 0x82, 0xf6),
             ],
             apply: true,
+            key: String::new(),
         }
     }
 
@@ -211,7 +215,7 @@ impl TransformGizmo {
 /// gizmo's ring or bar, which is its only handle. `Joint` is here so that
 /// [`GizmoPointer`] can name either kind; the transform gizmo's own code never
 /// meets it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum GizmoHandle {
     Arrow(usize),
     Plane(usize),
@@ -398,7 +402,7 @@ struct Part {
 /// Which way along each of the gizmo's axes its moving and scaling handles
 /// point: `1` along it, `-1` against it, whichever is toward the viewer.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
-struct Facing(Vec3);
+pub(crate) struct Facing(Vec3);
 
 /// The settings a gizmo's parts were built from; a change to any of them
 /// rebuilds the parts, while `only` just shows and hides them.
@@ -665,6 +669,38 @@ fn placement(
         facing,
         unit,
     })
+}
+
+/// The points marking how far a gizmo's shown handles reach in the world:
+/// its centre, the tip of each axis's handles on the side they face, and a
+/// ring's far side opposite. What the overlay boxes a gizmo by.
+pub(crate) fn reach_points(
+    gizmo: &TransformGizmo,
+    facing: &Facing,
+    target: &GlobalTransform,
+    camera: (&Camera, &GlobalTransform),
+) -> Option<Vec<Vec3>> {
+    let place = placement(gizmo, facing.0, target, camera)?;
+    let ring = if gizmo.shows(TransformMode::Rotate) {
+        RING_RADIUS
+    } else {
+        0.0
+    };
+    let tip = if gizmo.shows(TransformMode::Scale) {
+        BALL_REACH + BALL_RADIUS
+    } else if gizmo.shows(TransformMode::Translate) {
+        SHAFT_LENGTH + CONE_LENGTH
+    } else {
+        0.0
+    }
+    .max(ring);
+    let mut points = vec![place.origin];
+    for axis in 0..3 {
+        let toward = place.reach(GizmoHandle::Arrow(axis));
+        points.push(place.origin + toward * tip * place.unit);
+        points.push(place.origin - toward * ring * place.unit);
+    }
+    Some(points)
 }
 
 /// How many metres one gizmo unit is, for a gizmo of `size` standing at

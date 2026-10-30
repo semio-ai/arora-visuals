@@ -59,6 +59,8 @@ pub mod meta;
 #[cfg(feature = "view")]
 pub mod outline;
 #[cfg(feature = "view")]
+pub mod overlay;
+#[cfg(feature = "view")]
 pub mod pick;
 #[cfg(feature = "view")]
 pub mod select;
@@ -73,6 +75,8 @@ pub mod tone;
 pub mod value;
 #[cfg(feature = "view_gizmo")]
 pub mod view_gizmo;
+#[cfg(feature = "view")]
+pub mod view_offset;
 
 pub use binding::{ElementTargets, SceneBinding, SceneBindings};
 pub use hold::{HoldTarget, Holds};
