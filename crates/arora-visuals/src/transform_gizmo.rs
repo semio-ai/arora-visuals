@@ -41,6 +41,15 @@
 //! plane that handle moves in, so the handle stays under the pointer whatever
 //! the camera does.
 //!
+//! **A scale ball stands on a stem when the arrows are not showing.** With
+//! moving offered and shown, a ball sits beyond its arrow's head; without
+//! it, a ball would float apart from the centre it scales about, so a plain
+//! line runs out to it. The stem is part of the ball — it thickens when the
+//! ball is in hand — but only the ball can be taken.
+//!
+//! **Any combination of the three modes can be offered**, and changing the
+//! combination on a gizmo rebuilds its handles.
+//!
 //! **A scale ball stretches the target along its own axis nearest the
 //! ball's.** The balls sit with the arrows, in the gizmo's axes; in local
 //! space those are the target's own and the stretch is exact, but a turned
@@ -356,6 +365,8 @@ struct Part {
     /// handle's axis and facing are applied. Every piece's mesh is built
     /// along its own Y and is laid along that axis.
     offset: Vec3,
+    /// A scale ball's stem, shown only while the arrows are not.
+    stem: bool,
     meshes: [Handle<Mesh>; 2],
     materials: [Handle<HandleMaterial>; 2],
     /// Which look it shows now.
@@ -416,13 +427,14 @@ impl Plugin for TransformGizmoPlugin {
     }
 }
 
-/// A part to spawn: its handle, where it sits, and its rest and in-hand
-/// meshes and materials.
+/// A part to spawn: its handle, where it sits, its rest and in-hand meshes
+/// and materials, and whether it is a scale ball's stem.
 type Piece = (
     GizmoHandle,
     Vec3,
     [Handle<Mesh>; 2],
     [Handle<HandleMaterial>; 2],
+    bool,
 );
 
 /// Builds the parts of each gizmo that is new or whose look has changed.
@@ -476,6 +488,7 @@ fn build_parts(
                         Vec3::X * SHAFT_LENGTH / 2.0,
                         TUBE.map(|radius| meshes.add(Cylinder::new(radius, SHAFT_LENGTH))),
                         look.clone(),
+                        false,
                     ));
                     pieces.push((
                         handle,
@@ -490,6 +503,7 @@ fn build_parts(
                             })
                         }),
                         look,
+                        false,
                     ));
                 }
                 GizmoHandle::Plane(_) => {
@@ -503,6 +517,7 @@ fn build_parts(
                             meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(side * swell)))
                         }),
                         material(colour, PLANE_OPACITY),
+                        false,
                     ));
                 }
                 GizmoHandle::Ring(_) => {
@@ -516,24 +531,35 @@ fn build_parts(
                             })
                         }),
                         material(colour, RING_OPACITY),
+                        false,
                     ));
                 }
                 GizmoHandle::Ball(_) => {
+                    let look = material(colour, OPACITY);
                     pieces.push((
                         handle,
                         Vec3::X * BALL_REACH,
                         SWELL.map(|swell| meshes.add(Sphere::new(BALL_RADIUS * swell))),
-                        material(colour, OPACITY),
+                        look.clone(),
+                        false,
+                    ));
+                    pieces.push((
+                        handle,
+                        Vec3::X * BALL_REACH / 2.0,
+                        TUBE.map(|radius| meshes.add(Cylinder::new(radius, BALL_REACH))),
+                        look,
+                        true,
                     ));
                 }
             }
         }
         commands.entity(entity).with_children(|gizmo| {
-            for (handle, offset, meshes, materials) in pieces {
+            for (handle, offset, meshes, materials, stem) in pieces {
                 gizmo.spawn((
                     Part {
                         handle,
                         offset,
+                        stem,
                         meshes: meshes.clone(),
                         materials: materials.clone(),
                         hot: false,
@@ -1053,7 +1079,9 @@ fn place_parts(
                 scale: Vec3::ONE,
             };
             *part_global = global.mul_transform(*at);
-            *visibility = if gizmo.shows(part.handle.mode()) {
+            let shown = gizmo.shows(part.handle.mode())
+                && !(part.stem && gizmo.shows(TransformMode::Translate));
+            *visibility = if shown {
                 Visibility::Inherited
             } else {
                 Visibility::Hidden
