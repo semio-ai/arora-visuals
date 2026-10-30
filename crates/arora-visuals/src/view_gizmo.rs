@@ -90,6 +90,10 @@ const NEGATIVE: f32 = 0.75;
 const HOVERED: f32 = 1.2;
 /// drei's 18-pixel label on the same sprite.
 const LABEL_SIZE: f32 = 18.0 * UNIT / 64.0;
+/// How far a label is lowered, as a share of its size. Centring the text's
+/// line box leaves a capital letter high, since the box keeps room below the
+/// baseline for descenders the axis letters do not have.
+const LABEL_DROP: f32 = 0.08;
 /// Half the gizmo's box: wide enough for a hovered ball at full reach.
 const HALF: f32 = UNIT + BALL_RADIUS * HOVERED + 2.0;
 
@@ -177,6 +181,10 @@ fn build_gizmos(
                             ball.with_child((
                                 Text::new(gizmo.labels[axis].clone()),
                                 TextFont::from_font_size(LABEL_SIZE),
+                                Node {
+                                    top: Val::Px(LABEL_SIZE * LABEL_DROP),
+                                    ..default()
+                                },
                                 TextColor(gizmo.label_colour),
                                 Pickable::IGNORE,
                             ));
