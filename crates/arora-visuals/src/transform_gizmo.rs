@@ -9,7 +9,15 @@
 //! **Any of the three modes, at once or one at a time.** Every enabled mode's
 //! handles show together, laid out as Studio's pivot controls are: an arrow
 //! along each axis and a square in each plane to move, a ring about each axis
-//! to turn, and a ball beyond each arrow to scale. A host that wants one mode
+//! to turn, and a ball beyond each arrow to scale.
+//!
+//! **The moving and scaling handles stay on the side facing the viewer.** Each
+//! arrow points along its axis or against it, whichever way is toward the
+//! camera, and the squares and balls go with the arrows. Otherwise, as the
+//! view comes round, an arrow ends up behind the rings and the centre, and
+//! taking it means reaching through them. An arrow seen nearly end-on keeps
+//! the side it had until the view is clearly past it, so it does not flicker
+//! between the two, and nothing changes side while a drag is under way. A host that wants one mode
 //! at a time sets [`TransformGizmo::only`] — from whatever key it binds — and
 //! the others hide, so the choice of keys is the host's.
 //!
@@ -33,9 +41,11 @@
 //! plane that handle moves in, so the handle stays under the pointer whatever
 //! the camera does.
 //!
-//! **Scale is always along the target's own axes**, whichever space the other
-//! handles are in: a world axis is not one an object can be stretched along
-//! once it is turned.
+//! **A scale ball stretches the target along its own axis nearest the
+//! ball's.** The balls sit with the arrows, in the gizmo's axes; in local
+//! space those are the target's own and the stretch is exact, but a turned
+//! object cannot be stretched along a world axis, so in world space the ball
+//! takes the target's axis that lies closest to it.
 //!
 //! A drag reports itself as [`GizmoDrag`] — start, each move, end — carrying
 //! the target's new local transform; with [`TransformGizmo::apply`] the gizmo
@@ -283,10 +293,14 @@ const REACH_PX: f32 = 8.0;
 /// Below this share of facing the camera a plane is too nearly edge-on to
 /// drag in.
 const EDGE_ON: f32 = 0.15;
+/// How far past side-on an axis has to turn, as a share of facing the camera,
+/// before its handles change side.
+const FLIP: f32 = 0.1;
 
-/// Rest and in-hand thicknesses, as the joint controls swap thin for thick.
-const SHAFT_RADIUS: [f32; 2] = [0.008, 0.016];
-const RING_TUBE: [f32; 2] = [0.012, 0.04];
+/// The radius of an arrow's shaft and of a ring's tube, at rest and in hand:
+/// the two are one line drawn two ways, so they are one thickness, and the
+/// swap from thin to thick is the joint controls' hover.
+const TUBE: [f32; 2] = [0.012, 0.04];
 const SWELL: [f32; 2] = [1.0, 1.3];
 /// Rest and in-hand opacities, for lines and solids and for the planes.
 const OPACITY: [f32; 2] = [0.75, 1.0];
@@ -338,14 +352,20 @@ impl Material for HandleMaterial {
 #[derive(Component)]
 struct Part {
     handle: GizmoHandle,
-    /// Where the piece sits and how it is turned, in gizmo units along +X,
-    /// before the handle's own axis is applied.
-    at: Transform,
+    /// Where the piece sits, in gizmo units, laid out about +X before its
+    /// handle's axis and facing are applied. Every piece's mesh is built
+    /// along its own Y and is laid along that axis.
+    offset: Vec3,
     meshes: [Handle<Mesh>; 2],
     materials: [Handle<HandleMaterial>; 2],
     /// Which look it shows now.
     hot: bool,
 }
+
+/// Which way along each of the gizmo's axes its moving and scaling handles
+/// point: `1` along it, `-1` against it, whichever is toward the viewer.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+struct Facing(Vec3);
 
 /// The settings a gizmo's parts were built from; a change to any of them
 /// rebuilds the parts, while `only` just shows and hides them.
@@ -363,11 +383,8 @@ struct Drag {
     /// The gizmo's origin and axes when the drag began.
     origin: Vec3,
     axes: Quat,
-    /// The target's own axes when the drag began, for scaling along.
-    local_axes: Quat,
-    /// The gizmo's naming of the axes, so a scale handle stretches the
-    /// target's own component that its label names.
-    labels: Quat,
+    /// The target's own scale component a ball stretches.
+    stretch_along: Vec3,
     /// Where the pointer's ray met the drag's plane when it began.
     grabbed: Vec3,
     /// The plane the drag works in.
@@ -403,7 +420,7 @@ impl Plugin for TransformGizmoPlugin {
 /// meshes and materials.
 type Piece = (
     GizmoHandle,
-    Transform,
+    Vec3,
     [Handle<Mesh>; 2],
     [Handle<HandleMaterial>; 2],
 );
@@ -429,7 +446,7 @@ fn build_parts(
                 commands.entity(*child).despawn();
             }
         }
-        commands.entity(entity).insert(wanted);
+        commands.entity(entity).insert((wanted, Facing(Vec3::ONE)));
 
         let mut material = |colour: Color, opacity: [f32; 2]| {
             [0, 1].map(|hot| {
@@ -456,13 +473,13 @@ fn build_parts(
                     let look = material(colour, OPACITY);
                     pieces.push((
                         handle,
-                        along_x(SHAFT_LENGTH / 2.0),
-                        SHAFT_RADIUS.map(|radius| meshes.add(Cylinder::new(radius, SHAFT_LENGTH))),
+                        Vec3::X * SHAFT_LENGTH / 2.0,
+                        TUBE.map(|radius| meshes.add(Cylinder::new(radius, SHAFT_LENGTH))),
                         look.clone(),
                     ));
                     pieces.push((
                         handle,
-                        along_x(SHAFT_LENGTH + CONE_LENGTH / 2.0),
+                        Vec3::X * (SHAFT_LENGTH + CONE_LENGTH / 2.0),
                         SWELL.map(|swell| {
                             meshes.add(Cone {
                                 radius: CONE_RADIUS * swell,
@@ -476,11 +493,9 @@ fn build_parts(
                     let side = PLANE_SIDE / 2.0;
                     // A square in the plane square to X, out along the other
                     // two axes from the centre.
-                    let at = Transform::from_xyz(0.0, PLANE_OFFSET, PLANE_OFFSET)
-                        .with_rotation(Quat::from_rotation_arc(Vec3::Y, Vec3::X));
                     pieces.push((
                         handle,
-                        at,
+                        Vec3::new(0.0, PLANE_OFFSET, PLANE_OFFSET),
                         SWELL.map(|swell| {
                             meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(side * swell)))
                         }),
@@ -488,11 +503,10 @@ fn build_parts(
                     ));
                 }
                 GizmoHandle::Ring(_) => {
-                    let at = Transform::from_rotation(Quat::from_rotation_arc(Vec3::Y, Vec3::X));
                     pieces.push((
                         handle,
-                        at,
-                        RING_TUBE.map(|tube| {
+                        Vec3::ZERO,
+                        TUBE.map(|tube| {
                             meshes.add(Torus {
                                 minor_radius: tube,
                                 major_radius: RING_RADIUS,
@@ -504,7 +518,7 @@ fn build_parts(
                 GizmoHandle::Ball(_) => {
                     pieces.push((
                         handle,
-                        Transform::from_xyz(BALL_REACH, 0.0, 0.0),
+                        Vec3::X * BALL_REACH,
                         SWELL.map(|swell| meshes.add(Sphere::new(BALL_RADIUS * swell))),
                         material(colour, OPACITY),
                     ));
@@ -512,11 +526,11 @@ fn build_parts(
             }
         }
         commands.entity(entity).with_children(|gizmo| {
-            for (handle, at, meshes, materials) in pieces {
+            for (handle, offset, meshes, materials) in pieces {
                 gizmo.spawn((
                     Part {
                         handle,
-                        at,
+                        offset,
                         meshes: meshes.clone(),
                         materials: materials.clone(),
                         hot: false,
@@ -536,10 +550,6 @@ fn build_parts(
     }
 }
 
-fn along_x(distance: f32) -> Transform {
-    Transform::from_xyz(distance, 0.0, 0.0).with_rotation(Quat::from_rotation_arc(Vec3::Y, Vec3::X))
-}
-
 /// The turn that carries a part laid out about X onto `axis`, keeping the
 /// three axes a right-handed set: X to Y takes Y to Z, and X to Z takes Z to
 /// X. A plane laid out across Y and Z thereby lands across the other two.
@@ -551,27 +561,40 @@ fn onto_axis(axis: usize) -> Quat {
     }
 }
 
-/// Where a gizmo stands, how its axes are turned, its target's own axes, and
-/// how many metres one gizmo unit is.
+/// Where a gizmo stands, how its axes are turned, which side of each its
+/// handles are on, and how many metres one gizmo unit is.
 #[derive(Clone, Copy)]
 struct Placement {
     origin: Vec3,
     axes: Quat,
-    local_axes: Quat,
+    facing: Vec3,
     unit: f32,
+}
+
+impl Placement {
+    /// The direction a handle reaches along: its axis, turned toward the
+    /// viewer for the handles that face.
+    fn reach(&self, handle: GizmoHandle) -> Vec3 {
+        let index = handle.axis();
+        let axis = self.axes * axis_vector(index);
+        match handle {
+            GizmoHandle::Arrow(_) | GizmoHandle::Ball(_) => axis * self.facing[index],
+            GizmoHandle::Plane(_) | GizmoHandle::Ring(_) => axis,
+        }
+    }
 }
 
 fn placement(
     gizmo: &TransformGizmo,
+    facing: Vec3,
     target: &GlobalTransform,
     camera: (&Camera, &GlobalTransform),
 ) -> Option<Placement> {
     let (_, turned, position) = target.to_scale_rotation_translation();
     let labels = gizmo.labels();
-    let local_axes = turned * labels;
     let axes = match gizmo.space {
         GizmoSpace::World => labels,
-        GizmoSpace::Local => local_axes,
+        GizmoSpace::Local => turned * labels,
     };
     let origin = position + axes * gizmo.offset;
     let unit = match gizmo.size {
@@ -581,9 +604,37 @@ fn placement(
     Some(Placement {
         origin,
         axes,
-        local_axes,
+        facing,
         unit,
     })
+}
+
+/// Which side of each axis faces the viewer, keeping `previous` for an axis
+/// too near side-on to say.
+fn facing_toward(previous: Vec3, axes: Quat, origin: Vec3, eye: Vec3) -> Vec3 {
+    let toward = (eye - origin).normalize_or_zero();
+    Vec3::from_array(std::array::from_fn(|index| {
+        let along = (axes * axis_vector(index)).dot(toward);
+        if along > FLIP {
+            1.0
+        } else if along < -FLIP {
+            -1.0
+        } else {
+            previous[index]
+        }
+    }))
+}
+
+/// The target's own axis, as a component of its scale, that lies closest to
+/// `axis` in the world, for a target turned by `turned`.
+fn nearest_component(turned: Quat, axis: Vec3) -> Vec3 {
+    let index = (0..3)
+        .max_by(|&a, &b| {
+            let lean = |i: usize| (turned * axis_vector(i)).dot(axis).abs();
+            lean(a).total_cmp(&lean(b))
+        })
+        .unwrap_or(0);
+    axis_vector(index)
 }
 
 /// How many metres one logical pixel spans at `point`, from two rays a pixel
@@ -634,11 +685,7 @@ fn distance_to(
     ray: Ray3d,
     (camera, at): (&Camera, &GlobalTransform),
 ) -> Option<f32> {
-    let axes = match handle {
-        GizmoHandle::Ball(_) => place.local_axes,
-        _ => place.axes,
-    };
-    let axis = axes * axis_vector(handle.axis());
+    let axis = place.reach(handle);
     let to_screen = |world: Vec3| camera.world_to_viewport(at, world).ok();
     match handle {
         GizmoHandle::Arrow(_) => {
@@ -674,8 +721,8 @@ fn distance_to(
                 return None;
             }
             let hit = meet_plane(ray, axis, place.origin)?;
-            let u = place.axes * axis_vector((index + 1) % 3);
-            let v = place.axes * axis_vector((index + 2) % 3);
+            let u = place.reach(GizmoHandle::Arrow((index + 1) % 3));
+            let v = place.reach(GizmoHandle::Arrow((index + 2) % 3));
             let offset = (hit - place.origin) / place.unit;
             let half = PLANE_SIDE / 2.0;
             let inside = |along: f32| (along - PLANE_OFFSET).abs() <= half;
@@ -693,7 +740,12 @@ fn axis_vector(axis: usize) -> Vec3 {
 #[allow(clippy::too_many_arguments)]
 fn drive(
     mut commands: Commands,
-    gizmos: Query<(Entity, &TransformGizmo, &InheritedVisibility)>,
+    gizmos: Query<(
+        Entity,
+        &TransformGizmo,
+        &InheritedVisibility,
+        Option<&Facing>,
+    )>,
     cameras: Query<(&Camera, &GlobalTransform)>,
     globals: Query<&GlobalTransform>,
     mut locals: Query<&mut Transform>,
@@ -706,7 +758,7 @@ fn drive(
     let cursor = windows.iter().find_map(Window::cursor_position);
 
     if let Some(drag) = *held {
-        let Ok((_, gizmo, _)) = gizmos.get(drag.gizmo) else {
+        let Ok((_, gizmo, ..)) = gizmos.get(drag.gizmo) else {
             *held = None;
             pointer.dragging = None;
             return;
@@ -776,10 +828,14 @@ fn drive(
         return;
     };
     let mut nearest: Option<(f32, Entity, GizmoHandle, Placement, Ray3d)> = None;
-    for (entity, gizmo, visible) in &gizmos {
+    for (entity, gizmo, visible, facing) in &gizmos {
         if !visible.get() {
             continue;
         }
+        // Facing comes with the parts; until they are built, nothing shows.
+        let Some(facing) = facing else {
+            continue;
+        };
         let (Ok(camera), Ok(target)) = (cameras.get(gizmo.camera), globals.get(gizmo.target))
         else {
             continue;
@@ -787,7 +843,7 @@ fn drive(
         let Ok(ray) = camera.0.viewport_to_world(camera.1, cursor) else {
             continue;
         };
-        let Some(place) = placement(gizmo, target, camera) else {
+        let Some(place) = placement(gizmo, facing.0, target, camera) else {
             continue;
         };
         for handle in GizmoHandle::ALL {
@@ -810,18 +866,14 @@ fn drive(
     if !buttons.just_pressed(MouseButton::Left) {
         return;
     }
-    let Ok((_, gizmo, _)) = gizmos.get(entity) else {
+    let Ok((_, gizmo, ..)) = gizmos.get(entity) else {
         return;
     };
     let (Ok(start_global), Ok(start_local)) = (globals.get(gizmo.target), locals.get(gizmo.target))
     else {
         return;
     };
-    let axes = match handle {
-        GizmoHandle::Ball(_) => place.local_axes,
-        _ => place.axes,
-    };
-    let axis = axes * axis_vector(handle.axis());
+    let axis = place.reach(handle);
     let plane = match handle {
         GizmoHandle::Arrow(_) | GizmoHandle::Ball(_) => plane_along(ray, axis),
         GizmoHandle::Plane(_) | GizmoHandle::Ring(_) => axis,
@@ -834,8 +886,7 @@ fn drive(
         handle,
         origin: place.origin,
         axes: place.axes,
-        local_axes: place.local_axes,
-        labels: gizmo.labels(),
+        stretch_along: nearest_component(start_global.rotation(), axis),
         grabbed,
         plane,
         start_global: *start_global,
@@ -895,16 +946,13 @@ fn dragged_to(drag: &Drag, ray: Ray3d) -> Option<Moved> {
             }
         }
         GizmoHandle::Ball(index) => {
-            let axis = axis(drag.local_axes, index);
+            let axis = axis(drag.axes, index);
             let from = (drag.grabbed - drag.origin).dot(axis);
             let to = (point - drag.origin).dot(axis);
             if from.abs() < f32::EPSILON {
                 return None;
             }
-            // The target's own component this handle stretches: the one its
-            // label names, which under a relabelling need not be `index`.
-            let component = (drag.labels * axis_vector(index)).abs();
-            let stretch = Vec3::ONE + component * ((to / from).max(0.01) - 1.0);
+            let stretch = Vec3::ONE + drag.stretch_along * ((to / from).max(0.01) - 1.0);
             return Some(Moved::Stretch(stretch));
         }
     };
@@ -932,6 +980,7 @@ fn place_parts(
             &mut Transform,
             &mut GlobalTransform,
             &Children,
+            Option<&mut Facing>,
         ),
         Without<Part>,
     >,
@@ -948,15 +997,27 @@ fn place_parts(
     >,
 ) {
     let hot = pointer.dragging.or(pointer.hovered);
-    for (entity, gizmo, mut transform, mut global, children) in &mut gizmos {
-        let place = cameras
-            .get(gizmo.camera)
-            .ok()
-            .zip(targets.get(gizmo.target).ok())
-            .and_then(|(camera, target)| placement(gizmo, target, camera));
-        let Some(place) = place else {
+    for (entity, gizmo, mut transform, mut global, children, facing) in &mut gizmos {
+        let Some(mut facing) = facing else {
             continue;
         };
+        let (Ok(camera), Ok(target)) = (cameras.get(gizmo.camera), targets.get(gizmo.target))
+        else {
+            continue;
+        };
+        let Some(mut place) = placement(gizmo, facing.0, target, camera) else {
+            continue;
+        };
+        // Sides change only between drags, so a handle in hand stays where
+        // the pointer took it.
+        let held = pointer.dragging.is_some_and(|(gizmo, _)| gizmo == entity);
+        if !held {
+            let toward = facing_toward(facing.0, place.axes, place.origin, camera.1.translation());
+            if toward != facing.0 {
+                facing.0 = toward;
+            }
+            place.facing = toward;
+        }
         *transform = Transform::from_translation(place.origin).with_scale(Vec3::splat(place.unit));
         *global = GlobalTransform::from(*transform);
         for child in children.iter() {
@@ -965,15 +1026,23 @@ fn place_parts(
             else {
                 continue;
             };
-            let axes = match part.handle {
-                GizmoHandle::Ball(_) => place.local_axes,
-                _ => place.axes,
+            let index = part.handle.axis();
+            let turn = place.axes * onto_axis(index);
+            // The layout's X is the handle's own axis and its Y and Z the
+            // other two, so each flips with the side its axis faces. A ring
+            // has no side.
+            let flip = match part.handle {
+                GizmoHandle::Ring(_) => Vec3::ONE,
+                _ => Vec3::new(
+                    place.facing[index],
+                    place.facing[(index + 1) % 3],
+                    place.facing[(index + 2) % 3],
+                ),
             };
-            let turn = axes * onto_axis(part.handle.axis());
             *at = Transform {
-                translation: turn * part.at.translation,
-                rotation: turn * part.at.rotation,
-                scale: part.at.scale,
+                translation: turn * (part.offset * flip),
+                rotation: turn * Quat::from_rotation_arc(Vec3::Y, Vec3::X * flip.x),
+                scale: Vec3::ONE,
             };
             *part_global = global.mul_transform(*at);
             *visibility = if gizmo.shows(part.handle.mode()) {
@@ -1017,8 +1086,7 @@ mod tests {
             handle,
             origin: Vec3::ZERO,
             axes: Quat::IDENTITY,
-            local_axes: Quat::IDENTITY,
-            labels: Quat::IDENTITY,
+            stretch_along: axis_vector(handle.axis()),
             grabbed,
             plane,
             start_global: GlobalTransform::IDENTITY,
@@ -1034,7 +1102,7 @@ mod tests {
     }
 
     /// Under Z-up labels the Z arrow points along Bevy's up and the Y arrow
-    /// along Bevy's −Z, and the Z ball stretches the target's own Y.
+    /// along Bevy's −Z.
     #[test]
     fn z_up_labels_point_the_handles_their_way() {
         let gizmo = TransformGizmo {
@@ -1044,18 +1112,43 @@ mod tests {
         let labels = gizmo.labels();
         assert!((labels * axis_vector(2)).abs_diff_eq(Vec3::Y, 1e-6));
         assert!((labels * axis_vector(1)).abs_diff_eq(Vec3::NEG_Z, 1e-6));
+    }
 
-        let d = Drag {
-            axes: labels,
-            local_axes: labels,
-            labels,
-            ..drag(GizmoHandle::Ball(2), Vec3::new(0.0, 1.0, 0.0), Vec3::Z)
+    /// Each axis faces the side the eye is on, and one nearly side-on keeps
+    /// the side it had rather than flickering.
+    #[test]
+    fn handles_face_the_viewer_and_hold_when_side_on() {
+        let eye = Vec3::new(-5.0, 5.0, 0.2);
+        let toward = facing_toward(Vec3::ONE, Quat::IDENTITY, Vec3::ZERO, eye);
+        // X is behind, Y in front, Z all but side-on so it keeps its side.
+        assert_eq!(toward, Vec3::new(-1.0, 1.0, 1.0));
+        let kept = facing_toward(Vec3::NEG_ONE, Quat::IDENTITY, Vec3::ZERO, eye);
+        assert_eq!(kept, Vec3::new(-1.0, 1.0, -1.0));
+    }
+
+    /// A facing handle reaches the way it faces; a ring does not face.
+    #[test]
+    fn a_facing_handle_reaches_toward_its_side() {
+        let place = Placement {
+            origin: Vec3::ZERO,
+            axes: Quat::IDENTITY,
+            facing: Vec3::new(-1.0, 1.0, 1.0),
+            unit: 1.0,
         };
-        let ray = Ray3d::new(Vec3::new(0.3, 3.0, 10.0), Dir3::NEG_Z);
-        let Some(Moved::Stretch(stretch)) = dragged_to(&d, ray) else {
-            panic!("a ball stretches");
-        };
-        assert!(stretch.abs_diff_eq(Vec3::new(1.0, 3.0, 1.0), 1e-5));
+        assert_eq!(place.reach(GizmoHandle::Arrow(0)), Vec3::NEG_X);
+        assert_eq!(place.reach(GizmoHandle::Ball(0)), Vec3::NEG_X);
+        assert_eq!(place.reach(GizmoHandle::Ring(0)), Vec3::X);
+    }
+
+    /// In world space a ball on a turned target stretches the target's own
+    /// axis that lies along the ball's: a quarter turn about Y lays the
+    /// target's Z along the world's X.
+    #[test]
+    fn a_ball_stretches_the_nearest_own_axis() {
+        let turned = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        assert_eq!(nearest_component(turned, Vec3::X), Vec3::Z);
+        assert_eq!(nearest_component(turned, Vec3::NEG_X), Vec3::Z);
+        assert_eq!(nearest_component(Quat::IDENTITY, Vec3::Y), Vec3::Y);
     }
 
     fn ray_down_at(x: f32, z: f32) -> Ray3d {
