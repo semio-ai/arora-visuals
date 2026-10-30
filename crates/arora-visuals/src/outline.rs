@@ -43,6 +43,8 @@ use bevy::render::render_resource::{
 use bevy::shader::ShaderRef;
 
 use crate::instance::{EntityInstance, Superseded};
+#[cfg(test)]
+use crate::select::Selection;
 use crate::select::{covered, Selections};
 
 /// The render layer the mask camera draws, and only selected meshes are on.
@@ -51,17 +53,26 @@ pub const OUTLINE_LAYER: usize = 30;
 /// Outline this camera's view of the selection.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct OutlineView {
+    /// The colour of a selection that brings none of its own; see
+    /// [`Selections::colour`] for when one does.
     pub colour: Color,
     /// The line's width, in logical pixels.
     pub width: f32,
+    /// How strongly the selection itself is filled with the outline colour,
+    /// from not at all to solid, for when a line alone is not emphasis enough.
+    /// Like the line, the fill shows through whatever stands in front of the
+    /// selection.
+    pub fill: f32,
 }
 
 impl Default for OutlineView {
-    /// White, as Studio draws a selection that brings no colour of its own.
+    /// A white line and no fill, as Studio draws a selection that brings no
+    /// colour of its own.
     fn default() -> Self {
         Self {
             colour: Color::WHITE,
             width: 3.0,
+            fill: 0.0,
         }
     }
 }
@@ -96,7 +107,8 @@ pub struct OutlineUniform {
     pub colour: Vec4,
     /// In physical pixels.
     pub width: f32,
-    pub _padding: Vec3,
+    pub fill: f32,
+    pub _padding: Vec2,
 }
 
 /// The overlay's material; see `outline.wesl`.
@@ -167,7 +179,7 @@ fn attach_outline(
             None,
         ));
         let material = materials.add(OutlineMaterial {
-            outline: uniform(settings, 1.0),
+            outline: uniform(settings, None, 1.0),
             mask: mask.clone(),
         });
         let mask_camera = commands
@@ -208,10 +220,13 @@ fn attach_outline(
     }
 }
 
-fn uniform(settings: &OutlineView, scale: f32) -> OutlineUniform {
+/// What the shader is given: the selection's own colour if it has one, the
+/// view's otherwise, and the width scaled to physical pixels.
+fn uniform(settings: &OutlineView, colour: Option<Color>, scale: f32) -> OutlineUniform {
     OutlineUniform {
-        colour: LinearRgba::from(settings.colour).to_vec4(),
+        colour: LinearRgba::from(colour.unwrap_or(settings.colour)).to_vec4(),
         width: settings.width * scale,
+        fill: settings.fill,
         ..default()
     }
 }
@@ -233,9 +248,9 @@ fn mark_selection(
         let Some(selected) = selections.0.get(&instance.id) else {
             continue;
         };
-        for id in selected {
+        for selection in selected {
             wanted.extend(
-                covered(instance, id, &parents)
+                covered(instance, &selection.element, &parents)
                     .into_iter()
                     .filter_map(|element| element.mesh),
             );
@@ -270,6 +285,7 @@ fn mark_selection(
 /// Keeps the mask the size of the view, the mask camera looking through the
 /// view's lens, and the overlay exactly covering the view.
 fn fit_outline(
+    selections: Res<Selections>,
     views: Query<(&Camera, &Projection, &OutlineView, &OutlineParts)>,
     mut cameras: Query<&mut Projection, (With<OutlineMask>, Without<OutlineParts>)>,
     mut overlays: Query<&mut Transform, With<OutlineOverlay>>,
@@ -298,9 +314,14 @@ fn fit_outline(
         }
         // Only when something changed: touching a material re-uploads it. A
         // resize counts, because it replaces the mask the material binds.
-        let wanted = uniform(settings, camera.target_scaling_factor().unwrap_or(1.0));
+        let wanted = uniform(
+            settings,
+            selections.colour(),
+            camera.target_scaling_factor().unwrap_or(1.0),
+        );
         let stale = materials.get(&parts.material).is_some_and(|material| {
-            material.outline.colour != wanted.colour || material.outline.width != wanted.width
+            let held = &material.outline;
+            held.colour != wanted.colour || held.width != wanted.width || held.fill != wanted.fill
         });
         if stale || resized {
             if let Some(mut material) = materials.get_mut(&parts.material) {
@@ -366,7 +387,7 @@ mod tests {
     fn select(world: &mut World, ids: &[&str]) {
         world.resource_mut::<Selections>().0.insert(
             "robot".to_string(),
-            ids.iter().map(|id| id.to_string()).collect(),
+            ids.iter().map(|id| Selection::of(*id)).collect(),
         );
         world.run_system_once(mark_selection).unwrap();
     }

@@ -1,10 +1,10 @@
 // The selection outline, composited over the view.
 //
 // The mask holds the selection alone, drawn from the view camera's own eye.
-// A fragment the selection covers draws nothing — the line sits outside it —
-// and one within the outline's width of it takes the outline colour, weighted
-// by how much of the selection that reach finds, so the line's outer edge is
-// soft rather than stepped.
+// A fragment the selection covers takes only the fill, if there is one — the
+// line sits outside it. A fragment within the outline's width of it takes the
+// outline colour, weighted by how much of the selection that reach finds, so
+// the line's outer edge is soft rather than stepped.
 
 import bevy_pbr::render::{forward_io::VertexOutput, mesh_view_bindings::view};
 
@@ -12,7 +12,9 @@ struct Outline {
     colour: vec4<f32>,
     // In physical pixels.
     width: f32,
-    _padding: vec3<f32>,
+    // How strongly the selection itself is filled, from not at all to solid.
+    fill: f32,
+    _padding: vec2<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> outline: Outline;
@@ -32,8 +34,13 @@ fn coverage(uv: vec2<f32>) -> f32 {
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = (in.position.xy - view.viewport.xy) / view.viewport.zw;
-    if coverage(uv) > 0.5 {
-        discard;
+    let here = coverage(uv);
+    if here > 0.5 {
+        // Inside the selection: the fill, if there is one, and never the line.
+        if outline.fill <= 0.0 {
+            discard;
+        }
+        return vec4(outline.colour.rgb, outline.colour.a * outline.fill * here);
     }
     let texel = 1.0 / vec2<f32>(textureDimensions(mask));
     var reach = 0.0;

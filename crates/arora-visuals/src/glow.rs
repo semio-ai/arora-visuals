@@ -93,8 +93,8 @@ fn draw_glow(
         let Some(selected) = selections.0.get(&instance.id) else {
             continue;
         };
-        for id in selected {
-            for element in covered(instance, id, &parents) {
+        for selection in selected {
+            for element in covered(instance, &selection.element, &parents) {
                 let Some((mesh_id, mesh)) = elements.mesh(element) else {
                     continue;
                 };
