@@ -10,7 +10,10 @@
 //! one renderer's workaround.
 //!
 //! Bevy's picking is used only to deliver the press: with no mesh backend
-//! registered, every press reaches the window entity and is resolved here.
+//! registered, every press on the scene reaches the window entity and is
+//! resolved here. **A press that lands anywhere else is not the scene's.** A UI
+//! backend delivers a press on a panel to the panel's node, and resolving that
+//! one too would select whatever element happens to sit behind the panel.
 //!
 //! The press goes to the instances whose rectangle holds the pointer, the one
 //! drawn last first. The nearest element its ray meets is the pick; a press
@@ -47,10 +50,12 @@ pub fn on_press(
     instances: Query<&EntityInstance, Without<Superseded>>,
     cameras: Query<(&Camera, &GlobalTransform)>,
     elements: ElementMeshes,
+    windows: Query<(), With<Window>>,
     mut picks: ResMut<Picks>,
 ) {
-    // The press bubbles up from its target; resolve it once.
-    if press.entity != press.original_event_target() {
+    // The press bubbles up from its target; resolve it once, and only if what
+    // it landed on is the window rather than something drawn over the scene.
+    if press.entity != press.original_event_target() || !windows.contains(press.entity) {
         return;
     }
     let position = press.pointer.position;
