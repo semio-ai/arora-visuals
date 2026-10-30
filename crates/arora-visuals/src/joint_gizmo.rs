@@ -79,6 +79,13 @@ pub struct JointGizmo {
     /// transform gizmo's ring's at this size. Studio draws its joint controls
     /// at a fifth of a metre.
     pub size: GizmoSize,
+    /// Where the ring or bar stands and how it is turned, relative to the
+    /// joint: in the joint's rest frame, centred on its pivot with the body's
+    /// own axes. Its rotation turns the drawing — spinning a ring's zero round
+    /// its axis, say — and leaves the joint itself moving the body about or
+    /// along its own axis. [`JointGizmo::default_offset`] is where `new` puts
+    /// it.
+    pub offset: Transform,
     /// Pose the body from `value`. Without it the gizmo only keeps `value`.
     pub apply: bool,
 }
@@ -108,7 +115,22 @@ impl JointGizmo {
             rest,
             colour,
             size: GizmoSize::World(0.2),
+            offset: Self::default_offset(motion, axis),
             apply: true,
+        }
+    }
+
+    /// Where a joint gizmo stands unless told otherwise: a ring on the pivot;
+    /// a bar beside the travel, a ring's radius at Studio's size out from the
+    /// axis, since a bar laid on the axis would sit inside the housing it
+    /// slides through. Which side is fixed by the axis alone, in the body's
+    /// frame, so it does not change with how the body happens to be turned.
+    pub fn default_offset(motion: JointMotion, axis: Dir3) -> Transform {
+        match motion {
+            JointMotion::Turn => Transform::IDENTITY,
+            JointMotion::Slide => {
+                Transform::from_translation(axis.any_orthonormal_vector() * RING_RADIUS * 0.2)
+            }
         }
     }
 
@@ -316,9 +338,17 @@ pub(crate) struct JointFrame {
 /// ring's zero stays where it is while the joint turns past it.
 pub(crate) fn frame(gizmo: &JointGizmo, parent: &GlobalTransform, rest: &Transform) -> JointFrame {
     let at = parent.mul_transform(*rest);
-    let (_, rotation, centre) = at.to_scale_rotation_translation();
-    let axis = (rotation * *gizmo.axis).normalize_or(Vec3::Y);
-    let u = axis.any_orthonormal_vector();
+    let (_, rotation, pivot) = at.to_scale_rotation_translation();
+    // The offset in the body's frame, without the body's scale: it is a
+    // distance in the world, not a share of the body's size.
+    let centre = pivot + rotation * gizmo.offset.translation;
+    let turned = rotation * gizmo.offset.rotation;
+    let axis = (turned * *gizmo.axis).normalize_or(Vec3::Y);
+    // The ring's zero, fixed in the body's frame like the bar's side, so it
+    // turns with the offset rather than wherever the world puts it.
+    let u = (turned * gizmo.axis.any_orthonormal_vector())
+        .reject_from_normalized(axis)
+        .normalize_or(axis.any_orthonormal_vector());
     JointFrame {
         centre,
         axis,
@@ -328,11 +358,10 @@ pub(crate) fn frame(gizmo: &JointGizmo, parent: &GlobalTransform, rest: &Transfo
 }
 
 /// Where a sliding joint's bar runs, from one end of the travel to the other.
-fn bar_ends(gizmo: &JointGizmo, frame: &JointFrame, unit: f32) -> (Vec3, Vec3) {
-    let beside = frame.centre + frame.u * RING_RADIUS * unit;
+fn bar_ends(gizmo: &JointGizmo, frame: &JointFrame) -> (Vec3, Vec3) {
     (
-        beside + frame.axis * (gizmo.min - gizmo.rest),
-        beside + frame.axis * (gizmo.max - gizmo.rest),
+        frame.centre + frame.axis * (gizmo.min - gizmo.rest),
+        frame.centre + frame.axis * (gizmo.max - gizmo.rest),
     )
 }
 
@@ -382,7 +411,7 @@ pub(crate) fn distance(
             (nearest < f32::MAX).then_some(nearest)
         }
         JointMotion::Slide => {
-            let (from, to) = bar_ends(gizmo, &reach.frame, reach.unit);
+            let (from, to) = bar_ends(gizmo, &reach.frame);
             Some(segment_distance(pointer, to_screen(from)?, to_screen(to)?))
         }
     }
@@ -637,7 +666,7 @@ fn place_parts(
                 scale: Vec3::splat(unit),
             },
             JointMotion::Slide => {
-                let (from, to) = bar_ends(gizmo, &frame, unit);
+                let (from, to) = bar_ends(gizmo, &frame);
                 Transform {
                     translation: (from + to) / 2.0,
                     rotation: Quat::from_rotation_arc(Vec3::Y, frame.axis),
@@ -844,6 +873,43 @@ mod tests {
         gizmo.value = TAU - 0.1;
         let past = dragged(&gizmo, &held, ray_down_at(Vec3::new(1.0, 0.0, -0.1))).unwrap();
         assert!((past - (TAU + 0.1f32.atan2(1.0))).abs() < 1e-4, "{past}");
+    }
+
+    /// The offset places and turns the drawing in the joint's rest frame: a
+    /// shift moves the centre along the body's own axes, and a turn about the
+    /// joint's axis spins the ring's zero round it without tilting the axis.
+    #[test]
+    fn an_offset_moves_and_spins_the_drawing() {
+        let mut gizmo = joint(JointMotion::Turn, -1.0, 1.0);
+        let body = Transform::from_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2));
+        let plain = frame(&gizmo, &GlobalTransform::IDENTITY, &body);
+        gizmo.offset = Transform::from_xyz(1.0, 0.0, 0.0)
+            .with_rotation(Quat::from_axis_angle(Vec3::Y, std::f32::consts::FRAC_PI_2));
+        let moved = frame(&gizmo, &GlobalTransform::IDENTITY, &body);
+        // The body's X is the world's Y after its quarter turn about Z.
+        assert!(
+            moved.centre.abs_diff_eq(Vec3::Y, 1e-5),
+            "{:?}",
+            moved.centre
+        );
+        assert!(moved.axis.abs_diff_eq(plain.axis, 1e-5));
+        assert!(
+            moved.u.dot(plain.u).abs() < 1e-5,
+            "the zero turned a quarter"
+        );
+    }
+
+    /// A slide's bar stands beside its axis by default, and its offset moves
+    /// it.
+    #[test]
+    fn a_bar_stands_beside_its_axis_unless_moved() {
+        let mut gizmo = joint(JointMotion::Slide, -0.1, 0.1);
+        let beside = frame(&gizmo, &GlobalTransform::IDENTITY, &Transform::IDENTITY).centre;
+        assert!((beside.length() - RING_RADIUS * 0.2).abs() < 1e-5);
+        assert!(beside.dot(*gizmo.axis).abs() < 1e-5);
+        gizmo.offset = Transform::IDENTITY;
+        let on = frame(&gizmo, &GlobalTransform::IDENTITY, &Transform::IDENTITY).centre;
+        assert!(on.abs_diff_eq(Vec3::ZERO, 1e-6));
     }
 
     /// A slide follows the pointer along its axis and holds at its ends.

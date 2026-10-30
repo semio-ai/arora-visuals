@@ -146,10 +146,12 @@ pub struct TransformGizmo {
     pub only: Option<TransformMode>,
     pub space: GizmoSpace,
     pub size: GizmoSize,
-    /// Where the gizmo stands from the target's origin, along the gizmo's own
-    /// axes. Turning a target about an offset gizmo swings it round that
-    /// point.
-    pub offset: Vec3,
+    /// Where the gizmo stands and how it is turned, relative to the target:
+    /// its position is the offset's translation in the target's own frame,
+    /// and its axes are turned by the offset's rotation — after the target's
+    /// own rotation in local space, by itself in world space. Turning a target
+    /// about an offset gizmo swings it round the gizmo.
+    pub offset: Transform,
     /// The directions the gizmo calls X, Y and Z, in the space it works in:
     /// Bevy's own by default, or [`TransformGizmo::Z_UP`] for a Z-up world.
     /// They must be a right-handed set.
@@ -171,7 +173,7 @@ impl TransformGizmo {
             only: None,
             space: GizmoSpace::World,
             size: GizmoSize::Pixels(100.0),
-            offset: Vec3::ZERO,
+            offset: Transform::IDENTITY,
             axes: [Dir3::X, Dir3::Y, Dir3::Z],
             colours: [
                 Color::srgb_u8(0xef, 0x44, 0x44),
@@ -650,10 +652,12 @@ fn placement(
     let (_, turned, position) = target.to_scale_rotation_translation();
     let labels = gizmo.labels();
     let axes = match gizmo.space {
-        GizmoSpace::World => labels,
-        GizmoSpace::Local => turned * labels,
+        GizmoSpace::World => gizmo.offset.rotation * labels,
+        GizmoSpace::Local => turned * gizmo.offset.rotation * labels,
     };
-    let origin = position + axes * gizmo.offset;
+    // In the target's own frame, but not its scale: an offset is a distance
+    // in the world, not a share of the target's size.
+    let origin = position + turned * gizmo.offset.translation;
     let unit = unit_size(gizmo.size, camera, origin)?;
     Some(Placement {
         origin,
