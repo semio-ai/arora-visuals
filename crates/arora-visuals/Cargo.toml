@@ -18,6 +18,16 @@ snapshot = ["dep:bevy", "dep:image"]
 # outline. Off by default for the same reason as `snapshot` — a consumer that
 # wants the asset parse should not build a renderer to get it.
 view = ["dep:bevy"]
+# The view gizmo, which is drawn as UI. Apart from `view` because it brings the
+# UI and text stacks and a font, which a renderer without the gizmo should not
+# build.
+view_gizmo = [
+  "view",
+  "bevy/bevy_ui",
+  "bevy/bevy_ui_render",
+  "bevy/ui_picking",
+  "bevy/default_font",
+]
 
 # Dependencies are added by the module that needs them, never ahead of one. A
 # module that needs no Bevy type must not import one: that is what keeps it out

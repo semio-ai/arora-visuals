@@ -67,6 +67,8 @@ pub mod snapshot;
 pub mod target;
 pub mod tone;
 pub mod value;
+#[cfg(feature = "view_gizmo")]
+pub mod view_gizmo;
 
 pub use binding::{ElementTargets, SceneBinding, SceneBindings};
 pub use hold::{HoldTarget, Holds};
