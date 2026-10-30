@@ -31,7 +31,7 @@ use std::f32::consts::TAU;
 use bevy::asset::{embedded_asset, embedded_path, AssetPath};
 use bevy::camera::visibility::NoFrustumCulling;
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
-use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::mesh::{MeshVertexBufferLayoutRef, VertexAttributeValues};
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -543,7 +543,7 @@ fn build_parts(
             ),
             JointMotion::Slide => (
                 // A unit long; stretched to the travel when placed.
-                TUBE.map(|tube| meshes.add(Cylinder::new(tube, 1.0))),
+                TUBE.map(|tube| meshes.add(bar_mesh(tube))),
                 RangeLook::Bar(bars.add(BarRangeMaterial { range: uniform })),
             ),
         };
@@ -708,6 +708,32 @@ fn parent_global(
         .unwrap_or(GlobalTransform::IDENTITY)
 }
 
+/// A bar a unit long along Y, whose `uv.y` everywhere says how far along the
+/// travel a point is, as `joint_bar.wesl` reads it.
+///
+/// A cylinder's sides already run `uv.y` from nought at its −Y end to one at
+/// its +Y end, but its end caps carry coordinates of their own, laid out as a
+/// disc, which the shader would read as somewhere along the travel — so a cap
+/// would show the travelled colour wherever its disc falls below the joint's
+/// progress. Each cap is given the coordinate of the end it closes.
+fn bar_mesh(radius: f32) -> Mesh {
+    let mut mesh = Mesh::from(Cylinder::new(radius, 1.0));
+    let normals: Vec<[f32; 3]> = match mesh.attribute(Mesh::ATTRIBUTE_NORMAL) {
+        Some(VertexAttributeValues::Float32x3(normals)) => normals.clone(),
+        _ => return mesh,
+    };
+    if let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
+        for (uv, normal) in uvs.iter_mut().zip(&normals) {
+            if normal[1] > 0.5 {
+                uv[1] = 1.0;
+            } else if normal[1] < -0.5 {
+                uv[1] = 0.0;
+            }
+        }
+    }
+    mesh
+}
+
 /// Turns a torus built about +Y so its own angle runs the way the frame
 /// measures angles, its zero at `origin`.
 ///
@@ -783,6 +809,26 @@ mod tests {
         gizmo.value = 0.5;
         let back = dragged(&gizmo, &held, ray_down_at(Vec3::new(1.0, 0.0, -0.2))).unwrap();
         assert!((back - 0.2f32.atan2(1.0)).abs() < 1e-4);
+    }
+
+    /// Every point of a bar's cap says the end of the travel it closes, and
+    /// the sides run from nought at −Y to one at +Y.
+    #[test]
+    fn a_bar_reads_its_travel_from_end_to_end() {
+        let mesh = bar_mesh(0.1);
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            panic!("a bar has positions");
+        };
+        let Some(VertexAttributeValues::Float32x2(uvs)) = mesh.attribute(Mesh::ATTRIBUTE_UV_0)
+        else {
+            panic!("a bar has coordinates");
+        };
+        for (position, uv) in positions.iter().zip(uvs) {
+            let expected = position[1] + 0.5;
+            assert!((uv[1] - expected).abs() < 1e-5, "{position:?} reads {uv:?}");
+        }
     }
 
     /// An endless turn keeps going past a whole turn rather than jumping back
