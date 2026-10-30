@@ -88,9 +88,10 @@ pub struct JointGizmo {
     pub offset: Transform,
     /// Pose the body from `value`. Without it the gizmo only keeps `value`.
     pub apply: bool,
-    /// What the host calls this gizmo — the animatable it drives, say: the
-    /// name it goes by in the [overlay](crate::overlay), where an entity id
-    /// would mean nothing.
+    /// What the host calls this gizmo: the name it goes by in the
+    /// [overlay](crate::overlay), where an entity id would mean nothing. Any
+    /// string the host chooses — the blackboard key its value is written to,
+    /// say — since this crate reads nothing into it.
     pub key: String,
 }
 
