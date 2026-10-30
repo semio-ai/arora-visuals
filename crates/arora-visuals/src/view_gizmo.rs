@@ -63,9 +63,9 @@ impl Default for ViewGizmo {
 }
 
 impl ViewGizmo {
-    /// The axes of a Z-up world as Bevy's Y-up one holds it: Z is Bevy's up,
-    /// and Y is Bevy's −Z, so the three still form a right-handed set.
-    pub const Z_UP: [Dir3; 3] = [Dir3::X, Dir3::NEG_Z, Dir3::Y];
+    /// The axes of a Z-up world as Bevy's Y-up one holds it; the same as the
+    /// transform gizmo's, so the two agree on which way each axis points.
+    pub const Z_UP: [Dir3; 3] = crate::transform_gizmo::TransformGizmo::Z_UP;
 }
 
 /// A request, from a press on the gizmo, for `camera` to look from the side

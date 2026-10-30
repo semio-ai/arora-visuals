@@ -30,6 +30,7 @@ use bevy::prelude::*;
 
 use crate::binding::ElementTargets;
 use crate::instance::{EntityInstance, Superseded};
+use crate::transform_gizmo::GizmoPointer;
 
 /// A pointer press on an instance: the element under it, by the ids the
 /// asset's own `RobotData` declares, or `None` for a press that hit no
@@ -51,11 +52,18 @@ pub fn on_press(
     cameras: Query<(&Camera, &GlobalTransform)>,
     elements: ElementMeshes,
     windows: Query<(), With<Window>>,
+    gizmos: Option<Res<GizmoPointer>>,
     mut picks: ResMut<Picks>,
 ) {
     // The press bubbles up from its target; resolve it once, and only if what
     // it landed on is the window rather than something drawn over the scene.
     if press.entity != press.original_event_target() || !windows.contains(press.entity) {
+        return;
+    }
+    // A gizmo's handles are drawn over the scene but reach the window like
+    // any press on it, so one that grabs a handle is the gizmo's, not a pick
+    // of whatever lies behind the handle.
+    if gizmos.is_some_and(|gizmos| gizmos.engaged()) {
         return;
     }
     let position = press.pointer.position;

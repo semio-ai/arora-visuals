@@ -65,6 +65,8 @@ pub mod select;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
 pub mod target;
+#[cfg(feature = "view")]
+pub mod transform_gizmo;
 pub mod tone;
 pub mod value;
 #[cfg(feature = "view_gizmo")]
