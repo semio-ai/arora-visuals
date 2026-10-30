@@ -68,6 +68,7 @@ the upgrade off the schedule of a repo that has not adopted it yet.
 | `pick` | a pointer press resolved over the mesh **as drawn**, behind `view` | the whole engine |
 | `glow` | feature-edge selection marking, behind `view` | the whole engine |
 | `outline` | the selection outline: one line around the whole of what is selected, drawn over whatever stands in front of it, behind `view` | the whole engine |
+| `joint_gizmo` | a ring to turn a joint or a bar to slide it, within its limits and shaded to show its range, sharing the transform gizmo's look and pointer handling, behind `view` | the whole engine |
 | `transform_gizmo` | handles to move, turn and scale an entity — any of the three modes, together or one at a time — spawned on their own and pointed at a target, behind `view` | the whole engine |
 | `view_gizmo` | the corner gizmo of labelled axes that turns with the camera; a press on a ball asks for the view down that axis, behind `view_gizmo` | the whole engine, and the UI stack |
 | `select` | what is selected, and which element meshes a selection covers, behind `view` | the whole engine |

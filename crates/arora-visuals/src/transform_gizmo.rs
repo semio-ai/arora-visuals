@@ -75,6 +75,11 @@ use bevy::render::render_resource::{
 };
 use bevy::shader::ShaderRef;
 
+use crate::joint_gizmo::{
+    distance as joint_distance, dragged, reach as joint_reach, take, JointDrag, JointGizmo,
+    JointHeld, JointReach, Rest,
+};
+
 /// What a gizmo's handles can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TransformMode {
@@ -199,22 +204,28 @@ impl TransformGizmo {
     }
 }
 
-/// One handle of a gizmo, by what it does and about which axis. A plane's axis
-/// is the one it is square to.
+/// One handle of a gizmo: a transform gizmo's, by what it does and about
+/// which axis — a plane's axis being the one it is square to — or a joint
+/// gizmo's ring or bar, which is its only handle. `Joint` is here so that
+/// [`GizmoPointer`] can name either kind; the transform gizmo's own code never
+/// meets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GizmoHandle {
     Arrow(usize),
     Plane(usize),
     Ring(usize),
     Ball(usize),
+    Joint,
 }
 
 impl GizmoHandle {
-    fn mode(self) -> TransformMode {
+    /// The transform mode a handle belongs to; a joint's belongs to none.
+    fn mode(self) -> Option<TransformMode> {
         match self {
-            GizmoHandle::Arrow(_) | GizmoHandle::Plane(_) => TransformMode::Translate,
-            GizmoHandle::Ring(_) => TransformMode::Rotate,
-            GizmoHandle::Ball(_) => TransformMode::Scale,
+            GizmoHandle::Arrow(_) | GizmoHandle::Plane(_) => Some(TransformMode::Translate),
+            GizmoHandle::Ring(_) => Some(TransformMode::Rotate),
+            GizmoHandle::Ball(_) => Some(TransformMode::Scale),
+            GizmoHandle::Joint => None,
         }
     }
 
@@ -224,6 +235,7 @@ impl GizmoHandle {
             | GizmoHandle::Plane(axis)
             | GizmoHandle::Ring(axis)
             | GizmoHandle::Ball(axis) => axis,
+            GizmoHandle::Joint => 0,
         }
     }
 
@@ -289,7 +301,9 @@ pub struct GizmoPart;
 const SHAFT_LENGTH: f32 = 0.8;
 const CONE_LENGTH: f32 = 0.2;
 const CONE_RADIUS: f32 = 0.05;
-const RING_RADIUS: f32 = 0.65;
+/// A ring's radius, in units of the gizmo's size; public so a host can place
+/// things — a label, say — clear of a ring.
+pub const RING_RADIUS: f32 = 0.65;
 const PLANE_OFFSET: f32 = 0.243;
 const PLANE_SIDE: f32 = 0.225;
 const BALL_REACH: f32 = 1.2;
@@ -298,7 +312,7 @@ const BALL_RADIUS: f32 = 0.044;
 /// the planes and the other arrows crowd.
 const ARROW_FROM: f32 = 0.25;
 /// How far from a handle on screen the pointer may be and still take it.
-const REACH_PX: f32 = 8.0;
+pub(crate) const REACH_PX: f32 = 8.0;
 /// Below this share of facing the camera a plane is too nearly edge-on to
 /// drag in.
 const EDGE_ON: f32 = 0.15;
@@ -309,7 +323,7 @@ const FLIP: f32 = 0.1;
 /// The radius of an arrow's shaft and of a ring's tube, at rest and in hand:
 /// the two are one line drawn two ways, so they are one thickness, and the
 /// swap from thin to thick is the joint controls' hover.
-const TUBE: [f32; 2] = [0.012, 0.04];
+pub(crate) const TUBE: [f32; 2] = [0.012, 0.04];
 /// How far every handle's surface moves out in hand: the tubes' thickening,
 /// so a ball and an arrowhead grow with the lines they sit on rather than by
 /// a share of their own size.
@@ -482,7 +496,7 @@ fn build_parts(
         };
         let mut pieces: Vec<Piece> = Vec::new();
         for handle in GizmoHandle::ALL {
-            if !gizmo.modes.has(handle.mode()) {
+            if !handle.mode().is_some_and(|mode| gizmo.modes.has(mode)) {
                 continue;
             }
             let colour = gizmo.colours[handle.axis()];
@@ -546,6 +560,8 @@ fn build_parts(
                         false,
                     ));
                 }
+                // Not one of a transform gizmo's; never among `ALL`.
+                GizmoHandle::Joint => {}
                 GizmoHandle::Ball(_) => {
                     let look = material(colour, OPACITY);
                     pieces.push((
@@ -620,7 +636,7 @@ impl Placement {
         let axis = self.axes * axis_vector(index);
         match handle {
             GizmoHandle::Arrow(_) | GizmoHandle::Ball(_) => axis * self.facing[index],
-            GizmoHandle::Plane(_) | GizmoHandle::Ring(_) => axis,
+            GizmoHandle::Plane(_) | GizmoHandle::Ring(_) | GizmoHandle::Joint => axis,
         }
     }
 }
@@ -638,16 +654,26 @@ fn placement(
         GizmoSpace::Local => turned * labels,
     };
     let origin = position + axes * gizmo.offset;
-    let unit = match gizmo.size {
-        GizmoSize::World(metres) => metres,
-        GizmoSize::Pixels(pixels) => pixels * metres_per_pixel(camera, origin)?,
-    };
+    let unit = unit_size(gizmo.size, camera, origin)?;
     Some(Placement {
         origin,
         axes,
         facing,
         unit,
     })
+}
+
+/// How many metres one gizmo unit is, for a gizmo of `size` standing at
+/// `point`.
+pub(crate) fn unit_size(
+    size: GizmoSize,
+    camera: (&Camera, &GlobalTransform),
+    point: Vec3,
+) -> Option<f32> {
+    match size {
+        GizmoSize::World(metres) => Some(metres),
+        GizmoSize::Pixels(pixels) => Some(pixels * metres_per_pixel(camera, point)?),
+    }
 }
 
 /// Which side of each axis faces the viewer, keeping `previous` for an axis
@@ -692,7 +718,7 @@ fn metres_per_pixel((camera, at): (&Camera, &GlobalTransform), point: Vec3) -> O
 }
 
 /// Where a ray meets the plane through `origin` square to `normal`.
-fn meet_plane(ray: Ray3d, normal: Vec3, origin: Vec3) -> Option<Vec3> {
+pub(crate) fn meet_plane(ray: Ray3d, normal: Vec3, origin: Vec3) -> Option<Vec3> {
     let along = ray.direction.dot(normal);
     if along.abs() < f32::EPSILON {
         return None;
@@ -703,7 +729,7 @@ fn meet_plane(ray: Ray3d, normal: Vec3, origin: Vec3) -> Option<Vec3> {
 
 /// A plane containing `axis` and turned as far toward the viewer as it can
 /// be: dragging along an axis is meeting the pointer's ray with this.
-fn plane_along(ray: Ray3d, axis: Vec3) -> Vec3 {
+pub(crate) fn plane_along(ray: Ray3d, axis: Vec3) -> Vec3 {
     let across = ray.direction.cross(axis);
     if across.length_squared() < f32::EPSILON {
         return axis.any_orthonormal_vector();
@@ -711,7 +737,7 @@ fn plane_along(ray: Ray3d, axis: Vec3) -> Vec3 {
     axis.cross(across.normalize()).normalize()
 }
 
-fn segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f32 {
+pub(crate) fn segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f32 {
     let ab = b - a;
     let t = ((point - a).dot(ab) / ab.length_squared().max(f32::EPSILON)).clamp(0.0, 1.0);
     point.distance(a + ab * t)
@@ -757,6 +783,8 @@ fn distance_to(
             }
             (nearest < f32::MAX).then_some(nearest)
         }
+        // A joint gizmo's handle is measured by its own module.
+        GizmoHandle::Joint => None,
         GizmoHandle::Plane(index) => {
             if ray.direction.dot(axis).abs() < EDGE_ON {
                 return None;
@@ -776,9 +804,24 @@ fn axis_vector(axis: usize) -> Vec3 {
     [Vec3::X, Vec3::Y, Vec3::Z][axis]
 }
 
+/// A drag in hand, of either kind of gizmo.
+#[derive(Clone, Copy)]
+enum Held {
+    Transform(Drag),
+    Joint(JointHeld),
+}
+
+/// A handle under the pointer, of either kind of gizmo, with what taking it
+/// needs.
+enum Candidate {
+    Transform(Entity, GizmoHandle, Placement, Ray3d),
+    Joint(Entity, JointReach, Ray3d),
+}
+
 /// Finds the handle under the pointer, and takes, drags and lets go of
-/// handles with the left button.
-#[allow(clippy::too_many_arguments)]
+/// handles with the left button — for transform and joint gizmos alike, so
+/// whichever handle of either is nearest the pointer is the one taken.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn drive(
     mut commands: Commands,
     gizmos: Query<(
@@ -787,6 +830,7 @@ fn drive(
         &InheritedVisibility,
         Option<&Facing>,
     )>,
+    mut joints: Query<(Entity, &mut JointGizmo, Option<&Rest>, &InheritedVisibility)>,
     cameras: Query<(&Camera, &GlobalTransform)>,
     globals: Query<&GlobalTransform>,
     mut locals: Query<&mut Transform>,
@@ -794,73 +838,107 @@ fn drive(
     windows: Query<&Window>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut pointer: ResMut<GizmoPointer>,
-    mut held: Local<Option<Drag>>,
+    mut held: Local<Option<Held>>,
 ) {
     let cursor = windows.iter().find_map(Window::cursor_position);
+    let ray_through = |camera: Entity| {
+        cursor
+            .zip(cameras.get(camera).ok())
+            .and_then(|(cursor, (camera, at))| camera.viewport_to_world(at, cursor).ok())
+    };
+    let parent_of = |target: Entity| {
+        parents
+            .get(target)
+            .ok()
+            .and_then(|child_of| globals.get(child_of.parent()).ok())
+            .copied()
+            .unwrap_or(GlobalTransform::IDENTITY)
+    };
+    let released = !buttons.pressed(MouseButton::Left);
 
-    if let Some(drag) = *held {
-        let Ok((_, gizmo, ..)) = gizmos.get(drag.gizmo) else {
-            *held = None;
-            pointer.dragging = None;
-            return;
-        };
-        let released = !buttons.pressed(MouseButton::Left);
-        let ray = cursor
-            .zip(cameras.get(gizmo.camera).ok())
-            .and_then(|(cursor, (camera, at))| camera.viewport_to_world(at, cursor).ok());
-        let moved = ray.and_then(|ray| dragged_to(&drag, ray));
-        if let Some(moved) = moved {
-            let local = match moved {
-                Moved::World(global) => {
-                    let parent = parents
-                        .get(gizmo.target)
-                        .ok()
-                        .and_then(|child_of| globals.get(child_of.parent()).ok());
-                    // Moving and turning leave the scale as it was; taking it
-                    // back out of the world would only add rounding to it.
-                    Transform {
-                        scale: drag.start_local.scale,
-                        ..match parent {
-                            Some(parent) => global.reparented_to(parent),
-                            None => global.compute_transform(),
+    match *held {
+        Some(Held::Transform(drag)) => {
+            let Ok((_, gizmo, ..)) = gizmos.get(drag.gizmo) else {
+                *held = None;
+                pointer.dragging = None;
+                return;
+            };
+            let moved = ray_through(gizmo.camera).and_then(|ray| dragged_to(&drag, ray));
+            if let Some(moved) = moved {
+                let local = match moved {
+                    Moved::World(global) => {
+                        // Moving and turning leave the scale as it was; taking
+                        // it back out of the world would only add rounding.
+                        Transform {
+                            scale: drag.start_local.scale,
+                            ..global.reparented_to(&parent_of(gizmo.target))
                         }
                     }
+                    Moved::Stretch(stretch) => Transform {
+                        scale: drag.start_local.scale * stretch,
+                        ..drag.start_local
+                    },
+                };
+                if gizmo.apply {
+                    if let Ok(mut transform) = locals.get_mut(gizmo.target) {
+                        *transform = local;
+                    }
                 }
-                Moved::Stretch(stretch) => Transform {
-                    scale: drag.start_local.scale * stretch,
-                    ..drag.start_local
-                },
+                commands.trigger(GizmoDrag {
+                    entity: drag.gizmo,
+                    target: gizmo.target,
+                    handle: drag.handle,
+                    phase: if released {
+                        DragPhase::End
+                    } else {
+                        DragPhase::Move
+                    },
+                    transform: local,
+                });
+            } else if released {
+                commands.trigger(GizmoDrag {
+                    entity: drag.gizmo,
+                    target: gizmo.target,
+                    handle: drag.handle,
+                    phase: DragPhase::End,
+                    transform: locals.get(gizmo.target).copied().unwrap_or_default(),
+                });
+            }
+            if released {
+                *held = None;
+                pointer.dragging = None;
+            }
+            return;
+        }
+        Some(Held::Joint(grip)) => {
+            let Ok((_, mut gizmo, ..)) = joints.get_mut(grip.gizmo) else {
+                *held = None;
+                pointer.dragging = None;
+                return;
             };
-            if gizmo.apply {
-                if let Ok(mut transform) = locals.get_mut(gizmo.target) {
-                    *transform = local;
+            let value = ray_through(gizmo.camera).and_then(|ray| dragged(&gizmo, &grip, ray));
+            if let Some(value) = value {
+                if gizmo.value != value {
+                    gizmo.value = value;
                 }
             }
-            commands.trigger(GizmoDrag {
-                entity: drag.gizmo,
+            commands.trigger(JointDrag {
+                entity: grip.gizmo,
                 target: gizmo.target,
-                handle: drag.handle,
                 phase: if released {
                     DragPhase::End
                 } else {
                     DragPhase::Move
                 },
-                transform: local,
+                value: gizmo.value,
             });
-        } else if released {
-            commands.trigger(GizmoDrag {
-                entity: drag.gizmo,
-                target: gizmo.target,
-                handle: drag.handle,
-                phase: DragPhase::End,
-                transform: locals.get(gizmo.target).copied().unwrap_or_default(),
-            });
+            if released {
+                *held = None;
+                pointer.dragging = None;
+            }
+            return;
         }
-        if released {
-            *held = None;
-            pointer.dragging = None;
-        }
-        return;
+        None => {}
     }
 
     // Nothing held: find what is under the pointer — unless a button is
@@ -873,7 +951,12 @@ fn drive(
     let Some(cursor) = cursor else {
         return;
     };
-    let mut nearest: Option<(f32, Entity, GizmoHandle, Placement, Ray3d)> = None;
+    let mut nearest: Option<(f32, Candidate)> = None;
+    let mut offer = |distance: f32, candidate: Candidate| {
+        if distance <= REACH_PX && nearest.as_ref().is_none_or(|(best, _)| distance < *best) {
+            nearest = Some((distance, candidate));
+        }
+    };
     for (entity, gizmo, visible, facing) in &gizmos {
         if !visible.get() {
             continue;
@@ -893,60 +976,97 @@ fn drive(
             continue;
         };
         for handle in GizmoHandle::ALL {
-            if !gizmo.shows(handle.mode()) {
+            if !handle.mode().is_some_and(|mode| gizmo.shows(mode)) {
                 continue;
             }
-            let Some(distance) = distance_to(handle, &place, cursor, ray, camera) else {
-                continue;
-            };
-            if distance <= REACH_PX && nearest.as_ref().is_none_or(|(best, ..)| distance < *best) {
-                nearest = Some((distance, entity, handle, place, ray));
+            if let Some(distance) = distance_to(handle, &place, cursor, ray, camera) {
+                offer(distance, Candidate::Transform(entity, handle, place, ray));
             }
         }
     }
-    let Some((_, entity, handle, place, ray)) = nearest else {
+    for (entity, gizmo, rest, visible) in &joints {
+        if !visible.get() {
+            continue;
+        }
+        let Ok(camera) = cameras.get(gizmo.camera) else {
+            continue;
+        };
+        let Ok(ray) = camera.0.viewport_to_world(camera.1, cursor) else {
+            continue;
+        };
+        let Some(reach) = joint_reach(gizmo, rest, &parent_of(gizmo.target), camera) else {
+            continue;
+        };
+        if let Some(distance) = joint_distance(gizmo, &reach, cursor, camera) {
+            offer(distance, Candidate::Joint(entity, reach, ray));
+        }
+    }
+    let Some((_, candidate)) = nearest else {
         return;
     };
-    pointer.hovered = Some((entity, handle));
+    let hovered = match &candidate {
+        Candidate::Transform(entity, handle, ..) => (*entity, *handle),
+        Candidate::Joint(entity, ..) => (*entity, GizmoHandle::Joint),
+    };
+    pointer.hovered = Some(hovered);
 
     if !buttons.just_pressed(MouseButton::Left) {
         return;
     }
-    let Ok((_, gizmo, ..)) = gizmos.get(entity) else {
-        return;
-    };
-    let (Ok(start_global), Ok(start_local)) = (globals.get(gizmo.target), locals.get(gizmo.target))
-    else {
-        return;
-    };
-    let axis = place.reach(handle);
-    let plane = match handle {
-        GizmoHandle::Arrow(_) | GizmoHandle::Ball(_) => plane_along(ray, axis),
-        GizmoHandle::Plane(_) | GizmoHandle::Ring(_) => axis,
-    };
-    let Some(grabbed) = meet_plane(ray, plane, place.origin) else {
-        return;
-    };
-    let drag = Drag {
-        gizmo: entity,
-        handle,
-        origin: place.origin,
-        axes: place.axes,
-        stretch_along: nearest_component(start_global.rotation(), axis),
-        grabbed,
-        plane,
-        start_global: *start_global,
-        start_local: *start_local,
-    };
-    *held = Some(drag);
-    pointer.dragging = Some((entity, handle));
-    commands.trigger(GizmoDrag {
-        entity,
-        target: gizmo.target,
-        handle,
-        phase: DragPhase::Start,
-        transform: *start_local,
-    });
+    match candidate {
+        Candidate::Transform(entity, handle, place, ray) => {
+            let Ok((_, gizmo, ..)) = gizmos.get(entity) else {
+                return;
+            };
+            let (Ok(start_global), Ok(start_local)) =
+                (globals.get(gizmo.target), locals.get(gizmo.target))
+            else {
+                return;
+            };
+            let axis = place.reach(handle);
+            let plane = match handle {
+                GizmoHandle::Arrow(_) | GizmoHandle::Ball(_) => plane_along(ray, axis),
+                GizmoHandle::Plane(_) | GizmoHandle::Ring(_) | GizmoHandle::Joint => axis,
+            };
+            let Some(grabbed) = meet_plane(ray, plane, place.origin) else {
+                return;
+            };
+            *held = Some(Held::Transform(Drag {
+                gizmo: entity,
+                handle,
+                origin: place.origin,
+                axes: place.axes,
+                stretch_along: nearest_component(start_global.rotation(), axis),
+                grabbed,
+                plane,
+                start_global: *start_global,
+                start_local: *start_local,
+            }));
+            commands.trigger(GizmoDrag {
+                entity,
+                target: gizmo.target,
+                handle,
+                phase: DragPhase::Start,
+                transform: *start_local,
+            });
+        }
+        Candidate::Joint(entity, reach, ray) => {
+            let Ok((_, gizmo, ..)) = joints.get(entity) else {
+                return;
+            };
+            let Some(grip) = take(entity, gizmo, &reach, ray) else {
+                return;
+            };
+            *held = Some(Held::Joint(grip));
+            commands.trigger(JointDrag {
+                entity,
+                target: gizmo.target,
+                phase: DragPhase::Start,
+                value: gizmo.value,
+            });
+        }
+    }
+    pointer.dragging = Some(hovered);
 }
 
 /// What a drag does to its target.
@@ -991,6 +1111,8 @@ fn dragged_to(drag: &Drag, ray: Ray3d) -> Option<Moved> {
                 scale,
             }
         }
+        // A joint drag is carried by its own module, never as a `Drag`.
+        GizmoHandle::Joint => return None,
         GizmoHandle::Ball(index) => {
             let axis = axis(drag.axes, index);
             let from = (drag.grabbed - drag.origin).dot(axis);
@@ -1091,7 +1213,7 @@ fn place_parts(
                 scale: Vec3::ONE,
             };
             *part_global = global.mul_transform(*at);
-            let shown = gizmo.shows(part.handle.mode())
+            let shown = part.handle.mode().is_some_and(|mode| gizmo.shows(mode))
                 && !(part.stem && gizmo.shows(TransformMode::Translate));
             *visibility = if shown {
                 Visibility::Inherited

@@ -66,6 +66,8 @@ pub mod select;
 pub mod snapshot;
 pub mod target;
 #[cfg(feature = "view")]
+pub mod joint_gizmo;
+#[cfg(feature = "view")]
 pub mod transform_gizmo;
 pub mod tone;
 pub mod value;
