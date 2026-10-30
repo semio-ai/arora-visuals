@@ -480,9 +480,12 @@ fn build_parts(
                     pieces.push((
                         handle,
                         Vec3::X * (SHAFT_LENGTH + CONE_LENGTH / 2.0),
-                        SWELL.map(|swell| {
+                        // The head overhangs the shaft by the same margin
+                        // however thick the shaft is, so the two grow
+                        // together in hand.
+                        TUBE.map(|tube| {
                             meshes.add(Cone {
-                                radius: CONE_RADIUS * swell,
+                                radius: tube + CONE_RADIUS - TUBE[0],
                                 height: CONE_LENGTH,
                             })
                         }),
@@ -822,8 +825,13 @@ fn drive(
         return;
     }
 
-    // Nothing held: find what is under the pointer.
+    // Nothing held: find what is under the pointer — unless a button is
+    // already down for something else, such as a turn of the view, which a
+    // handle passing under the pointer must not interrupt.
     pointer.hovered = None;
+    if buttons.get_pressed().next().is_some() && !buttons.just_pressed(MouseButton::Left) {
+        return;
+    }
     let Some(cursor) = cursor else {
         return;
     };
