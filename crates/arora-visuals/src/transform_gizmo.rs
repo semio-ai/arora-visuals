@@ -310,6 +310,12 @@ const FLIP: f32 = 0.1;
 /// the two are one line drawn two ways, so they are one thickness, and the
 /// swap from thin to thick is the joint controls' hover.
 const TUBE: [f32; 2] = [0.012, 0.04];
+/// How far every handle's surface moves out in hand: the tubes' thickening,
+/// so a ball and an arrowhead grow with the lines they sit on rather than by
+/// a share of their own size.
+const GROW: f32 = TUBE[1] - TUBE[0];
+/// How much the plane squares swell in hand. A square has no edge thickness
+/// to match the tubes by, so it grows by a share of its side.
 const SWELL: [f32; 2] = [1.0, 1.3];
 /// Rest and in-hand opacities, for lines and solids and for the planes.
 const OPACITY: [f32; 2] = [0.75, 1.0];
@@ -492,15 +498,21 @@ fn build_parts(
                     ));
                     pieces.push((
                         handle,
-                        Vec3::X * (SHAFT_LENGTH + CONE_LENGTH / 2.0),
-                        // The head overhangs the shaft by the same margin
-                        // however thick the shaft is, so the two grow
-                        // together in hand.
-                        TUBE.map(|tube| {
-                            meshes.add(Cone {
-                                radius: tube + CONE_RADIUS - TUBE[0],
-                                height: CONE_LENGTH,
-                            })
+                        Vec3::X * SHAFT_LENGTH,
+                        // The head keeps its shape in hand, scaled so its rim
+                        // moves out as far as the shaft's surface does, and
+                        // stands on the shaft's end: its mesh is moved so its
+                        // base, not its middle, is at the piece's origin.
+                        [0.0, GROW].map(|grow| {
+                            let scale = (CONE_RADIUS + grow) / CONE_RADIUS;
+                            let height = CONE_LENGTH * scale;
+                            meshes.add(
+                                Mesh::from(Cone {
+                                    radius: CONE_RADIUS * scale,
+                                    height,
+                                })
+                                .translated_by(Vec3::Y * height / 2.0),
+                            )
                         }),
                         look,
                         false,
@@ -539,7 +551,7 @@ fn build_parts(
                     pieces.push((
                         handle,
                         Vec3::X * BALL_REACH,
-                        SWELL.map(|swell| meshes.add(Sphere::new(BALL_RADIUS * swell))),
+                        [0.0, GROW].map(|grow| meshes.add(Sphere::new(BALL_RADIUS + grow))),
                         look.clone(),
                         false,
                     ));
