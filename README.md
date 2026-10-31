@@ -66,6 +66,7 @@ the upgrade off the schedule of a repo that has not adopted it yet.
 | `instance` | `EntityInstance` — one entity being drawn: its GLB, its bindings, its camera, whether it is on screen yet | `bevy_ecs` |
 | `drawn` | when an instance is actually drawable, behind `view` | the whole engine |
 | `pick` | a pointer press resolved over the mesh **as drawn**, behind `view` | the whole engine |
+| `ghost` | draws everything beneath an entity as a ghost of itself, Studio's look, over its own material rather than replacing it, behind `view` | the whole engine |
 | `glow` | feature-edge selection marking, behind `view` | the whole engine |
 | `outline` | the selection outline: one line around the whole of what is selected, drawn over whatever stands in front of it, behind `view` | the whole engine |
 | `joint_gizmo` | a ring to turn a joint or a bar to slide it, within its limits and shaded to show its range, sharing the transform gizmo's look and pointer handling, behind `view` | the whole engine |

@@ -52,6 +52,8 @@ pub mod binding;
 #[cfg(feature = "view")]
 pub mod drawn;
 #[cfg(feature = "view")]
+pub mod ghost;
+#[cfg(feature = "view")]
 pub mod glow;
 pub mod hold;
 pub mod instance;

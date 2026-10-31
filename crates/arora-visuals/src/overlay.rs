@@ -24,7 +24,8 @@
 //! rather than a point because an overlay anchors to an edge: a label wants
 //! the top of what it names, or to sit clear of a ring rather than over it.
 //! Anything partly behind its camera is left out, since half a projection is
-//! nothing to anchor to.
+//! nothing to anchor to, and so is a hidden gizmo, which has nothing on screen
+//! at all.
 //!
 //! The pointer half says which gizmo is hovered or held, and for a joint its
 //! value, so a host can show the tooltip for the animatable that gizmo drives;
@@ -159,8 +160,13 @@ const RING_SAMPLES: usize = 16;
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn publish(
     instances: Query<&EntityInstance, Without<Superseded>>,
-    transform_gizmos: Query<(Entity, &TransformGizmo, Option<&Facing>)>,
-    joint_gizmos: Query<(Entity, &JointGizmo, Option<&Rest>)>,
+    transform_gizmos: Query<(
+        Entity,
+        &TransformGizmo,
+        Option<&Facing>,
+        &InheritedVisibility,
+    )>,
+    joint_gizmos: Query<(Entity, &JointGizmo, Option<&Rest>, &InheritedVisibility)>,
     cameras: Query<(&Camera, &GlobalTransform)>,
     globals: Query<&GlobalTransform>,
     bounds: Query<(&GlobalTransform, &Aabb)>,
@@ -215,7 +221,8 @@ fn publish(
             .copied()
             .unwrap_or(GlobalTransform::IDENTITY)
     };
-    for (_, gizmo, facing) in &transform_gizmos {
+    // A hidden gizmo has nothing on screen to anchor to.
+    for (_, gizmo, facing, _) in transform_gizmos.iter().filter(|(.., shown)| shown.get()) {
         let (Ok(camera), Ok(target), Some(facing)) =
             (cameras.get(gizmo.camera), globals.get(gizmo.target), facing)
         else {
@@ -232,7 +239,7 @@ fn publish(
             });
         }
     }
-    for (_, gizmo, rest) in &joint_gizmos {
+    for (_, gizmo, rest, _) in joint_gizmos.iter().filter(|(.., shown)| shown.get()) {
         let Ok(camera) = cameras.get(gizmo.camera) else {
             continue;
         };
@@ -269,7 +276,7 @@ fn publish(
             .map(|grip| (grip, true))
             .or(pointer.hovered.map(|grip| (grip, false)));
         frame.pointer = in_hand.and_then(|((entity, handle), held)| {
-            if let Ok((_, gizmo, _)) = transform_gizmos.get(entity) {
+            if let Ok((_, gizmo, ..)) = transform_gizmos.get(entity) {
                 return Some(GizmoInHand {
                     key: gizmo.key.clone(),
                     kind: GizmoKind::Transform,
@@ -278,7 +285,7 @@ fn publish(
                     value: None,
                 });
             }
-            let (_, gizmo, _) = joint_gizmos.get(entity).ok()?;
+            let (_, gizmo, ..) = joint_gizmos.get(entity).ok()?;
             Some(GizmoInHand {
                 key: gizmo.key.clone(),
                 kind: GizmoKind::Joint,
