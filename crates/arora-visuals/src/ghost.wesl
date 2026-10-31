@@ -22,6 +22,9 @@ struct Ghost {
     coefficient: f32,
     // One where the element carries an image, nought otherwise.
     image: f32,
+    // How opaque the rim is against Studio's.
+    rim: f32,
+    _padding: vec3<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> ghost: Ghost;
@@ -48,6 +51,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let rim = pow(max(ghost.coefficient + dot(normal, toward), 0.0), ghost.power);
     // Studio's mix runs past its end at the very rim, which the clamp keeps an
     // opacity.
-    let alpha = clamp(mix(0.01, 0.25, rim), 0.0, 1.0);
+    let alpha = clamp(mix(0.01, 0.25, rim) * ghost.rim, 0.0, 1.0);
     return vec4(mix(ghost.wash.rgb, base, ghost.tint), alpha);
 }
