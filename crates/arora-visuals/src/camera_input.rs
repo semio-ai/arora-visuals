@@ -19,16 +19,28 @@
 //! on the robot or beside it, so a gesture behaves the same from anywhere in
 //! the scene — as an orbit target does in three.js's OrbitControls.
 //!
-//! **A zoom follows the fingers, not the trackpad's inertia.** After the
-//! fingers lift, macOS keeps scrolling for a while as they would have carried
-//! on; the camera ignores that unless [`CameraBindings::inertia`] asks for
-//! it, so a zoom stops where the gesture stopped. A mouse wheel has no
-//! inertia and is unaffected.
+//! **A zoom is OrbitControls' zoom.** Each scroll moves the camera along its
+//! axis at once, scaling its distance to the target by
+//! `0.95^(|pixels| × 0.01 × zoom_speed)`: no smoothing to spread a scroll
+//! over the frames after it, and no momentum of its own. What the camera has
+//! moved is exactly what has been scrolled, so a zoom stops the moment the
+//! scrolling does. As in OrbitControls, a scroll during an orbit or a pan is
+//! ignored.
+//!
+//! **Inertia is one choice, as Studio's damping is.** With
+//! [`CameraBindings::inertia`] off, an orbit or pan stops when its button
+//! comes up, and a trackpad zoom stops when the fingers lift: macOS keeps
+//! scrolling for a while afterward, as the fingers would have carried on,
+//! and the camera ignores that. With it on, an orbit or pan carries on and
+//! slows, and the trackpad's own inertia zooms on. A mouse wheel has no
+//! inertia either way.
 //!
 //! Drags are measured as the cursor's movement in logical pixels rather than
 //! the mouse's raw motion, so a pan keeps what was pressed under the pointer
 //! as the controller means it to.
 
+use bevy::camera_controller::pan_orbit_camera::controller::momentum::Velocity;
+use bevy::camera_controller::pan_orbit_camera::controller::motion::CurrentMotion;
 use bevy::camera_controller::pan_orbit_camera::prelude::{
     DefaultPanOrbitCameraPlugins, PanOrbitCamera,
 };
@@ -46,13 +58,12 @@ use crate::transform_gizmo::GizmoPointer;
 pub struct CameraBindings {
     pub orbit: MouseButton,
     pub pan: MouseButton,
-    /// How far one line of wheel scrolling zooms, in the controller's units,
-    /// which are roughly pixels of travel at the anchor.
-    pub zoom_per_line: f32,
-    /// How far one pixel of smooth scrolling zooms — a trackpad's.
-    pub zoom_per_pixel: f32,
-    /// Whether a zoom carries on with the trackpad's inertia after the
-    /// fingers lift.
+    /// How strongly a scroll zooms: OrbitControls' `zoomSpeed`.
+    pub zoom_speed: f32,
+    /// How many pixels of scrolling one line of a wheel counts as. A wheel
+    /// reports lines and a trackpad pixels; this puts them on one scale.
+    pub pixels_per_line: f32,
+    /// Whether motion carries on after the input stops ([module docs](self)).
     pub inertia: bool,
 }
 
@@ -62,8 +73,9 @@ impl Default for CameraBindings {
         Self {
             orbit: MouseButton::Left,
             pan: MouseButton::Right,
-            zoom_per_line: 24.0,
-            zoom_per_pixel: 1.0,
+            zoom_speed: 1.0,
+            // A browser's wheel step, so a notch zooms as it does in Studio.
+            pixels_per_line: 100.0,
             inertia: false,
         }
     }
@@ -73,18 +85,6 @@ impl Default for CameraBindings {
 /// cursor was last frame.
 #[derive(Resource, Default)]
 struct Gesture(Option<(Entity, MouseButton, Vec2)>);
-
-/// When a camera was last scrolled, so a zoom with nothing else held can end
-/// once the scrolling has stopped.
-#[derive(Resource, Default)]
-struct Scrolled(Option<f32>);
-
-/// How long scrolling must have stopped, in seconds, before a zoom ends. A
-/// wheel delivers its scrolling in bursts with frames between them, and a zoom
-/// ended in such a gap and begun again on the next burst loses the
-/// controller's smoothing and re-anchors, so the zoom lurches; this bridges
-/// the gaps while still freeing the camera promptly for the next gesture.
-const ZOOM_QUIET: f32 = 0.25;
 
 /// Where a trackpad's scrolling stands, read from the phases its scrolls
 /// carry. The fingers' scrolling runs from a start to an end; the inertia
@@ -136,11 +136,10 @@ impl Plugin for CameraInputPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(DefaultPanOrbitCameraPlugins)
             .init_resource::<Gesture>()
-            .init_resource::<Scrolled>()
             .init_resource::<Trackpad>()
             .add_observer(start_gesture)
             .add_observer(zoom)
-            .add_systems(Update, (drag, end_zoom));
+            .add_systems(Update, drag);
     }
 }
 
@@ -153,6 +152,7 @@ type Cameras<'w, 's> = Query<
         &'static Camera,
         &'static CameraBindings,
         &'static mut PanOrbitCamera,
+        &'static mut Transform,
     ),
 >;
 
@@ -184,7 +184,7 @@ fn start_gesture(
         PointerButton::Middle => MouseButton::Middle,
     };
     let position = press.pointer.position;
-    for (entity, camera, bindings, mut controller) in &mut cameras {
+    for (entity, camera, bindings, mut controller, _) in &mut cameras {
         if !holds(position, camera) {
             continue;
         }
@@ -201,22 +201,25 @@ fn start_gesture(
 }
 
 /// Feeds the gesture in hand the cursor's movement, and ends it when its
-/// button comes up.
+/// button comes up — at once, or carrying on, as the bindings ask.
 fn drag(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
-    mut cameras: Query<&mut PanOrbitCamera>,
+    mut cameras: Query<(&mut PanOrbitCamera, &CameraBindings)>,
     mut gesture: ResMut<Gesture>,
 ) {
     let Some((entity, button, last)) = gesture.0 else {
         return;
     };
-    let Ok(mut controller) = cameras.get_mut(entity) else {
+    let Ok((mut controller, bindings)) = cameras.get_mut(entity) else {
         gesture.0 = None;
         return;
     };
     if !buttons.pressed(button) {
         controller.end_move();
+        if !bindings.inertia {
+            controller.current_motion = CurrentMotion::Stationary;
+        }
         gesture.0 = None;
         return;
     }
@@ -229,61 +232,68 @@ fn drag(
     gesture.0 = Some((entity, button, cursor));
 }
 
-/// Zooms the camera under a scroll that reaches the scene, toward the point
-/// under the pointer, joining an orbit or pan in hand rather than ending it.
+/// The camera's distance to its target after scrolling `pixels` — upward
+/// positive, closing on the target — as OrbitControls' wheel zoom scales it.
+fn dolly(distance: f64, pixels: f32, zoom_speed: f32) -> f64 {
+    let scale = 0.95_f64.powf(f64::from(zoom_speed * (pixels * 0.01).abs()));
+    if pixels > 0.0 {
+        distance * scale
+    } else {
+        distance / scale
+    }
+}
+
+/// Zooms the camera under a scroll that reaches the scene toward its target,
+/// unless an orbit or pan is in hand.
 fn zoom(
     scroll: On<PointerScroll>,
     windows: Query<(), With<Window>>,
     mut cameras: Cameras,
+    gesture: Res<Gesture>,
     time: Res<Time>,
-    mut scrolled: ResMut<Scrolled>,
     mut trackpad: ResMut<Trackpad>,
 ) {
     if scroll.entity != scroll.original_event_target() || !windows.contains(scroll.entity) {
         return;
     }
+    // Read every scroll's phase, taken or not, so the inertia is still told
+    // from the fingers when the scrolling around it was ignored.
     let coasting = trackpad.coasting(scroll.phase, time.elapsed_secs());
+    if gesture.0.is_some() {
+        return;
+    }
     let position = scroll.pointer.position;
-    for (_, camera, bindings, mut controller) in &mut cameras {
+    for (_, camera, bindings, mut controller, mut transform) in &mut cameras {
         if !holds(position, camera) {
             continue;
         }
         if coasting && !bindings.inertia {
             return;
         }
-        let amount = scroll.y
+        let pixels = scroll.y
             * match scroll.unit {
-                MouseScrollUnit::Line => bindings.zoom_per_line,
-                MouseScrollUnit::Pixel => bindings.zoom_per_pixel,
+                MouseScrollUnit::Line => bindings.pixels_per_line,
+                MouseScrollUnit::Pixel => 1.0,
             };
-        if !controller.current_motion.is_user_controlled() {
-            controller.start_zoom(None);
+        if pixels == 0.0 {
+            return;
         }
-        controller.send_zoom_input(amount);
-        scrolled.0 = Some(time.elapsed_secs());
-        return;
-    }
-}
-
-/// Ends a zoom with nothing else held once the scrolling has stopped for
-/// [`ZOOM_QUIET`], so the controller is free to start the next gesture.
-fn end_zoom(
-    time: Res<Time>,
-    mut cameras: Query<&mut PanOrbitCamera>,
-    mut scrolled: ResMut<Scrolled>,
-) {
-    let Some(last) = scrolled.0 else {
-        return;
-    };
-    if time.elapsed_secs() - last < ZOOM_QUIET {
-        return;
-    }
-    for mut controller in &mut cameras {
-        if controller.current_motion.is_zooming_only() {
-            controller.end_move();
+        let distance = controller.last_anchor_depth().abs();
+        let closer = dolly(distance, pixels, bindings.zoom_speed);
+        let forward = transform.forward().as_vec3();
+        transform.translation += forward * (distance - closer) as f32;
+        controller.last_anchor_depth = -closer;
+        // An orbit or pan still carrying on turns about the target where it
+        // now stands.
+        if let CurrentMotion::Momentum {
+            velocity: Velocity::Orbit { anchor, .. } | Velocity::Pan { anchor, .. },
+            ..
+        } = &mut controller.current_motion
+        {
+            anchor.z = -closer;
         }
+        return;
     }
-    scrolled.0 = None;
 }
 
 #[cfg(test)]
@@ -302,6 +312,16 @@ mod tests {
         assert!(pad.coasting(TouchPhase::Moved, 0.5));
         assert!(pad.coasting(TouchPhase::Ended, 0.9));
         assert!(!pad.coasting(TouchPhase::Moved, 1.0), "a wheel after it");
+    }
+
+    /// A scroll up closes on the target by OrbitControls' factor, and the same
+    /// scroll down undoes it exactly.
+    #[test]
+    fn a_scroll_scales_the_distance_and_its_reverse_undoes_it() {
+        let closer = dolly(2.0, 100.0, 1.0);
+        assert!((closer - 2.0 * 0.95).abs() < 1e-9, "{closer}");
+        assert!((dolly(closer, -100.0, 1.0) - 2.0).abs() < 1e-9);
+        assert!((dolly(2.0, 100.0, 2.0) - 2.0 * 0.95 * 0.95).abs() < 1e-9);
     }
 
     /// Fingers that come back down after a pause start a gesture of their
