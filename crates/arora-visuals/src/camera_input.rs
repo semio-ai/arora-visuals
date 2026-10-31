@@ -119,7 +119,7 @@ fn anchor_under(
         .iter()
         .filter(|instance| instance.ready)
         .flat_map(|instance| instance.bindings.elements.values())
-        .filter_map(|targets| elements.drawn(targets).and_then(|mesh| mesh.hit(ray)))
+        .filter_map(|targets| elements.cast(targets, ray))
         .min_by(f32::total_cmp)?;
     let world = ray.get_point(nearest);
     Some(at.affine().inverse().transform_point3(world).as_dvec3())

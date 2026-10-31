@@ -28,6 +28,7 @@
 //! different element than any the press found picks nothing. A press or
 //! release outside every drawn rectangle belongs to no instance.
 
+use bevy::camera::primitives::Aabb;
 use bevy::ecs::system::SystemParam;
 use bevy::math::Affine3A;
 use bevy::mesh::morph::{MorphAttributes, MorphWeights};
@@ -121,7 +122,7 @@ fn under(
             continue;
         };
         for (id, targets) in &instance.bindings.elements {
-            let Some(distance) = elements.drawn(targets).and_then(|mesh| mesh.hit(ray)) else {
+            let Some(distance) = elements.cast(targets, ray) else {
                 continue;
             };
             hits.push((camera.order, distance));
@@ -256,6 +257,7 @@ pub struct ElementMeshes<'w, 's> {
     handles: Query<'w, 's, &'static Mesh3d>,
     transforms: Query<'w, 's, &'static GlobalTransform>,
     weights: Query<'w, 's, &'static MorphWeights>,
+    bounds: Query<'w, 's, &'static Aabb>,
 }
 
 impl ElementMeshes<'_, '_> {
@@ -266,6 +268,41 @@ impl ElementMeshes<'_, '_> {
         let mesh = self.meshes.get(handle)?;
         (mesh.primitive_topology() == PrimitiveTopology::TriangleList)
             .then_some((handle.id(), mesh))
+    }
+
+    /// The distance along `ray` to the nearest triangle of the element as it
+    /// is drawn, either side.
+    ///
+    /// **An element no morph is moving is cast where it stands**: a ray that
+    /// misses its bounding box misses it, and one that does not is met with
+    /// its own vertices under its transform, with nothing copied. A cast is
+    /// paid on every press and at the start of every gesture and zoom, so
+    /// building the whole robot's vertices again each time is the cost to
+    /// avoid. **An element a morph is moving is cast as drawn**
+    /// ([`ElementMeshes::drawn`]), with no box first: the box is the base
+    /// mesh's, and a morph can carry vertices past it — an opened mouth
+    /// below a closed one's box — where a box test would miss a real hit.
+    pub fn cast(&self, targets: &ElementTargets, ray: Ray3d) -> Option<f32> {
+        let morphing = targets
+            .morph
+            .and_then(|entity| self.weights.get(entity).ok())
+            .is_some_and(|weights| weights.weights().iter().any(|weight| *weight != 0.0));
+        if morphing {
+            return self.drawn(targets)?.hit(ray);
+        }
+        let entity = targets.mesh?;
+        let (_, mesh) = self.mesh(targets)?;
+        let world = self.transforms.get(entity).ok()?.affine();
+        if let Ok(aabb) = self.bounds.get(entity) {
+            if !ray_meets_box(ray, &world, aabb) {
+                return None;
+            }
+        }
+        let positions = mesh
+            .try_attribute(Mesh::ATTRIBUTE_POSITION)
+            .ok()?
+            .as_float3()?;
+        cast_triangles(ray, &world, positions, mesh.try_indices().ok())
     }
 
     /// The element's mesh as it is drawn this frame: its vertices with the
@@ -304,20 +341,61 @@ impl DrawnMesh<'_> {
     /// The distance along `ray` to the nearest triangle it meets, either
     /// side, since an asset's materials may be double-sided.
     pub(crate) fn hit(&self, ray: Ray3d) -> Option<f32> {
-        let world = Affine3A::IDENTITY;
-        let cull = Backfaces::Include;
-        let positions = &self.positions;
-        match self.indices {
-            Some(Indices::U16(i)) => {
-                ray_mesh_intersection(ray, &world, positions, None, Some(i), None, cull)
-            }
-            Some(Indices::U32(i)) => {
-                ray_mesh_intersection(ray, &world, positions, None, Some(i), None, cull)
-            }
-            None => ray_mesh_intersection::<u32>(ray, &world, positions, None, None, None, cull),
-        }
-        .map(|hit| hit.distance)
+        cast_triangles(ray, &Affine3A::IDENTITY, &self.positions, self.indices)
     }
+}
+
+/// The distance along `ray` to the nearest triangle of these, placed by
+/// `world`, either side, since an asset's materials may be double-sided.
+fn cast_triangles(
+    ray: Ray3d,
+    world: &Affine3A,
+    positions: &[[f32; 3]],
+    indices: Option<&Indices>,
+) -> Option<f32> {
+    let cull = Backfaces::Include;
+    match indices {
+        Some(Indices::U16(i)) => {
+            ray_mesh_intersection(ray, world, positions, None, Some(i), None, cull)
+        }
+        Some(Indices::U32(i)) => {
+            ray_mesh_intersection(ray, world, positions, None, Some(i), None, cull)
+        }
+        None => ray_mesh_intersection::<u32>(ray, world, positions, None, None, None, cull),
+    }
+    .map(|hit| hit.distance)
+}
+
+/// Whether `ray` meets a mesh's bounding box, the box in the mesh's own space
+/// and placed by `world`: the ray is carried into that space rather than the
+/// box out of it, so the box stays a box.
+fn ray_meets_box(ray: Ray3d, world: &Affine3A, aabb: &Aabb) -> bool {
+    let to_local = world.inverse();
+    let origin = to_local.transform_point3(ray.origin);
+    let direction = to_local.transform_vector3(*ray.direction);
+    let (min, max) = (
+        Vec3::from(aabb.center - aabb.half_extents),
+        Vec3::from(aabb.center + aabb.half_extents),
+    );
+    // The slab test: the ray is inside the box between where it has entered
+    // every pair of faces and before it has left any.
+    let (mut near, mut far) = (0.0_f32, f32::INFINITY);
+    for axis in 0..3 {
+        if direction[axis].abs() < f32::EPSILON {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return false;
+            }
+            continue;
+        }
+        let a = (min[axis] - origin[axis]) / direction[axis];
+        let b = (max[axis] - origin[axis]) / direction[axis];
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+        if near > far {
+            return false;
+        }
+    }
+    true
 }
 
 /// `base` positions moved by each morph target at its weight. `deltas` holds
@@ -351,6 +429,20 @@ pub fn morphed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ray meets a placed box when it passes through it, and not when it
+    /// passes beside it or the box is behind it.
+    #[test]
+    fn a_ray_meets_a_box_it_passes_through() {
+        let aabb = Aabb::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
+        let world = Affine3A::from_translation(Vec3::new(5.0, 0.0, 0.0));
+        let toward = Ray3d::new(Vec3::ZERO, Dir3::X);
+        assert!(ray_meets_box(toward, &world, &aabb));
+        let beside = Ray3d::new(Vec3::new(0.0, 3.0, 0.0), Dir3::X);
+        assert!(!ray_meets_box(beside, &world, &aabb));
+        let away = Ray3d::new(Vec3::ZERO, Dir3::NEG_X);
+        assert!(!ray_meets_box(away, &world, &aabb));
+    }
 
     fn pair(element: &str) -> (String, String) {
         ("robot".to_string(), element.to_string())
