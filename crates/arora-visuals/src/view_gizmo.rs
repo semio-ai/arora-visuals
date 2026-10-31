@@ -28,6 +28,8 @@ use bevy::picking::Pickable;
 use bevy::prelude::*;
 use bevy::ui::UiTargetCamera;
 
+use crate::active_area::ActiveAreaShown;
+
 /// A camera's view gizmo. Put it on the camera whose view it shows.
 #[derive(Component, Clone, Debug)]
 pub struct ViewGizmo {
@@ -39,8 +41,9 @@ pub struct ViewGizmo {
     pub labels: [String; 3],
     pub label_colour: Color,
     /// How far the gizmo's centre is from the right and bottom of the view,
-    /// in logical pixels. A host whose panels cover part of the view adds what
-    /// they cover, so the gizmo sits in the corner the user can see.
+    /// in logical pixels — of the camera's [active area](crate::active_area)
+    /// where it has one, so the gizmo sits in the corner the user can see and
+    /// moves with that corner as it eases.
     pub inset: Vec2,
 }
 
@@ -231,15 +234,33 @@ fn centred(width: f32, height: f32) -> Node {
 
 /// Places every part of every gizmo where its axis projects through its
 /// camera's current rotation, and stacks the parts nearest the viewer on top.
+#[allow(clippy::type_complexity)]
 fn place_gizmos(
-    roots: Query<(&GizmoRoot, &Children)>,
-    cameras: Query<(&GlobalTransform, &ViewGizmo)>,
-    mut parts: Query<(&Part, &mut UiTransform, &mut ZIndex, Has<Hovered>)>,
+    mut roots: Query<(&GizmoRoot, &Children, &mut Node)>,
+    cameras: Query<(
+        &GlobalTransform,
+        &ViewGizmo,
+        &Camera,
+        Option<&ActiveAreaShown>,
+    )>,
+    mut parts: Query<(&Part, &mut UiTransform, &mut ZIndex, Has<Hovered>), Without<GizmoRoot>>,
 ) {
-    for (root, children) in &roots {
-        let Ok((camera, gizmo)) = cameras.get(root.0) else {
+    for (root, children, mut node) in &mut roots {
+        let Ok((camera, gizmo, view, area)) = cameras.get(root.0) else {
             continue;
         };
+        // From the corner of the area the user can see: the whole viewport,
+        // or the active area within it.
+        let viewport = view.logical_viewport_size().unwrap_or_default();
+        let covered = area.map_or(Vec2::ZERO, |area| viewport - area.0.max);
+        let (right, bottom) = (
+            Val::Px(covered.x + gizmo.inset.x - HALF),
+            Val::Px(covered.y + gizmo.inset.y - HALF),
+        );
+        if node.right != right || node.bottom != bottom {
+            node.right = right;
+            node.bottom = bottom;
+        }
         let to_view = camera.rotation().inverse();
         // An axis's offset from the centre on screen, in units with y down,
         // and how far toward the viewer it points.

@@ -48,6 +48,8 @@
 //! standing example: colour science, no imports, no lockstep. **A module that
 //! can stay free of Bevy should stay free of Bevy.**
 
+#[cfg(feature = "view")]
+pub mod active_area;
 pub mod binding;
 #[cfg(feature = "view")]
 pub mod drawn;

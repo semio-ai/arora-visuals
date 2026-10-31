@@ -6,10 +6,15 @@
 //! host supplies it through a [`ViewOffsetFeed`] read every frame, since a
 //! panel sliding in changes it continuously; it is applied to every live
 //! instance's camera.
+//!
+//! A camera with an [`ActiveArea`] is framed by that instead, and this leaves it
+//! alone: an active area is the higher-level answer to the same question, and
+//! two writers of one camera's sub-view would undo each other every frame.
 
 use bevy::camera::SubCameraView;
 use bevy::prelude::*;
 
+use crate::active_area::ActiveArea;
 use crate::instance::{EntityInstance, Superseded};
 
 /// The host's view offset, read each frame. `None` renders the whole view.
@@ -35,7 +40,7 @@ impl Plugin for ViewOffsetPlugin {
 fn apply_view_offset(
     feed: Option<Res<ViewOffsetFeed>>,
     instances: Query<&EntityInstance, Without<Superseded>>,
-    mut cameras: Query<&mut Camera>,
+    mut cameras: Query<&mut Camera, Without<ActiveArea>>,
 ) {
     let Some(feed) = feed else {
         return;
