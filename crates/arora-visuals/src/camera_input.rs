@@ -19,6 +19,12 @@
 //! on the robot or beside it, so a gesture behaves the same from anywhere in
 //! the scene — as an orbit target does in three.js's OrbitControls.
 //!
+//! **A zoom follows the fingers, not the trackpad's inertia.** After the
+//! fingers lift, macOS keeps scrolling for a while as they would have carried
+//! on; the camera ignores that unless [`CameraBindings::inertia`] asks for
+//! it, so a zoom stops where the gesture stopped. A mouse wheel has no
+//! inertia and is unaffected.
+//!
 //! Drags are measured as the cursor's movement in logical pixels rather than
 //! the mouse's raw motion, so a pan keeps what was pressed under the pointer
 //! as the controller means it to.
@@ -27,6 +33,7 @@ use bevy::camera_controller::pan_orbit_camera::prelude::{
     DefaultPanOrbitCameraPlugins, PanOrbitCamera,
 };
 use bevy::input::mouse::MouseScrollUnit;
+use bevy::input::touch::TouchPhase;
 use bevy::picking::events::{PointerPress, PointerScroll};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
@@ -44,6 +51,9 @@ pub struct CameraBindings {
     pub zoom_per_line: f32,
     /// How far one pixel of smooth scrolling zooms — a trackpad's.
     pub zoom_per_pixel: f32,
+    /// Whether a zoom carries on with the trackpad's inertia after the
+    /// fingers lift.
+    pub inertia: bool,
 }
 
 impl Default for CameraBindings {
@@ -54,6 +64,7 @@ impl Default for CameraBindings {
             pan: MouseButton::Right,
             zoom_per_line: 24.0,
             zoom_per_pixel: 1.0,
+            inertia: false,
         }
     }
 }
@@ -75,6 +86,50 @@ struct Scrolled(Option<f32>);
 /// the gaps while still freeing the camera promptly for the next gesture.
 const ZOOM_QUIET: f32 = 0.25;
 
+/// Where a trackpad's scrolling stands, read from the phases its scrolls
+/// carry. The fingers' scrolling runs from a start to an end; the inertia
+/// that follows runs from a second start, straight after that end, to its own
+/// end. A mouse wheel's scrolls carry no phase but movement, and leave this
+/// as it is.
+#[derive(Resource, Default)]
+struct Trackpad {
+    /// When the fingers last lifted.
+    lifted: Option<f32>,
+    /// Whether the scrolling now arriving is the inertia's.
+    coasting: bool,
+}
+
+/// How soon after the fingers lift a start is the inertia's rather than a
+/// new gesture's, in seconds. macOS begins the inertia at once, and fingers
+/// cannot come back down that fast.
+const INERTIA_FOLLOWS: f32 = 0.05;
+
+impl Trackpad {
+    /// Takes in a scroll's phase at `now`, and says whether the scroll is the
+    /// inertia's.
+    fn coasting(&mut self, phase: TouchPhase, now: f32) -> bool {
+        match phase {
+            TouchPhase::Started => {
+                self.coasting = self
+                    .lifted
+                    .take()
+                    .is_some_and(|lifted| now - lifted <= INERTIA_FOLLOWS);
+                self.coasting
+            }
+            TouchPhase::Ended | TouchPhase::Canceled => {
+                let coasting = self.coasting;
+                if coasting {
+                    self.coasting = false;
+                } else {
+                    self.lifted = Some(now);
+                }
+                coasting
+            }
+            TouchPhase::Moved => self.coasting,
+        }
+    }
+}
+
 pub struct CameraInputPlugin;
 
 impl Plugin for CameraInputPlugin {
@@ -82,6 +137,7 @@ impl Plugin for CameraInputPlugin {
         app.add_plugins(DefaultPanOrbitCameraPlugins)
             .init_resource::<Gesture>()
             .init_resource::<Scrolled>()
+            .init_resource::<Trackpad>()
             .add_observer(start_gesture)
             .add_observer(zoom)
             .add_systems(Update, (drag, end_zoom));
@@ -181,14 +237,19 @@ fn zoom(
     mut cameras: Cameras,
     time: Res<Time>,
     mut scrolled: ResMut<Scrolled>,
+    mut trackpad: ResMut<Trackpad>,
 ) {
     if scroll.entity != scroll.original_event_target() || !windows.contains(scroll.entity) {
         return;
     }
+    let coasting = trackpad.coasting(scroll.phase, time.elapsed_secs());
     let position = scroll.pointer.position;
     for (_, camera, bindings, mut controller) in &mut cameras {
         if !holds(position, camera) {
             continue;
+        }
+        if coasting && !bindings.inertia {
+            return;
         }
         let amount = scroll.y
             * match scroll.unit {
@@ -223,4 +284,34 @@ fn end_zoom(
         }
     }
     scrolled.0 = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The scrolling that starts straight after the fingers lift is the
+    /// inertia's, until it ends; a mouse wheel's is never.
+    #[test]
+    fn inertia_is_the_scrolling_that_follows_a_lift() {
+        let mut pad = Trackpad::default();
+        assert!(!pad.coasting(TouchPhase::Started, 0.0));
+        assert!(!pad.coasting(TouchPhase::Moved, 0.1));
+        assert!(!pad.coasting(TouchPhase::Ended, 0.2));
+        assert!(pad.coasting(TouchPhase::Started, 0.2));
+        assert!(pad.coasting(TouchPhase::Moved, 0.5));
+        assert!(pad.coasting(TouchPhase::Ended, 0.9));
+        assert!(!pad.coasting(TouchPhase::Moved, 1.0), "a wheel after it");
+    }
+
+    /// Fingers that come back down after a pause start a gesture of their
+    /// own, not inertia.
+    #[test]
+    fn a_later_start_is_a_new_gesture() {
+        let mut pad = Trackpad::default();
+        pad.coasting(TouchPhase::Started, 0.0);
+        pad.coasting(TouchPhase::Ended, 0.2);
+        assert!(!pad.coasting(TouchPhase::Started, 0.6));
+        assert!(!pad.coasting(TouchPhase::Moved, 0.7));
+    }
 }
