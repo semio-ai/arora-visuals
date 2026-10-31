@@ -12,12 +12,12 @@
 //! comes up, wherever the pointer goes, so nothing it passes over can take
 //! it. A scroll over the scene zooms; over UI it does not.
 //!
-//! **Motion is about the point under the pointer.** Each gesture anchors on
-//! the nearest element the pointer's ray meets, cast over the meshes as drawn
-//! — morph targets applied — so the camera orbits the thing you pressed on
-//! and zooms toward the thing you point at. Over empty space the controller
-//! falls back to the depth of the last anchor, so a gesture begun beside the
-//! robot does not fling the camera away.
+//! **Every gesture moves about the same point: the view's target.** It sits on
+//! the camera's axis at the controller's anchor depth, which the host sets
+//! when it frames the scene. An orbit turns about it, a pan carries it with
+//! the view, and a zoom closes on it. Where the press lands does not matter,
+//! on the robot or beside it, so a gesture behaves the same from anywhere in
+//! the scene — as an orbit target does in three.js's OrbitControls.
 //!
 //! Drags are measured as the cursor's movement in logical pixels rather than
 //! the mouse's raw motion, so a pan keeps what was pressed under the pointer
@@ -27,13 +27,10 @@ use bevy::camera_controller::pan_orbit_camera::prelude::{
     DefaultPanOrbitCameraPlugins, PanOrbitCamera,
 };
 use bevy::input::mouse::MouseScrollUnit;
-use bevy::math::DVec3;
 use bevy::picking::events::{PointerPress, PointerScroll};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 
-use crate::instance::{EntityInstance, Superseded};
-use crate::pick::ElementMeshes;
 use crate::transform_gizmo::GizmoPointer;
 
 /// Which inputs move a camera ([module docs](self)).
@@ -91,39 +88,17 @@ impl Plugin for CameraInputPlugin {
     }
 }
 
-/// The camera whose viewport holds `position`, with its bindings, and the
-/// anchor under the pointer in that camera's view space.
+/// The cameras a gesture can move, with their bindings.
 type Cameras<'w, 's> = Query<
     'w,
     's,
     (
         Entity,
         &'static Camera,
-        &'static GlobalTransform,
         &'static CameraBindings,
         &'static mut PanOrbitCamera,
     ),
 >;
-
-/// The nearest point of any drawn element the ray from `position` meets, in
-/// the camera's view space.
-fn anchor_under(
-    position: Vec2,
-    camera: &Camera,
-    at: &GlobalTransform,
-    instances: &Query<&EntityInstance, Without<Superseded>>,
-    elements: &ElementMeshes,
-) -> Option<DVec3> {
-    let ray = camera.viewport_to_world(at, position).ok()?;
-    let nearest = instances
-        .iter()
-        .filter(|instance| instance.ready)
-        .flat_map(|instance| instance.bindings.elements.values())
-        .filter_map(|targets| elements.cast(targets, ray))
-        .min_by(f32::total_cmp)?;
-    let world = ray.get_point(nearest);
-    Some(at.affine().inverse().transform_point3(world).as_dvec3())
-}
 
 fn holds(position: Vec2, camera: &Camera) -> bool {
     camera
@@ -132,14 +107,11 @@ fn holds(position: Vec2, camera: &Camera) -> bool {
 }
 
 /// Starts an orbit or a pan on a press that reaches the scene.
-#[allow(clippy::too_many_arguments)]
 fn start_gesture(
     press: On<PointerPress>,
     windows: Query<(), With<Window>>,
     gizmos: Option<Res<GizmoPointer>>,
     mut cameras: Cameras,
-    instances: Query<&EntityInstance, Without<Superseded>>,
-    elements: ElementMeshes,
     mut gesture: ResMut<Gesture>,
 ) {
     // A press bubbles from where it landed; take it once, and only where it
@@ -156,15 +128,14 @@ fn start_gesture(
         PointerButton::Middle => MouseButton::Middle,
     };
     let position = press.pointer.position;
-    for (entity, camera, at, bindings, mut controller) in &mut cameras {
+    for (entity, camera, bindings, mut controller) in &mut cameras {
         if !holds(position, camera) {
             continue;
         }
-        let anchor = anchor_under(position, camera, at, &instances, &elements);
         if button == bindings.orbit {
-            controller.start_orbit(anchor);
+            controller.start_orbit(None);
         } else if button == bindings.pan {
-            controller.start_pan(anchor);
+            controller.start_pan(None);
         } else {
             continue;
         }
@@ -208,8 +179,6 @@ fn zoom(
     scroll: On<PointerScroll>,
     windows: Query<(), With<Window>>,
     mut cameras: Cameras,
-    instances: Query<&EntityInstance, Without<Superseded>>,
-    elements: ElementMeshes,
     time: Res<Time>,
     mut scrolled: ResMut<Scrolled>,
 ) {
@@ -217,7 +186,7 @@ fn zoom(
         return;
     }
     let position = scroll.pointer.position;
-    for (_, camera, at, bindings, mut controller) in &mut cameras {
+    for (_, camera, bindings, mut controller) in &mut cameras {
         if !holds(position, camera) {
             continue;
         }
@@ -227,8 +196,7 @@ fn zoom(
                 MouseScrollUnit::Pixel => bindings.zoom_per_pixel,
             };
         if !controller.current_motion.is_user_controlled() {
-            let anchor = anchor_under(position, camera, at, &instances, &elements);
-            controller.start_zoom(anchor);
+            controller.start_zoom(None);
         }
         controller.send_zoom_input(amount);
         scrolled.0 = Some(time.elapsed_secs());
