@@ -66,10 +66,17 @@ impl Default for CameraBindings {
 #[derive(Resource, Default)]
 struct Gesture(Option<(Entity, MouseButton, Vec2)>);
 
-/// Whether any camera was scrolled this frame, so a zoom with nothing else
-/// held can end when the scrolling does.
+/// When a camera was last scrolled, so a zoom with nothing else held can end
+/// once the scrolling has stopped.
 #[derive(Resource, Default)]
-struct Scrolled(bool);
+struct Scrolled(Option<f32>);
+
+/// How long scrolling must have stopped, in seconds, before a zoom ends. A
+/// wheel delivers its scrolling in bursts with frames between them, and a zoom
+/// ended in such a gap and begun again on the next burst loses the
+/// controller's smoothing and re-anchors, so the zoom lurches; this bridges
+/// the gaps while still freeing the camera promptly for the next gesture.
+const ZOOM_QUIET: f32 = 0.25;
 
 pub struct CameraInputPlugin;
 
@@ -203,6 +210,7 @@ fn zoom(
     mut cameras: Cameras,
     instances: Query<&EntityInstance, Without<Superseded>>,
     elements: ElementMeshes,
+    time: Res<Time>,
     mut scrolled: ResMut<Scrolled>,
 ) {
     if scroll.entity != scroll.original_event_target() || !windows.contains(scroll.entity) {
@@ -223,20 +231,28 @@ fn zoom(
             controller.start_zoom(anchor);
         }
         controller.send_zoom_input(amount);
-        scrolled.0 = true;
+        scrolled.0 = Some(time.elapsed_secs());
         return;
     }
 }
 
-/// Ends a zoom with nothing else held once the scrolling stops, so the
-/// controller is free to start the next gesture.
-fn end_zoom(mut cameras: Query<&mut PanOrbitCamera>, mut scrolled: ResMut<Scrolled>) {
-    if !scrolled.0 {
-        for mut controller in &mut cameras {
-            if controller.current_motion.is_zooming_only() {
-                controller.end_move();
-            }
+/// Ends a zoom with nothing else held once the scrolling has stopped for
+/// [`ZOOM_QUIET`], so the controller is free to start the next gesture.
+fn end_zoom(
+    time: Res<Time>,
+    mut cameras: Query<&mut PanOrbitCamera>,
+    mut scrolled: ResMut<Scrolled>,
+) {
+    let Some(last) = scrolled.0 else {
+        return;
+    };
+    if time.elapsed_secs() - last < ZOOM_QUIET {
+        return;
+    }
+    for mut controller in &mut cameras {
+        if controller.current_motion.is_zooming_only() {
+            controller.end_move();
         }
     }
-    scrolled.0 = false;
+    scrolled.0 = None;
 }
