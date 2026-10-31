@@ -303,7 +303,7 @@ pub struct DrawnMesh<'a> {
 impl DrawnMesh<'_> {
     /// The distance along `ray` to the nearest triangle it meets, either
     /// side, since an asset's materials may be double-sided.
-    fn hit(&self, ray: Ray3d) -> Option<f32> {
+    pub(crate) fn hit(&self, ray: Ray3d) -> Option<f32> {
         let world = Affine3A::IDENTITY;
         let cull = Backfaces::Include;
         let positions = &self.positions;

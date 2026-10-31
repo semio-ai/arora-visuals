@@ -51,6 +51,8 @@
 #[cfg(feature = "view")]
 pub mod active_area;
 pub mod binding;
+#[cfg(feature = "camera_input")]
+pub mod camera_input;
 #[cfg(feature = "view")]
 pub mod drawn;
 #[cfg(feature = "view")]

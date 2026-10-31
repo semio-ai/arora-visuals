@@ -66,6 +66,7 @@ the upgrade off the schedule of a repo that has not adopted it yet.
 | `instance` | `EntityInstance` — one entity being drawn: its GLB, its bindings, its camera, whether it is on screen yet | `bevy_ecs` |
 | `drawn` | when an instance is actually drawable, behind `view` | the whole engine |
 | `pick` | a pointer press resolved over the mesh **as drawn**, behind `view` | the whole engine |
+| `camera_input` | the editing camera's bindings over Bevy's pan-orbit controller: Studio's mouse scheme, gestures only from presses on the scene, anchored on the element under the pointer, behind `camera_input` | the whole engine and Bevy's camera controller |
 | `active_area` | the part of a view the user can see beside panels, which a camera frames its subject in, easing as the area changes, behind `view` | the whole engine |
 | `ghost` | draws everything beneath an entity as a ghost of itself, Studio's look, over its own material rather than replacing it, behind `view` | the whole engine |
 | `glow` | feature-edge selection marking, behind `view` | the whole engine |
