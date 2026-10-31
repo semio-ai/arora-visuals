@@ -35,6 +35,13 @@
 //! slows, and the trackpad's own inertia zooms on. A mouse wheel has no
 //! inertia either way.
 //!
+//! **A floor, when a host sets one, keeps the camera above it**
+//! ([`CameraBindings::floor`]), as Studio keeps its camera above the ground:
+//! wherever an orbit, pan or zoom leaves the camera below the floor, it is
+//! raised back to it and turned to look at the target again, so an orbit
+//! that dips toward the floor slides along it instead. A face editor has no
+//! floor and sets none.
+//!
 //! Drags are measured as the cursor's movement in logical pixels rather than
 //! the mouse's raw motion, so a pan keeps what was pressed under the pointer
 //! as the controller means it to.
@@ -44,8 +51,10 @@ use bevy::camera_controller::pan_orbit_camera::controller::motion::CurrentMotion
 use bevy::camera_controller::pan_orbit_camera::prelude::{
     DefaultPanOrbitCameraPlugins, PanOrbitCamera,
 };
+use bevy::camera_controller::pan_orbit_camera::SyncCameraPosition;
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::input::touch::TouchPhase;
+use bevy::math::DVec3;
 use bevy::picking::events::{PointerPress, PointerScroll};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
@@ -65,6 +74,16 @@ pub struct CameraBindings {
     pub pixels_per_line: f32,
     /// Whether motion carries on after the input stops ([module docs](self)).
     pub inertia: bool,
+    /// A height the camera may not go below ([module docs](self)).
+    pub floor: Option<CameraFloor>,
+}
+
+/// A height the camera is kept at or above, measured along `up` from the
+/// world's origin.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraFloor {
+    pub up: Dir3,
+    pub height: f32,
 }
 
 impl Default for CameraBindings {
@@ -77,6 +96,7 @@ impl Default for CameraBindings {
             // A browser's wheel step, so a notch zooms as it does in Studio.
             pixels_per_line: 100.0,
             inertia: false,
+            floor: None,
         }
     }
 }
@@ -139,7 +159,8 @@ impl Plugin for CameraInputPlugin {
             .init_resource::<Trackpad>()
             .add_observer(start_gesture)
             .add_observer(zoom)
-            .add_systems(Update, drag);
+            .add_systems(Update, drag)
+            .add_systems(PreUpdate, keep_above_floor.after(SyncCameraPosition));
     }
 }
 
@@ -296,6 +317,51 @@ fn zoom(
     }
 }
 
+/// Where a camera at `at`, `depth` from its target along its axis, stands
+/// once kept above `floor`: raised to it if below, and turned back to the
+/// target. `None` when it is not below.
+fn above_floor(at: &Transform, depth: f32, floor: CameraFloor) -> Option<Transform> {
+    let up = floor.up.as_vec3();
+    let below = floor.height - at.translation.dot(up);
+    if below <= 0.0 {
+        return None;
+    }
+    let target = at.translation + at.forward().as_vec3() * depth;
+    Some(Transform::from_translation(at.translation + up * below).looking_at(target, up))
+}
+
+/// Raises a camera the controller or a zoom has left below its floor.
+fn keep_above_floor(mut cameras: Query<(&CameraBindings, &mut PanOrbitCamera, &mut Transform)>) {
+    for (bindings, mut controller, mut transform) in &mut cameras {
+        let Some(floor) = bindings.floor else {
+            continue;
+        };
+        let depth = controller.last_anchor_depth().abs();
+        let Some(raised) = above_floor(&transform, depth as f32, floor) else {
+            continue;
+        };
+        // The controller's anchors are in view space; carry each through the
+        // move in world space, so a motion in progress keeps its point.
+        let (before, after) = (
+            transform.to_matrix().as_dmat4(),
+            raised.to_matrix().as_dmat4().inverse(),
+        );
+        let carry =
+            |anchor: &mut DVec3| *anchor = after.transform_point3(before.transform_point3(*anchor));
+        match &mut controller.current_motion {
+            CurrentMotion::UserControlled { anchor, .. }
+            | CurrentMotion::Momentum {
+                velocity: Velocity::Orbit { anchor, .. } | Velocity::Pan { anchor, .. },
+                ..
+            } => carry(anchor),
+            _ => {}
+        }
+        let target = transform.translation + transform.forward().as_vec3() * depth as f32;
+        controller.last_anchor_depth = -f64::from(raised.translation.distance(target));
+        *transform = raised;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +388,26 @@ mod tests {
         assert!((closer - 2.0 * 0.95).abs() < 1e-9, "{closer}");
         assert!((dolly(closer, -100.0, 1.0) - 2.0).abs() < 1e-9);
         assert!((dolly(2.0, 100.0, 2.0) - 2.0 * 0.95 * 0.95).abs() < 1e-9);
+    }
+
+    /// A camera below the floor is raised onto it and still looks at its
+    /// target; one above it is left alone.
+    #[test]
+    fn a_camera_below_the_floor_is_raised_and_still_faces_its_target() {
+        let floor = CameraFloor {
+            up: Dir3::Y,
+            height: 0.01,
+        };
+        let target = Vec3::new(0.0, 0.7, 0.0);
+        let below = Transform::from_xyz(0.0, -0.5, 3.0).looking_at(target, Vec3::Y);
+        let depth = below.translation.distance(target);
+        let raised = above_floor(&below, depth, floor).expect("it was below");
+        assert!((raised.translation.y - 0.01).abs() < 1e-5);
+        assert!((raised.translation.z - 3.0).abs() < 1e-5);
+        let facing = (target - raised.translation).normalize();
+        assert!(raised.forward().as_vec3().abs_diff_eq(facing, 1e-5));
+        let above = Transform::from_xyz(0.0, 1.0, 3.0).looking_at(target, Vec3::Y);
+        assert!(above_floor(&above, 3.0, floor).is_none());
     }
 
     /// Fingers that come back down after a pause start a gesture of their
