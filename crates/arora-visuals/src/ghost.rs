@@ -17,6 +17,10 @@
 //! drawn over everything without testing depth, so the robot it stands beside
 //! never hides it.
 //!
+//! **What a ghost is washed toward is the host's** ([`GhostWash`]), white by
+//! default as Studio has it. A wash reads only against a ground unlike it, so
+//! a host drawing on a light ground washes toward a dark colour instead.
+//!
 //! **A ghost casts no shadow.** It is the trace of where something is, not a
 //! second solid object standing in the light.
 //!
@@ -47,12 +51,24 @@ pub struct GhostOf {
     had_no_shadow: bool,
 }
 
-/// How far a ghost's colour is from white toward the element's: Studio's.
+/// How far a ghost's colour is from its wash toward the element's: Studio's.
 pub const GHOST_TINT: f32 = 0.5;
+
+/// The colour every ghost is washed toward: white, as Studio has it, unless
+/// the host sets another ([module docs](self)).
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct GhostWash(pub Color);
+
+impl Default for GhostWash {
+    fn default() -> Self {
+        Self(Color::WHITE)
+    }
+}
 
 #[derive(ShaderType, Clone, Debug, Default)]
 pub struct GhostUniform {
     pub colour: Vec4,
+    pub wash: Vec4,
     pub tint: f32,
     pub power: f32,
     pub coefficient: f32,
@@ -70,11 +86,13 @@ pub struct GhostMaterial {
 }
 
 impl GhostMaterial {
-    /// The ghost of a material: its colour and image, in Studio's ghost look.
-    pub fn of(material: &StandardMaterial) -> Self {
+    /// The ghost of a material: its colour and image, washed toward `wash`, in
+    /// Studio's ghost look.
+    pub fn of(material: &StandardMaterial, wash: Color) -> Self {
         Self {
             ghost: GhostUniform {
                 colour: LinearRgba::from(material.base_color).to_vec4(),
+                wash: LinearRgba::from(wash).to_vec4(),
                 tint: GHOST_TINT,
                 power: 8.0,
                 coefficient: 1.2,
@@ -122,6 +140,7 @@ impl Plugin for GhostPlugin {
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "ghost.wesl");
         app.add_plugins(MaterialPlugin::<GhostMaterial>::default())
+            .init_resource::<GhostWash>()
             .add_systems(Update, (ghost_meshes, restore_meshes, follow_originals));
     }
 }
@@ -133,6 +152,7 @@ fn ghost_meshes(
     children: Query<&Children>,
     meshes: Query<(&MeshMaterial3d<StandardMaterial>, Has<NotShadowCaster>), Without<GhostOf>>,
     standard: Res<Assets<StandardMaterial>>,
+    wash: Res<GhostWash>,
     mut ghosts: ResMut<Assets<GhostMaterial>>,
 ) {
     for root in &roots {
@@ -143,7 +163,7 @@ fn ghost_meshes(
             let Some(original) = standard.get(&material.0) else {
                 continue;
             };
-            let ghost = ghosts.add(GhostMaterial::of(original));
+            let ghost = ghosts.add(GhostMaterial::of(original, wash.0));
             commands
                 .entity(entity)
                 .insert((
@@ -182,20 +202,24 @@ fn restore_meshes(
     }
 }
 
-/// Copies each ghosted mesh's own colour and image into its ghost as they
-/// change, reading before writing so an unchanged ghost is not re-uploaded.
+/// Copies each ghosted mesh's own colour and image, and the wash, into its
+/// ghost as they change, reading before writing so an unchanged ghost is not
+/// re-uploaded.
 fn follow_originals(
     ghosted: Query<(&GhostOf, &MeshMaterial3d<GhostMaterial>)>,
     standard: Res<Assets<StandardMaterial>>,
+    wash: Res<GhostWash>,
     mut ghosts: ResMut<Assets<GhostMaterial>>,
 ) {
     for (of, handle) in &ghosted {
         let Some(original) = standard.get(&of.original) else {
             continue;
         };
-        let wanted = GhostMaterial::of(original);
+        let wanted = GhostMaterial::of(original, wash.0);
         let stale = ghosts.get(&handle.0).is_some_and(|ghost| {
-            ghost.ghost.colour != wanted.ghost.colour || ghost.image != wanted.image
+            ghost.ghost.colour != wanted.ghost.colour
+                || ghost.ghost.wash != wanted.ghost.wash
+                || ghost.image != wanted.image
         });
         if stale {
             if let Some(mut ghost) = ghosts.get_mut(&handle.0) {
@@ -214,11 +238,15 @@ mod tests {
     /// falloff.
     #[test]
     fn a_ghost_takes_its_elements_colour_and_image() {
-        let plain = GhostMaterial::of(&StandardMaterial {
-            base_color: Color::srgb(1.0, 0.0, 0.0),
-            ..default()
-        });
+        let plain = GhostMaterial::of(
+            &StandardMaterial {
+                base_color: Color::srgb(1.0, 0.0, 0.0),
+                ..default()
+            },
+            Color::BLACK,
+        );
         assert_eq!(plain.ghost.colour, LinearRgba::RED.to_vec4());
+        assert_eq!(plain.ghost.wash, LinearRgba::BLACK.to_vec4());
         assert_eq!(
             (plain.ghost.tint, plain.ghost.power, plain.ghost.coefficient),
             (0.5, 8.0, 1.2)
@@ -226,10 +254,13 @@ mod tests {
         assert_eq!(plain.ghost.image, 0.0);
 
         let image = Handle::<Image>::default();
-        let pictured = GhostMaterial::of(&StandardMaterial {
-            base_color_texture: Some(image.clone()),
-            ..default()
-        });
+        let pictured = GhostMaterial::of(
+            &StandardMaterial {
+                base_color_texture: Some(image.clone()),
+                ..default()
+            },
+            Color::WHITE,
+        );
         assert_eq!(pictured.ghost.image, 1.0);
         assert_eq!(pictured.image, Some(image));
     }
@@ -241,6 +272,7 @@ mod tests {
         let mut app = App::new();
         app.init_resource::<Assets<StandardMaterial>>()
             .init_resource::<Assets<GhostMaterial>>()
+            .init_resource::<GhostWash>()
             .add_systems(Update, (ghost_meshes, restore_meshes).chain());
         let original = app
             .world_mut()
