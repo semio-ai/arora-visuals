@@ -172,7 +172,10 @@ pub struct TransformGizmo {
 
 impl TransformGizmo {
     /// A gizmo on `target`, seen through `camera`, with every mode, in world
-    /// space, a hundred pixels across, in Studio's axis colours.
+    /// space, reaching a quarter of a metre, in Studio's axis colours.
+    ///
+    /// Sized in the world, as Studio's `PivotControls` are by default and the
+    /// joint gizmo is, so every gizmo in a scene answers a zoom the same way.
     pub fn new(target: Entity, camera: Entity) -> Self {
         Self {
             target,
@@ -180,7 +183,7 @@ impl TransformGizmo {
             modes: TransformModes::ALL,
             only: None,
             space: GizmoSpace::World,
-            size: GizmoSize::Pixels(100.0),
+            size: GizmoSize::World(0.25),
             offset: Transform::IDENTITY,
             axes: [Dir3::X, Dir3::Y, Dir3::Z],
             colours: [
