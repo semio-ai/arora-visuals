@@ -121,7 +121,10 @@ pub enum GizmoSpace {
     Local,
 }
 
-/// How big a gizmo is: the reach of its arrows.
+/// How big a gizmo is: the reach of its arrows, or a joint gizmo's radius
+/// or length. Every gizmo takes one, and the two kinds are a gizmo's whole
+/// sizing choice: this is drei `PivotControls`' `fixed` and `scale` as one
+/// value, so a size can never be read in the other kind's unit.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GizmoSize {
     /// The same on screen however near or far, in logical pixels.
