@@ -236,9 +236,11 @@ pub struct JointDrag {
     pub value: f32,
 }
 
-/// The body's pose when the gizmo found it, which `rest` names.
+/// The body's pose when the gizmo found it, which `rest` names, and the body
+/// it is the pose of: a gizmo pointed at another body finds that body's pose
+/// afresh, rather than posing it from where the last one stood.
 #[derive(Component, Clone, Copy)]
-pub(crate) struct Rest(Transform);
+pub(crate) struct Rest(Transform, Entity);
 
 /// What a range material needs to shade a joint's span.
 #[derive(ShaderType, Debug, Clone, Default)]
@@ -528,8 +530,8 @@ fn pose_bodies(
         let Ok(mut body) = bodies.get_mut(gizmo.target) else {
             continue;
         };
-        let Some(rest) = rest else {
-            commands.entity(entity).insert(Rest(*body));
+        let Some(rest) = rest.filter(|rest| rest.1 == gizmo.target) else {
+            commands.entity(entity).insert(Rest(*body, gizmo.target));
             continue;
         };
         if !gizmo.apply {
@@ -911,6 +913,41 @@ mod tests {
         app.update();
         assert!(app.world().get_entity(part).is_err(), "the ring is gone");
         assert!(app.world().get_entity(other).is_ok(), "other children stay");
+    }
+
+    /// A gizmo pointed at another body poses that body from its own rest, not
+    /// from where the first one stood.
+    #[test]
+    fn a_retargeted_gizmo_poses_its_new_body_from_its_own_rest() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_systems(Update, pose_bodies);
+        let first = app
+            .world_mut()
+            .spawn(Transform::from_xyz(1.0, 0.0, 0.0))
+            .id();
+        let second = app
+            .world_mut()
+            .spawn(Transform::from_xyz(0.0, 5.0, 0.0))
+            .id();
+        let mut gizmo = joint(JointMotion::Slide, -1.0, 1.0);
+        gizmo.target = first;
+        gizmo.axis = Dir3::X;
+        gizmo.value = 0.5;
+        let gizmo = app.world_mut().spawn(gizmo).id();
+        app.update();
+        app.update();
+        let at = |app: &App, body: Entity| app.world().get::<Transform>(body).unwrap().translation;
+        assert!(at(&app, first).abs_diff_eq(Vec3::new(1.5, 0.0, 0.0), 1e-5));
+
+        app.world_mut().get_mut::<JointGizmo>(gizmo).unwrap().target = second;
+        app.update();
+        app.update();
+        assert!(
+            at(&app, second).abs_diff_eq(Vec3::new(0.5, 5.0, 0.0), 1e-5),
+            "{:?}",
+            at(&app, second)
+        );
     }
 
     /// A range shifts to start at zero rather than wrapping, so a range across
