@@ -11,7 +11,8 @@
 //! so a line can stay fixed in the world or the same on screen however far.
 //! Its width does not: it is always [`WIDTH_PX`] across wherever a camera is
 //! given to measure with, so a guide never swells into a bar up close or
-//! thins to nothing far away. It is flat, fainter than a handle, drawn over
+//! thins to nothing far away. It fades out over the outer half of its reach
+//! rather than stopping on a hard edge. It is flat, fainter than a handle, drawn over
 //! everything as the gizmos are, never picked and casts no shadow. It follows
 //! the entity's position and turn but not its scale.
 
@@ -53,6 +54,10 @@ const DASH_PERIOD: f32 = 0.08;
 /// How much of each period is dash.
 const DUTY: f32 = 0.5;
 
+/// Where along each half the line starts fading out, as a fraction of its
+/// reach: the outer half trails off to nothing.
+const FADE_FROM: f32 = 0.5;
+
 /// How much fainter than its colour a line is drawn.
 const OPACITY: f32 = 0.6;
 
@@ -61,7 +66,8 @@ pub struct AxisLineUniform {
     pub colour: Vec4,
     pub dashes: f32,
     pub duty: f32,
-    pub _padding: Vec2,
+    pub fade_from: f32,
+    pub _padding: f32,
 }
 
 /// A line's material: one flat colour in dashes, never hidden; see
@@ -234,7 +240,8 @@ fn place_lines(
                 colour: LinearRgba::from(faint).to_vec4(),
                 dashes: line.reach / DASH_PERIOD,
                 duty: DUTY,
-                _padding: Vec2::ZERO,
+                fade_from: FADE_FROM,
+                _padding: 0.0,
             };
             // Touched only on a change, since touching a material re-uploads it.
             let stale = materials.get(&built.material).is_some_and(|material| {

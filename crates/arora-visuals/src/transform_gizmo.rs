@@ -188,7 +188,7 @@ impl TransformGizmo {
             modes: TransformModes::ALL,
             only: None,
             space: GizmoSpace::World,
-            size: GizmoSize::World(0.25),
+            size: GIZMO_SIZE,
             offset: Transform::IDENTITY,
             axes: [Dir3::X, Dir3::Y, Dir3::Z],
             colours: AXIS_COLOURS,
@@ -445,6 +445,11 @@ struct Drag {
 /// [`GizmoPointer`] is this frame's answer when it reads it.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransformGizmoSystems;
+
+/// A transform gizmo's size unless a host sets one, and a frame's arrows':
+/// a quarter of a metre in the world, so an arrow along a frame and a handle
+/// along the same axis reach the same length.
+pub const GIZMO_SIZE: GizmoSize = GizmoSize::World(0.25);
 
 /// Studio's axis colours, X, Y and Z, as its gizmos draw them.
 pub const AXIS_COLOURS: [Color; 3] = [

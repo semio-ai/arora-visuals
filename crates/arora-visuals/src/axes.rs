@@ -7,9 +7,10 @@
 //! target — and removing it takes them away again. Any number of entities may
 //! show theirs at once.
 //!
-//! The arrows are the transform gizmo's, at rest and without its handles:
-//! unlit, in its axis colours, and drawn over everything, so a frame inside a
-//! body still shows. They follow the entity's position and turn but not its
+//! The arrows are the transform gizmo's, at its length and without its
+//! handles: unlit, in its axis colours but faint, so they read as a reference
+//! rather than as something to take, and drawn over everything, so a frame
+//! inside a body still shows. They follow the entity's position and turn but not its
 //! scale, so a scaled node's axes keep their length; [`FrameAxes::size`] sets
 //! that length, in the world or on screen, as a gizmo's size does. They are
 //! never picked, cast no shadow, and are left alone by a ghost.
@@ -25,7 +26,7 @@ use bevy::prelude::*;
 use crate::axis_line::{AxisLine, AxisLinePlugin};
 use crate::transform_gizmo::{
     add_handle_material, unit_size, GizmoSize, HandleMaterial, HandleUniform, AXIS_COLOURS,
-    CONE_LENGTH, CONE_RADIUS, SHAFT_LENGTH, TUBE,
+    CONE_LENGTH, CONE_RADIUS, GIZMO_SIZE, SHAFT_LENGTH, TUBE,
 };
 
 /// Shows this entity's reference frame ([module docs](self)).
@@ -67,10 +68,10 @@ impl Default for FrameLines {
 }
 
 impl Default for FrameAxes {
-    /// Studio's body axes: three tenths of a metre, in the gizmos' colours.
+    /// Arrows the transform gizmo's length, in its colours.
     fn default() -> Self {
         Self {
-            size: GizmoSize::World(0.3),
+            size: GIZMO_SIZE,
             camera: None,
             axes: [Dir3::X, Dir3::Y, Dir3::Z],
             colours: AXIS_COLOURS,
@@ -79,6 +80,11 @@ impl Default for FrameAxes {
         }
     }
 }
+
+/// How opaque a frame's arrows are: clearly fainter than a gizmo's handles,
+/// which are at least three quarters opaque, so an arrow marking an axis is
+/// never mistaken for a handle to take.
+const ARROW_OPACITY: f32 = 0.4;
 
 /// The arrows showing an entity's axes, held under it; `0` is the entity.
 #[derive(Component)]
@@ -189,7 +195,7 @@ fn build_axes(
         for (index, colour) in axes.colours.into_iter().enumerate() {
             let material = materials.add(HandleMaterial {
                 handle: HandleUniform {
-                    colour: LinearRgba::from(colour).to_vec4(),
+                    colour: LinearRgba::from(colour.with_alpha(ARROW_OPACITY)).to_vec4(),
                 },
             });
             // The meshes stand along Y; each arrow is turned onto its axis.
@@ -332,7 +338,7 @@ mod tests {
             },
         ));
         app.update();
-        let blue = LinearRgba::from(AXIS_COLOURS[2]).to_vec4();
+        let blue = LinearRgba::from(AXIS_COLOURS[2].with_alpha(ARROW_OPACITY)).to_vec4();
         let world = app.world_mut();
         let pieces: Vec<(Vec3, Handle<HandleMaterial>)> = world
             .query::<(&Transform, &MeshMaterial3d<HandleMaterial>)>()
@@ -392,13 +398,16 @@ mod tests {
         ));
         app.update();
         app.update();
+        let GizmoSize::World(metres) = GIZMO_SIZE else {
+            panic!("the default is sized in the world");
+        };
         let global = *app
             .world_mut()
             .query_filtered::<&GlobalTransform, With<AxesOf>>()
             .single(app.world())
             .expect("one holder");
         assert!(
-            global.scale().abs_diff_eq(Vec3::splat(0.3), 1e-5),
+            global.scale().abs_diff_eq(Vec3::splat(metres), 1e-5),
             "{:?}",
             global.scale()
         );
