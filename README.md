@@ -71,6 +71,7 @@ the upgrade off the schedule of a repo that has not adopted it yet.
 | `ghost` | draws everything beneath an entity as a ghost of itself, Studio's look, over its own material rather than replacing it, behind `view` | the whole engine |
 | `glow` | feature-edge selection marking, behind `view` | the whole engine |
 | `outline` | the selection outline: one line around the whole of what is selected, drawn over whatever stands in front of it, behind `view` | the whole engine |
+| `axes` | an entity's reference frame shown as three arrows along its own axes, off until a host asks for it, behind `view` | the whole engine |
 | `joint_gizmo` | a ring to turn a joint or a bar to slide it, within its limits and shaded to show its range, sharing the transform gizmo's look and pointer handling, behind `view` | the whole engine |
 | `transform_gizmo` | handles to move, turn and scale an entity — any of the three modes, together or one at a time — spawned on their own and pointed at a target, behind `view` | the whole engine |
 | `overlay` | what a host needs to draw labels and tooltips over the view: element and gizmo boxes on screen, and the gizmo the pointer has, by the host's names, each frame to a resource and a sink, behind `view` | the whole engine |

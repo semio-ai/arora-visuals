@@ -50,6 +50,8 @@
 
 #[cfg(feature = "view")]
 pub mod active_area;
+#[cfg(feature = "view")]
+pub mod axes;
 pub mod binding;
 #[cfg(feature = "camera_input")]
 pub mod camera_input;
@@ -61,6 +63,8 @@ pub mod ghost;
 pub mod glow;
 pub mod hold;
 pub mod instance;
+#[cfg(feature = "view")]
+pub mod joint_gizmo;
 pub mod meta;
 #[cfg(feature = "view")]
 pub mod outline;
@@ -73,11 +77,9 @@ pub mod select;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
 pub mod target;
-#[cfg(feature = "view")]
-pub mod joint_gizmo;
+pub mod tone;
 #[cfg(feature = "view")]
 pub mod transform_gizmo;
-pub mod tone;
 pub mod value;
 #[cfg(feature = "view_gizmo")]
 pub mod view_gizmo;
@@ -87,9 +89,9 @@ pub mod view_offset;
 pub use binding::{ElementTargets, SceneBinding, SceneBindings};
 pub use hold::{HoldTarget, Holds};
 pub use instance::{ClearCamera, EntityInstance, Superseded, ViewOf, CLEAR_ORDER};
+pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 #[cfg(feature = "view")]
 pub use pick::{Picked, Picks};
-pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 pub use target::OffscreenTarget;
 pub use tone::ToneMapping;
 pub use value::Decoded;

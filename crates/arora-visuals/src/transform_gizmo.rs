@@ -186,11 +186,7 @@ impl TransformGizmo {
             size: GizmoSize::World(0.25),
             offset: Transform::IDENTITY,
             axes: [Dir3::X, Dir3::Y, Dir3::Z],
-            colours: [
-                Color::srgb_u8(0xef, 0x44, 0x44),
-                Color::srgb_u8(0x22, 0xc5, 0x5e),
-                Color::srgb_u8(0x3b, 0x82, 0xf6),
-            ],
+            colours: AXIS_COLOURS,
             apply: true,
             key: String::new(),
         }
@@ -312,9 +308,9 @@ impl GizmoPointer {
 pub struct GizmoPart;
 
 // Proportions, in units of the gizmo's size, from Studio's pivot controls.
-const SHAFT_LENGTH: f32 = 0.8;
-const CONE_LENGTH: f32 = 0.2;
-const CONE_RADIUS: f32 = 0.05;
+pub(crate) const SHAFT_LENGTH: f32 = 0.8;
+pub(crate) const CONE_LENGTH: f32 = 0.2;
+pub(crate) const CONE_RADIUS: f32 = 0.05;
 /// A ring's radius, in units of the gizmo's size; public so a host can place
 /// things — a label, say — clear of a ring.
 pub const RING_RADIUS: f32 = 0.65;
@@ -444,13 +440,29 @@ struct Drag {
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransformGizmoSystems;
 
+/// Studio's axis colours, X, Y and Z, as its gizmos draw them.
+pub const AXIS_COLOURS: [Color; 3] = [
+    Color::srgb_u8(0xef, 0x44, 0x44),
+    Color::srgb_u8(0x22, 0xc5, 0x5e),
+    Color::srgb_u8(0x3b, 0x82, 0xf6),
+];
+
+/// Registers the handle material once, for whichever of the plugins drawing
+/// with it is added first.
+pub(crate) fn add_handle_material(app: &mut App) {
+    if app.is_plugin_added::<MaterialPlugin<HandleMaterial>>() {
+        return;
+    }
+    embedded_asset!(app, "handle.wesl");
+    app.add_plugins(MaterialPlugin::<HandleMaterial>::default());
+}
+
 pub struct TransformGizmoPlugin;
 
 impl Plugin for TransformGizmoPlugin {
     fn build(&self, app: &mut App) {
-        embedded_asset!(app, "handle.wesl");
-        app.add_plugins(MaterialPlugin::<HandleMaterial>::default())
-            .init_resource::<GizmoPointer>()
+        add_handle_material(app);
+        app.init_resource::<GizmoPointer>()
             .add_systems(Update, drive.in_set(TransformGizmoSystems))
             .add_systems(
                 PostUpdate,
