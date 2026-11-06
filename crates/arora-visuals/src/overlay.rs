@@ -41,6 +41,7 @@ use crate::instance::{EntityInstance, Superseded};
 use crate::joint_gizmo::{self, JointGizmo, JointMotion, Rest};
 use crate::pick::{ElementMeshes, MorphOffsets};
 use crate::transform_gizmo::{self, Facing, GizmoHandle, GizmoPointer, TransformGizmo};
+pub use crate::transform_gizmo::{Reading, ReadingUnit};
 
 /// A box on screen, in logical pixels of the camera's target, with its
 /// centre.
@@ -114,8 +115,11 @@ pub struct GizmoInHand {
     pub handle: GizmoHandle,
     /// Held in a drag, rather than only under the pointer.
     pub held: bool,
-    /// A joint's value, where the gizmo is a joint's.
-    pub value: Option<f32>,
+    /// What the gizmo reads, one [`Reading`] to each axis it moves along or
+    /// about, for a host to show — stacked, say, one to a line. A transform
+    /// gizmo's while a handle is held: how far the drag has gone. A joint's
+    /// at any time: its value, in degrees for a turn and metres for a slide.
+    pub readings: Vec<Reading>,
 }
 
 /// Everything an overlay needs for one frame.
@@ -297,7 +301,11 @@ fn publish(
                     kind: GizmoKind::Transform,
                     handle,
                     held,
-                    value: None,
+                    readings: if held {
+                        pointer.readings.clone()
+                    } else {
+                        Vec::new()
+                    },
                 });
             }
             let (_, gizmo, ..) = joint_gizmos.get(entity).ok()?;
@@ -306,7 +314,7 @@ fn publish(
                 kind: GizmoKind::Joint,
                 handle,
                 held,
-                value: Some(gizmo.value),
+                readings: vec![joint_reading(gizmo)],
             })
         });
     }
@@ -316,6 +324,19 @@ fn publish(
     }
     if overlay.0 != frame {
         overlay.0 = frame;
+    }
+}
+
+/// A joint's value as a reading: an angle for a turn, a distance for a slide.
+fn joint_reading(gizmo: &JointGizmo) -> Reading {
+    let (amount, unit) = match gizmo.motion {
+        JointMotion::Turn => (gizmo.value.to_degrees(), ReadingUnit::Degrees),
+        JointMotion::Slide => (gizmo.value, ReadingUnit::Metres),
+    };
+    Reading {
+        axis: None,
+        amount,
+        unit,
     }
 }
 
@@ -401,7 +422,11 @@ mod tests {
                 kind: GizmoKind::Joint,
                 handle: GizmoHandle::Joint,
                 held: true,
-                value: Some(0.5),
+                readings: vec![Reading {
+                    axis: None,
+                    amount: 0.5,
+                    unit: ReadingUnit::Metres,
+                }],
             }),
         };
         let json = serde_json::to_value(&frame).unwrap();
@@ -421,6 +446,7 @@ mod tests {
         assert!(json["elements"][0].get("screen").is_none());
         assert_eq!(json["pointer"]["key"], "tilt");
         assert_eq!(json["pointer"]["kind"], "Joint");
-        assert_eq!(json["pointer"]["value"], 0.5);
+        assert_eq!(json["pointer"]["readings"][0]["amount"], 0.5);
+        assert_eq!(json["pointer"]["readings"][0]["unit"], "Metres");
     }
 }

@@ -301,6 +301,83 @@ pub struct GizmoPointer {
     pub hovered: Option<(Entity, GizmoHandle)>,
     /// The handle being dragged, and its gizmo.
     pub dragging: Option<(Entity, GizmoHandle)>,
+    /// How far the transform gizmo's drag in hand has gone, in its handle's
+    /// own measure ([`Reading`]); empty when no transform handle is held.
+    pub readings: Vec<Reading>,
+}
+
+/// One amount a held handle has moved its target by, for a host to show
+/// beside the gizmo: along one axis, or about it.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct Reading {
+    /// The axis it is along or about — 0, 1 or 2 for X, Y or Z, as the gizmo
+    /// names them in [`TransformGizmo::axes`]. `None` for a joint, whose one
+    /// axis is its own.
+    pub axis: Option<usize>,
+    pub amount: f32,
+    pub unit: ReadingUnit,
+}
+
+/// What a [`Reading`] counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum ReadingUnit {
+    /// A distance moved: along an arrow, across a plane, or a sliding
+    /// joint's travel.
+    Metres,
+    /// An angle turned: about a ring, or a turning joint's.
+    Degrees,
+    /// A stretch: the target's scale along the axis, over its scale when the
+    /// drag began.
+    Factor,
+}
+
+/// How far a drag has carried its target from where it began, in the
+/// held handle's own measure: the move along an arrow, a plane's move along
+/// each of its two axes, the turn about a ring, or a ball's stretch. Axes
+/// are the gizmo's as the drag began, so a reading does not drift as a
+/// gizmo in local space turns with what it turns.
+fn readings(drag: &Drag, moved: &Moved) -> Vec<Reading> {
+    let axis = |index: usize| drag.axes * axis_vector(index);
+    let along = |index: usize, offset: Vec3| Reading {
+        axis: Some(index),
+        amount: offset.dot(axis(index)),
+        unit: ReadingUnit::Metres,
+    };
+    match (drag.handle, moved) {
+        (GizmoHandle::Arrow(index), Moved::World(global)) => {
+            vec![along(
+                index,
+                global.translation() - drag.start_global.translation(),
+            )]
+        }
+        (GizmoHandle::Plane(index), Moved::World(global)) => {
+            let offset = global.translation() - drag.start_global.translation();
+            // In axis order, so a host stacking them shows X above Z.
+            (0..3)
+                .filter(|other| *other != index)
+                .map(|other| along(other, offset))
+                .collect()
+        }
+        (GizmoHandle::Ring(index), Moved::World(global)) => {
+            // The twist about the ring's axis: the part of the turn a ring
+            // can make, measured either way round, up to half a turn.
+            let turn = global.rotation() * drag.start_global.rotation().inverse();
+            let twist = 2.0 * turn.xyz().dot(axis(index)).atan2(turn.w);
+            let twist = (twist + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+                - std::f32::consts::PI;
+            vec![Reading {
+                axis: Some(index),
+                amount: twist.to_degrees(),
+                unit: ReadingUnit::Degrees,
+            }]
+        }
+        (GizmoHandle::Ball(index), Moved::Stretch(stretch)) => vec![Reading {
+            axis: Some(index),
+            amount: stretch.dot(drag.stretch_along),
+            unit: ReadingUnit::Factor,
+        }],
+        _ => Vec::new(),
+    }
 }
 
 impl GizmoPointer {
@@ -1009,6 +1086,7 @@ fn drive(
             };
             let moved = ray_through(gizmo.camera).and_then(|ray| dragged_to(&drag, ray));
             if let Some(moved) = moved {
+                pointer.readings = readings(&drag, &moved);
                 let local = match moved {
                     Moved::World(global) => {
                         // Moving and turning leave the scale as it was; taking
@@ -1055,6 +1133,7 @@ fn drive(
             if released {
                 *held = None;
                 pointer.dragging = None;
+                pointer.readings.clear();
             }
             return;
         }
@@ -1460,6 +1539,53 @@ fn place_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drag reads in its handle's own measure: an arrow's move along its
+    /// axis, a plane's move along each of its two, a ring's turn about its
+    /// axis either way, and a ball's stretch.
+    #[test]
+    fn a_drag_reads_in_its_handles_measure() {
+        let start = |handle| drag(handle, Vec3::ZERO, Vec3::Y);
+        let moved_to = |translation: Vec3, rotation: Quat| {
+            Moved::World(GlobalTransform::from(
+                Transform::from_translation(translation).with_rotation(rotation),
+            ))
+        };
+        let amounts = |handle, moved: Moved| {
+            readings(&start(handle), &moved)
+                .into_iter()
+                .map(|reading| (reading.axis, reading.amount, reading.unit))
+                .collect::<Vec<_>>()
+        };
+        let offset = Vec3::new(0.3, -0.2, 0.5);
+        assert_eq!(
+            amounts(GizmoHandle::Arrow(0), moved_to(offset, Quat::IDENTITY)),
+            vec![(Some(0), 0.3, ReadingUnit::Metres)]
+        );
+        assert_eq!(
+            amounts(GizmoHandle::Plane(1), moved_to(offset, Quat::IDENTITY)),
+            vec![
+                (Some(0), 0.3, ReadingUnit::Metres),
+                (Some(2), 0.5, ReadingUnit::Metres),
+            ]
+        );
+        let turned = amounts(
+            GizmoHandle::Ring(2),
+            moved_to(Vec3::ZERO, Quat::from_rotation_z(-0.5)),
+        );
+        assert_eq!(turned.len(), 1);
+        assert!(
+            (turned[0].1 - (-0.5_f32).to_degrees()).abs() < 1e-3,
+            "{turned:?}"
+        );
+        assert_eq!(
+            amounts(
+                GizmoHandle::Ball(0),
+                Moved::Stretch(Vec3::new(1.5, 1.0, 1.0))
+            ),
+            vec![(Some(0), 1.5, ReadingUnit::Factor)]
+        );
+    }
 
     /// A move, turn or stretch shows its own axis; a plane shows its two.
     #[test]
