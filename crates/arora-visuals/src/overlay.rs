@@ -39,7 +39,7 @@ use serde::Serialize;
 
 use crate::instance::{EntityInstance, Superseded};
 use crate::joint_gizmo::{self, JointGizmo, JointMotion, Rest};
-use crate::pick::ElementMeshes;
+use crate::pick::{ElementMeshes, MorphOffsets};
 use crate::transform_gizmo::{self, Facing, GizmoHandle, GizmoPointer, TransformGizmo};
 
 /// A box on screen, in logical pixels of the camera's target, with its
@@ -155,9 +155,6 @@ impl Plugin for OverlayPlugin {
     }
 }
 
-/// Points around a ring, for its box.
-const RING_SAMPLES: usize = 16;
-
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn publish(
     instances: Query<&EntityInstance, Without<Superseded>>,
@@ -172,6 +169,7 @@ fn publish(
     globals: Query<&GlobalTransform>,
     bounds: Query<(&GlobalTransform, &Aabb)>,
     drawn: ElementMeshes,
+    mut offsets: Local<MorphOffsets>,
     children: Query<&Children>,
     parents: Query<&ChildOf>,
     pointer: Option<Res<GizmoPointer>>,
@@ -194,21 +192,25 @@ fn publish(
             .map(|element| (element.id.as_str(), element.node_name.as_str()))
             .collect();
         for (element, targets) in &instance.bindings.elements {
-            // An element a morph is moving is boxed as drawn: its base
-            // mesh's bounding box is where it stood before the morph, which
-            // can carry it well past that. Any other element with a mesh of
-            // its own is boxed by that mesh's bounding box, and a group by
-            // the boxes of everything drawn beneath its node.
-            let screen = if drawn.morphing(targets) {
-                drawn
-                    .drawn_bounds(targets)
-                    .and_then(|[low, high]| box_of_points(&corners_of(low, high), camera))
-            } else {
-                let meshes: Vec<Entity> = match targets.mesh {
-                    Some(mesh) => vec![mesh],
-                    None => children.iter_descendants(targets.node).collect(),
-                };
-                box_of_meshes(&meshes, &bounds, camera)
+            // An element a morph is moving is boxed past its base mesh's
+            // bounding box, which is where it stood before the morph and
+            // which the morph can carry it well beyond. Any other element
+            // with a mesh of its own — or a morphing one whose widened box
+            // cannot be had — is boxed by that mesh's bounding box, and a
+            // group by the boxes of everything drawn beneath its node.
+            let morphed = drawn
+                .morphing(targets)
+                .then(|| drawn.morphed_corners(targets, &mut offsets))
+                .flatten();
+            let screen = match morphed {
+                Some(corners) => box_of_points(&corners, camera),
+                None => {
+                    let meshes: Vec<Entity> = match targets.mesh {
+                        Some(mesh) => vec![mesh],
+                        None => children.iter_descendants(targets.node).collect(),
+                    };
+                    box_of_meshes(&meshes, &bounds, camera)
+                }
             };
             if let Some(screen) = screen {
                 frame.elements.push(ElementAnchor {
@@ -259,9 +261,10 @@ fn publish(
             continue;
         };
         let points: Vec<Vec3> = match gizmo.motion {
-            JointMotion::Turn => (0..RING_SAMPLES)
+            JointMotion::Turn => (0..transform_gizmo::RING_SAMPLES)
                 .map(|i| {
-                    let angle = i as f32 * std::f32::consts::TAU / RING_SAMPLES as f32;
+                    let angle =
+                        i as f32 * std::f32::consts::TAU / transform_gizmo::RING_SAMPLES as f32;
                     reach.frame.centre
                         + (reach.frame.u * angle.cos() + reach.frame.v * angle.sin())
                             * transform_gizmo::RING_RADIUS
@@ -328,17 +331,6 @@ fn box_of_points(points: &[Vec3], (camera, at): (&Camera, &GlobalTransform)) -> 
 
 /// The box around the bounding boxes of these meshes, or nothing if any
 /// corner of any is behind the camera.
-/// The eight corners of the box from `low` to `high`.
-fn corners_of(low: Vec3, high: Vec3) -> [Vec3; 8] {
-    std::array::from_fn(|corner| {
-        Vec3::new(
-            if corner & 1 == 0 { low.x } else { high.x },
-            if corner & 2 == 0 { low.y } else { high.y },
-            if corner & 4 == 0 { low.z } else { high.z },
-        )
-    })
-}
-
 fn box_of_meshes(
     meshes: &[Entity],
     bounds: &Query<(&GlobalTransform, &Aabb)>,

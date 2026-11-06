@@ -88,6 +88,10 @@ pub struct JointGizmo {
     pub offset: Transform,
     /// Pose the body from `value`. Without it the gizmo only keeps `value`.
     pub apply: bool,
+    /// Draw the gizmo as though it were in hand, without its being so: the
+    /// look of a held control, for a still image. It takes nothing from the
+    /// pointer, so the view and every other control work as ever.
+    pub show_in_hand: bool,
     /// What the host calls this gizmo: the name it goes by in the
     /// [overlay](crate::overlay), where an entity id would mean nothing. Any
     /// string the host chooses — the blackboard key its value is written to,
@@ -119,9 +123,10 @@ impl JointGizmo {
             value: rest,
             rest,
             colour,
-            size: GizmoSize::World(0.2),
+            size: JOINT_GIZMO_SIZE,
             offset: Self::default_offset(motion, axis),
             apply: true,
+            show_in_hand: false,
             key: String::new(),
         }
     }
@@ -304,6 +309,10 @@ struct Built {
 const BACKGROUND: Color = Color::srgb(0.2, 0.2, 0.2);
 /// A resting handle's opacity, as the transform gizmo's rings rest.
 const REST_OPACITY: f32 = 0.5;
+
+/// A joint gizmo's size unless a host sets one: Studio's joint controls, a
+/// fifth of a metre in the world.
+pub const JOINT_GIZMO_SIZE: GizmoSize = GizmoSize::World(0.2);
 
 pub struct JointGizmoPlugin;
 
@@ -591,6 +600,7 @@ fn build_parts(
             let common = || {
                 (
                     GizmoPart,
+                    Pickable::IGNORE,
                     NotShadowCaster,
                     NotShadowReceiver,
                     NoFrustumCulling,
@@ -685,7 +695,7 @@ fn place_parts(
                 }
             }
         };
-        let in_hand = hot == Some(entity);
+        let in_hand = hot == Some(entity) || gizmo.show_in_hand;
         for child in children.iter() {
             let Ok((part, mut at, mut part_global, mut visibility, look)) = parts.get_mut(child)
             else {

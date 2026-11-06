@@ -311,8 +311,9 @@ impl GizmoPointer {
     }
 }
 
-/// Marks every mesh a gizmo draws, so a host can leave them out of anything
-/// that measures the scene.
+/// Marks every mesh this crate draws as an aid to the view rather than as
+/// part of what it shows — a gizmo's handles, a frame's axes, a guide line —
+/// so a host can leave them out of anything that measures the scene.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct GizmoPart;
 
@@ -479,6 +480,11 @@ pub(crate) fn add_handle_material(app: &mut App) {
 
 pub struct TransformGizmoPlugin;
 
+/// Marks the plugin installed. Its own, not a public resource a host might
+/// also create, so installing it again is the only way to skip installing it.
+#[derive(Resource, Default)]
+struct Installed;
+
 impl Plugin for TransformGizmoPlugin {
     /// The joint gizmo installs this one, and a host may too, in any order;
     /// installing it again does nothing.
@@ -487,9 +493,10 @@ impl Plugin for TransformGizmoPlugin {
     }
 
     fn build(&self, app: &mut App) {
-        if app.world().contains_resource::<GizmoPointer>() {
+        if app.world().contains_resource::<Installed>() {
             return;
         }
+        app.init_resource::<Installed>();
         add_handle_material(app);
         app.add_plugins(AxisLinePlugin);
         app.init_resource::<GizmoPointer>()
@@ -671,6 +678,9 @@ fn build_parts(
                         hot: false,
                     },
                     GizmoPart,
+                    // A handle is taken by this crate's own pointer handling;
+                    // a mesh picking backend must not take the press first.
+                    Pickable::IGNORE,
                     Mesh3d(meshes[0].clone()),
                     MeshMaterial3d(materials[0].clone()),
                     Transform::default(),
@@ -787,8 +797,9 @@ pub(crate) fn reach_points(
     Some(points)
 }
 
-/// Points around each ring, for a gizmo's box.
-const RING_SAMPLES: usize = 24;
+/// Points around each ring, for a gizmo's box: the transform gizmo's rings
+/// and a joint's alike.
+pub(crate) const RING_SAMPLES: usize = 24;
 
 /// How many metres one gizmo unit is, for a gizmo of `size` standing at
 /// `point`.

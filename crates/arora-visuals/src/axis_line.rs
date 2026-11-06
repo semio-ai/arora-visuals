@@ -27,7 +27,7 @@ use bevy::render::render_resource::{
 };
 use bevy::shader::ShaderRef;
 
-use crate::transform_gizmo::{metres_per_pixel, unit_size, GizmoSize, TUBE};
+use crate::transform_gizmo::{metres_per_pixel, unit_size, GizmoPart, GizmoSize, TUBE};
 
 /// A dashed line from this entity's origin ([module docs](self)).
 #[derive(Component, Clone, Debug, PartialEq)]
@@ -207,6 +207,7 @@ fn build_lines(
                 MeshMaterial3d(material.clone()),
                 Transform::default(),
                 Visibility::Hidden,
+                GizmoPart,
                 NotShadowCaster,
                 Pickable::IGNORE,
                 ChildOf(entity),

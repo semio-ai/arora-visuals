@@ -60,7 +60,7 @@ use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 
 use crate::pick::on_the_scene;
-use crate::transform_gizmo::GizmoPointer;
+use crate::transform_gizmo::{GizmoPointer, TransformGizmoSystems};
 
 /// Which inputs move a camera ([module docs](self)).
 #[derive(Component, Clone, Copy, Debug)]
@@ -77,6 +77,11 @@ pub struct CameraBindings {
     pub inertia: bool,
     /// A height the camera may not go below ([module docs](self)).
     pub floor: Option<CameraFloor>,
+    /// How near and how far a zoom may take the camera from its target:
+    /// OrbitControls' `minDistance` and `maxDistance`. A zoom stops at either
+    /// rather than passing into the target or shrinking it to nothing.
+    pub min_distance: f32,
+    pub max_distance: f32,
 }
 
 /// A height the camera is kept at or above, measured along `up` from the
@@ -96,6 +101,8 @@ impl Default for CameraBindings {
             zoom_speed: 1.0,
             // A browser's wheel step, so a notch zooms as it does in Studio.
             pixels_per_line: 100.0,
+            min_distance: 0.0,
+            max_distance: f32::INFINITY,
             inertia: false,
             floor: None,
         }
@@ -160,7 +167,10 @@ impl Plugin for CameraInputPlugin {
             .init_resource::<Trackpad>()
             .add_observer(start_gesture)
             .add_observer(zoom)
-            .add_systems(Update, drag)
+            // After the gizmos' pointer handling, so a handle taken by the
+            // same press that began a gesture ends the gesture before it
+            // moves the view.
+            .add_systems(Update, drag.after(TransformGizmoSystems))
             .add_systems(PreUpdate, keep_above_floor.after(SyncCameraPosition));
     }
 }
@@ -178,19 +188,38 @@ type Cameras<'w, 's> = Query<
     ),
 >;
 
-/// The camera a gesture at `position` belongs to: the topmost active one
-/// whose viewport holds it, as picking decides which view a press is on, so
-/// an inactive camera, or a view drawn beneath another, never moves.
-fn camera_under(position: Vec2, cameras: &Cameras) -> Option<Entity> {
+/// The camera a gesture at `position` belongs to, if any: the topmost active
+/// camera of all whose viewport holds it — bound or not, so a view drawn over
+/// a bound one shields it — and only if that camera has bindings. An
+/// inactive camera, or a view beneath another, never moves. Every camera is
+/// taken to draw to the window the pointer is in; a host with several
+/// windows keeps each window's cameras apart.
+fn camera_under(position: Vec2, all: &Query<(Entity, &Camera)>, bound: &Cameras) -> Option<Entity> {
+    topmost(
+        position,
+        all.iter().map(|(entity, camera)| {
+            (
+                entity,
+                camera.is_active,
+                camera.order,
+                camera.logical_viewport_rect(),
+            )
+        }),
+    )
+    .filter(|entity| bound.contains(*entity))
+}
+
+/// The topmost of `cameras` — each its entity, whether it is active, its
+/// order and its viewport — whose viewport holds `position`.
+fn topmost(
+    position: Vec2,
+    cameras: impl Iterator<Item = (Entity, bool, isize, Option<Rect>)>,
+) -> Option<Entity> {
     cameras
-        .iter()
-        .filter(|(_, camera, ..)| {
-            camera.is_active
-                && camera
-                    .logical_viewport_rect()
-                    .is_some_and(|rect| rect.contains(position))
+        .filter(|(_, active, _, viewport)| {
+            *active && viewport.is_some_and(|rect| rect.contains(position))
         })
-        .max_by_key(|(_, camera, ..)| camera.order)
+        .max_by_key(|(_, _, order, _)| *order)
         .map(|(entity, ..)| entity)
 }
 
@@ -199,6 +228,7 @@ fn start_gesture(
     press: On<PointerPress>,
     windows: Query<(), With<Window>>,
     gizmos: Option<Res<GizmoPointer>>,
+    all: Query<(Entity, &Camera)>,
     mut cameras: Cameras,
     mut gesture: ResMut<Gesture>,
 ) {
@@ -214,7 +244,7 @@ fn start_gesture(
         PointerButton::Middle => MouseButton::Middle,
     };
     let position = press.pointer.position;
-    let Some(entity) = camera_under(position, &cameras) else {
+    let Some(entity) = camera_under(position, &all, &cameras) else {
         return;
     };
     let Ok((_, _, bindings, mut controller, _)) = cameras.get_mut(entity) else {
@@ -235,6 +265,7 @@ fn start_gesture(
 fn drag(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window>,
+    gizmos: Option<Res<GizmoPointer>>,
     mut cameras: Query<(&mut PanOrbitCamera, &CameraBindings)>,
     mut gesture: ResMut<Gesture>,
 ) {
@@ -245,6 +276,16 @@ fn drag(
         gesture.0 = None;
         return;
     };
+    // A gizmo drag owns the pointer. A gesture can begin on the same press
+    // that takes a handle — the first frame the pointer reaches the handle,
+    // before it is known to be over it — and it yields at once, without
+    // carrying on, so the view never turns under a handle in hand.
+    if gizmos.is_some_and(|gizmos| gizmos.dragging.is_some()) {
+        controller.end_move();
+        controller.current_motion = CurrentMotion::Stationary;
+        gesture.0 = None;
+        return;
+    }
     if !buttons.pressed(button) {
         controller.end_move();
         if !bindings.inertia {
@@ -278,6 +319,7 @@ fn dolly(distance: f64, pixels: f32, zoom_speed: f32) -> f64 {
 fn zoom(
     scroll: On<PointerScroll>,
     windows: Query<(), With<Window>>,
+    all: Query<(Entity, &Camera)>,
     mut cameras: Cameras,
     gesture: Res<Gesture>,
     time: Res<Time>,
@@ -292,7 +334,7 @@ fn zoom(
     if gesture.0.is_some() {
         return;
     }
-    let Some(entity) = camera_under(scroll.pointer.position, &cameras) else {
+    let Some(entity) = camera_under(scroll.pointer.position, &all, &cameras) else {
         return;
     };
     if let Ok((_, _, bindings, mut controller, mut transform)) = cameras.get_mut(entity) {
@@ -308,7 +350,10 @@ fn zoom(
             return;
         }
         let distance = controller.last_anchor_depth().abs();
-        let closer = dolly(distance, pixels, bindings.zoom_speed);
+        let closer = dolly(distance, pixels, bindings.zoom_speed).clamp(
+            f64::from(bindings.min_distance),
+            f64::from(bindings.max_distance),
+        );
         let forward = transform.forward().as_vec3();
         transform.translation += forward * (distance - closer) as f32;
         controller.last_anchor_depth = -closer;
@@ -385,6 +430,31 @@ mod tests {
         assert!(pad.coasting(TouchPhase::Moved, 0.5));
         assert!(pad.coasting(TouchPhase::Ended, 0.9));
         assert!(!pad.coasting(TouchPhase::Moved, 1.0), "a wheel after it");
+    }
+
+    /// The topmost active camera holding the pointer is the gesture's; an
+    /// inactive one, one beneath, and one whose viewport misses are not.
+    #[test]
+    fn a_gesture_goes_to_the_topmost_active_camera_under_it() {
+        let [beneath, above, inactive, elsewhere] =
+            [1, 2, 3, 4].map(|index| Entity::from_raw_u32(index).unwrap());
+        let full = Some(Rect::new(0.0, 0.0, 800.0, 600.0));
+        let cameras = [
+            (beneath, true, 0, full),
+            (above, true, 1, full),
+            (inactive, false, 5, full),
+            (
+                elsewhere,
+                true,
+                9,
+                Some(Rect::new(900.0, 0.0, 1000.0, 100.0)),
+            ),
+        ];
+        assert_eq!(
+            topmost(Vec2::new(10.0, 10.0), cameras.into_iter()),
+            Some(above)
+        );
+        assert_eq!(topmost(Vec2::new(850.0, 10.0), cameras.into_iter()), None);
     }
 
     /// A scroll up closes on the target by OrbitControls' factor, and the same

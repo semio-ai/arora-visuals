@@ -25,8 +25,8 @@ use bevy::prelude::*;
 
 use crate::axis_line::{AxisLine, AxisLinePlugin};
 use crate::transform_gizmo::{
-    add_handle_material, unit_size, GizmoSize, HandleMaterial, HandleUniform, AXIS_COLOURS,
-    CONE_LENGTH, CONE_RADIUS, GIZMO_SIZE, SHAFT_LENGTH, TUBE,
+    add_handle_material, unit_size, GizmoPart, GizmoSize, HandleMaterial, HandleUniform,
+    AXIS_COLOURS, CONE_LENGTH, CONE_RADIUS, GIZMO_SIZE, SHAFT_LENGTH, TUBE,
 };
 
 /// Shows this entity's reference frame ([module docs](self)).
@@ -204,6 +204,7 @@ fn build_axes(
                     Mesh3d(mesh.clone()),
                     MeshMaterial3d(material.clone()),
                     Transform::from_translation(along * from).with_rotation(onto),
+                    GizmoPart,
                     NotShadowCaster,
                     Pickable::IGNORE,
                     ChildOf(holder),

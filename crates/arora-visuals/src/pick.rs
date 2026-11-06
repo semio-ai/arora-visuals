@@ -33,7 +33,7 @@ use bevy::ecs::system::SystemParam;
 use bevy::math::Affine3A;
 use bevy::mesh::morph::{MorphAttributes, MorphWeights};
 use bevy::mesh::{Indices, PrimitiveTopology};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bevy::picking::events::{PointerPress, PointerRelease};
 use bevy::picking::mesh_picking::ray_cast::{ray_mesh_intersection, Backfaces};
@@ -306,16 +306,51 @@ impl ElementMeshes<'_, '_> {
             .is_some_and(|weights| weights.weights().iter().any(|weight| *weight != 0.0))
     }
 
-    /// The corners of the box around the element as it is drawn, in the
-    /// world: its drawn vertices', morphs applied. Paid in full, so for an
-    /// element a morph is moving; a still one's own bounding box says the
-    /// same for nothing.
-    pub fn drawn_bounds(&self, targets: &ElementTargets) -> Option<[Vec3; 2]> {
-        let drawn = self.drawn(targets)?;
-        let mut points = drawn.positions.iter().map(|point| Vec3::from(*point));
-        let first = points.next()?;
-        Some(points.fold([first, first], |[low, high], point| {
-            [low.min(point), high.max(point)]
+    /// The corners, in the world, of a box sure to hold the element as its
+    /// morphs draw it: its base mesh's bounding box, widened by each morph
+    /// target's offsets at that target's weight.
+    ///
+    /// **Not its drawn vertices' box.** Building those costs every vertex of
+    /// every target, which a view paying it each frame for a speaking face
+    /// cannot afford. Each target's offsets are boxed once per mesh, in
+    /// `offsets`, and widening by them costs one step per target. The box is
+    /// conservative — each target widens it as far as that target alone could
+    /// — so it may be larger than the drawn shape, never smaller. `None` for
+    /// an element with no morph targets or no bounding box.
+    pub fn morphed_corners(
+        &self,
+        targets: &ElementTargets,
+        offsets: &mut MorphOffsets,
+    ) -> Option<[Vec3; 8]> {
+        let entity = targets.mesh?;
+        let (id, mesh) = self.mesh(targets)?;
+        let deltas = mesh.try_morph_targets().ok()?;
+        let vertices = mesh.count_vertices();
+        let held = offsets
+            .0
+            .entry(id)
+            .and_modify(|held| {
+                if held.0 != (vertices, deltas.len()) {
+                    *held = ((vertices, deltas.len()), target_offsets(deltas, vertices));
+                }
+            })
+            .or_insert_with(|| ((vertices, deltas.len()), target_offsets(deltas, vertices)));
+        let aabb = self.bounds.get(entity).ok()?;
+        let centre = Vec3::from(aabb.center);
+        let half = Vec3::from(aabb.half_extents);
+        let weights = targets
+            .morph
+            .and_then(|morph| self.weights.get(morph).ok())
+            .map(MorphWeights::weights)
+            .unwrap_or_default();
+        let [low, high] = widened([centre - half, centre + half], &held.1, weights);
+        let world = self.transforms.get(entity).ok()?.affine();
+        Some(std::array::from_fn(|corner| {
+            world.transform_point3(Vec3::new(
+                if corner & 1 == 0 { low.x } else { high.x },
+                if corner & 2 == 0 { low.y } else { high.y },
+                if corner & 4 == 0 { low.z } else { high.z },
+            ))
         }))
     }
 
@@ -374,6 +409,46 @@ impl ElementMeshes<'_, '_> {
             indices: mesh.try_indices().ok(),
         })
     }
+}
+
+/// Each mesh's morph targets' offset boxes, kept between frames by whoever
+/// widens boxes by them, and remade when a mesh's vertex or offset count
+/// changes.
+/// One mesh's held offset boxes, with the vertex and offset counts they were
+/// made from.
+type HeldOffsets = ((usize, usize), Vec<[Vec3; 2]>);
+
+#[derive(Default)]
+pub struct MorphOffsets(HashMap<AssetId<Mesh>, HeldOffsets>);
+
+/// The box of each morph target's offsets: `deltas` is every target's
+/// offsets in turn, `vertices` to a target.
+fn target_offsets(deltas: &[MorphAttributes], vertices: usize) -> Vec<[Vec3; 2]> {
+    if vertices == 0 {
+        return Vec::new();
+    }
+    deltas
+        .chunks(vertices)
+        .map(|target| {
+            target
+                .iter()
+                .fold([Vec3::ZERO, Vec3::ZERO], |[low, high], delta| {
+                    [low.min(delta.position), high.max(delta.position)]
+                })
+        })
+        .collect()
+}
+
+/// `base` widened by each target's offset box at its weight: as far as that
+/// target could carry any vertex, either way, for a negative weight too.
+fn widened(base: [Vec3; 2], offsets: &[[Vec3; 2]], weights: &[f32]) -> [Vec3; 2] {
+    offsets
+        .iter()
+        .zip(weights)
+        .fold(base, |[low, high], ([least, most], weight)| {
+            let (a, b) = (*least * *weight, *most * *weight);
+            [low + a.min(b), high + a.max(b)]
+        })
 }
 
 /// A mesh's triangles as drawn, in world space.
@@ -474,6 +549,34 @@ pub fn morphed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box widened by a target at a weight holds wherever that target can
+    /// carry a vertex at it, a negative weight included, and a target at no
+    /// weight leaves it alone.
+    #[test]
+    fn a_widened_box_holds_what_the_morph_can_reach() {
+        let base = [Vec3::splat(-1.0), Vec3::splat(1.0)];
+        // One target that opens a mouth: down by up to 0.5, and no further up.
+        let offsets = [[Vec3::new(0.0, -0.5, 0.0), Vec3::ZERO]];
+        let [low, high] = widened(base, &offsets, &[1.0]);
+        assert_eq!(low, Vec3::new(-1.0, -1.5, -1.0));
+        assert_eq!(high, Vec3::splat(1.0));
+        let [low, high] = widened(base, &offsets, &[-2.0]);
+        assert_eq!(low, Vec3::splat(-1.0));
+        assert_eq!(high, Vec3::new(1.0, 2.0, 1.0));
+        assert_eq!(widened(base, &offsets, &[0.0]), base);
+    }
+
+    /// Each target's offsets are boxed apart from the others'.
+    #[test]
+    fn each_target_is_boxed_on_its_own() {
+        let offset = |y: f32| MorphAttributes::new(Vec3::new(0.0, y, 0.0), Vec3::ZERO, Vec3::ZERO);
+        let deltas = [offset(1.0), offset(0.5), offset(-2.0), offset(0.0)];
+        let boxes = target_offsets(&deltas, 2);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0], [Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0)]);
+        assert_eq!(boxes[1], [Vec3::new(0.0, -2.0, 0.0), Vec3::ZERO]);
+    }
 
     /// A ray meets a placed box when it passes through it, and not when it
     /// passes beside it or the box is behind it.
