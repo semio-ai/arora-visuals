@@ -1,6 +1,6 @@
 //! Showing a reference frame: three arrows along an entity's own X, Y and Z,
-//! from its origin, so where a body or a joint's frame sits and how it is
-//! turned can be seen.
+//! from its origin, dashed lines reaching well past them, or both, so where
+//! a body or a joint's frame sits and how it is turned can be seen.
 //!
 //! **A view, not a default.** Nothing shows axes until a host puts
 //! [`FrameAxes`] on an entity — a body, a joint, an element's node, a gizmo's
@@ -13,10 +13,16 @@
 //! scale, so a scaled node's axes keep their length; [`FrameAxes::size`] sets
 //! that length, in the world or on screen, as a gizmo's size does. They are
 //! never picked, cast no shadow, and are left alone by a ghost.
+//!
+//! The lines are [`AxisLine`]s, the guides a gizmo shows along a held
+//! handle's axis, measured in the arrows' length. Run them both ways when the
+//! arrows show too, since the arrows already say which way is positive, and
+//! one way when the lines show alone.
 
 use bevy::light::NotShadowCaster;
 use bevy::prelude::*;
 
+use crate::axis_line::{AxisLine, AxisLinePlugin};
 use crate::transform_gizmo::{
     add_handle_material, unit_size, GizmoSize, HandleMaterial, HandleUniform, AXIS_COLOURS,
     CONE_LENGTH, CONE_RADIUS, SHAFT_LENGTH, TUBE,
@@ -35,6 +41,29 @@ pub struct FrameAxes {
     pub axes: [Dir3; 3],
     /// X's, Y's and Z's colours.
     pub colours: [Color; 3],
+    /// Whether the arrows show.
+    pub arrows: bool,
+    /// The dashed lines along the axes, if they show.
+    pub lines: Option<FrameLines>,
+}
+
+/// A frame's dashed lines ([module docs](self)).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameLines {
+    /// How far each reaches from the origin, in arrow lengths.
+    pub reach: f32,
+    /// Whether each runs back through the origin as far again.
+    pub both_ways: bool,
+}
+
+impl Default for FrameLines {
+    /// Four arrow lengths, both ways, as beside arrows.
+    fn default() -> Self {
+        Self {
+            reach: 4.0,
+            both_ways: true,
+        }
+    }
 }
 
 impl Default for FrameAxes {
@@ -45,6 +74,8 @@ impl Default for FrameAxes {
             camera: None,
             axes: [Dir3::X, Dir3::Y, Dir3::Z],
             colours: AXIS_COLOURS,
+            arrows: true,
+            lines: None,
         }
     }
 }
@@ -53,16 +84,42 @@ impl Default for FrameAxes {
 #[derive(Component)]
 struct AxesOf(Entity);
 
-/// The directions and colours the arrows were built in, so a change
-/// rebuilds them.
+/// One of the lines showing an entity's axes, under it; `0` is the entity.
+#[derive(Component)]
+struct LinesOf(Entity);
+
+/// What an entity's axes were built as, so a change rebuilds them.
 #[derive(Component, PartialEq)]
-struct Built([Dir3; 3], [Color; 3]);
+struct Built {
+    axes: [Dir3; 3],
+    colours: [Color; 3],
+    arrows: bool,
+    lines: Option<FrameLines>,
+    size: GizmoSize,
+    camera: Option<Entity>,
+}
+
+impl Built {
+    fn of(axes: &FrameAxes) -> Self {
+        Self {
+            axes: axes.axes,
+            colours: axes.colours,
+            arrows: axes.arrows,
+            lines: axes.lines,
+            size: axes.size,
+            camera: axes.camera,
+        }
+    }
+}
 
 pub struct FrameAxesPlugin;
 
 impl Plugin for FrameAxesPlugin {
     fn build(&self, app: &mut App) {
         add_handle_material(app);
+        if !app.is_plugin_added::<AxisLinePlugin>() {
+            app.add_plugins(AxisLinePlugin);
+        }
         app.add_systems(
             PostUpdate,
             (build_axes, (size_axes, drop_axes))
@@ -72,26 +129,45 @@ impl Plugin for FrameAxesPlugin {
     }
 }
 
-/// Builds the arrows for each entity newly showing its axes, or showing them
-/// in new colours.
+/// Builds the arrows and lines for each entity newly showing its axes, or
+/// showing them differently.
 fn build_axes(
     mut commands: Commands,
     shown: Query<(Entity, &FrameAxes, Option<&Built>)>,
     holders: Query<(Entity, &AxesOf)>,
+    lines: Query<(Entity, &LinesOf)>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<HandleMaterial>>,
 ) {
     for (entity, axes, built) in &shown {
-        let wanted = Built(axes.axes, axes.colours);
+        let wanted = Built::of(axes);
         if built == Some(&wanted) {
             continue;
         }
-        for (holder, of) in &holders {
-            if of.0 == entity {
-                commands.entity(holder).despawn();
+        despawn_shown(&mut commands, entity, &holders, &lines);
+        commands.entity(entity).insert(wanted);
+
+        if let Some(style) = axes.lines {
+            for (index, colour) in axes.colours.into_iter().enumerate() {
+                commands.spawn((
+                    LinesOf(entity),
+                    AxisLine {
+                        direction: axes.axes[index],
+                        reach: style.reach,
+                        both_ways: style.both_ways,
+                        size: axes.size,
+                        camera: axes.camera,
+                        colour,
+                    },
+                    Transform::default(),
+                    Visibility::default(),
+                    ChildOf(entity),
+                ));
             }
         }
-        commands.entity(entity).insert(wanted);
+        if !axes.arrows {
+            continue;
+        }
 
         let shaft = meshes.add(Cylinder::new(TUBE[0], SHAFT_LENGTH));
         // The head stands on the shaft's end, its base at the piece's origin.
@@ -166,21 +242,39 @@ fn size_axes(
     }
 }
 
-/// Takes the arrows away from an entity no longer showing its axes.
+/// Takes the arrows and lines away from an entity no longer showing its
+/// axes.
 fn drop_axes(
     mut commands: Commands,
     mut removed: RemovedComponents<FrameAxes>,
     holders: Query<(Entity, &AxesOf)>,
+    lines: Query<(Entity, &LinesOf)>,
 ) {
     for entity in removed.read() {
         if let Ok(mut built) = commands.get_entity(entity) {
             built.remove::<Built>();
         }
-        for (holder, of) in &holders {
-            if of.0 == entity {
-                commands.entity(holder).despawn();
-            }
-        }
+        despawn_shown(&mut commands, entity, &holders, &lines);
+    }
+}
+
+/// Despawns whatever shows `entity`'s axes.
+fn despawn_shown(
+    commands: &mut Commands,
+    entity: Entity,
+    holders: &Query<(Entity, &AxesOf)>,
+    lines: &Query<(Entity, &LinesOf)>,
+) {
+    let arrows = holders
+        .iter()
+        .filter(|(_, of)| of.0 == entity)
+        .map(|(e, _)| e);
+    let dashed = lines
+        .iter()
+        .filter(|(_, of)| of.0 == entity)
+        .map(|(e, _)| e);
+    for shown in arrows.chain(dashed) {
+        commands.entity(shown).despawn();
     }
 }
 
@@ -255,6 +349,37 @@ mod tests {
         for at in z {
             assert!(at.normalize().abs_diff_eq(Vec3::Y, 1e-5), "{at:?}");
         }
+    }
+
+    /// Lines alone show three dashed lines and no arrows; taking the axes
+    /// away removes them too.
+    #[test]
+    fn lines_alone_show_three_lines_and_no_arrows() {
+        let mut app = app();
+        let body = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                FrameAxes {
+                    arrows: false,
+                    lines: Some(FrameLines {
+                        reach: 4.0,
+                        both_ways: false,
+                    }),
+                    ..default()
+                },
+            ))
+            .id();
+        app.update();
+        let count = |app: &mut App| {
+            let world = app.world_mut();
+            world.query::<&AxisLine>().iter(world).count()
+        };
+        assert_eq!(count(&mut app), 3);
+        assert_eq!(arrows(&mut app), 0);
+        app.world_mut().entity_mut(body).remove::<FrameAxes>();
+        app.update();
+        assert_eq!(count(&mut app), 0);
     }
 
     /// The arrows keep their length on a scaled node.

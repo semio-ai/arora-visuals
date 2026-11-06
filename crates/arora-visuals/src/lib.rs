@@ -52,6 +52,8 @@
 pub mod active_area;
 #[cfg(feature = "view")]
 pub mod axes;
+#[cfg(feature = "view")]
+pub mod axis_line;
 pub mod binding;
 #[cfg(feature = "camera_input")]
 pub mod camera_input;

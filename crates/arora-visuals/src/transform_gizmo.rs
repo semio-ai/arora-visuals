@@ -767,7 +767,10 @@ fn nearest_component(turned: Quat, axis: Vec3) -> Vec3 {
 /// How many metres one logical pixel spans at `point`, from two rays a pixel
 /// apart met with the plane through `point` facing the camera. Rays rather
 /// than a field of view, so orthographic cameras are measured the same way.
-fn metres_per_pixel((camera, at): (&Camera, &GlobalTransform), point: Vec3) -> Option<f32> {
+pub(crate) fn metres_per_pixel(
+    (camera, at): (&Camera, &GlobalTransform),
+    point: Vec3,
+) -> Option<f32> {
     let centre = camera.world_to_viewport(at, point).ok()?;
     let facing = at.forward().as_vec3();
     let meet = |pixel: Vec2| {
