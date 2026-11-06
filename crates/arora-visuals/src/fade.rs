@@ -8,11 +8,14 @@
 //! entity loses `FadeIn` when the fade is done, so it fades once: nothing
 //! fades again unless a host asks again.
 //!
-//! **The copies use alpha to coverage**, which keeps depth testing and depth
-//! writes and needs the view's multisampling, rather than blending, under
-//! which a body would show its own inside while half faded. A material that
-//! is already blended keeps its own mode. Meshes under a ghost are left
-//! alone: a ghost draws with its own material.
+//! **The copies blend.** Alpha to coverage would keep depth, but at a view's
+//! multisampling it has only a handful of steps of opacity, so a fade through
+//! it judders and its pattern shimmers as the view moves; a blend is smooth.
+//! What a blend costs is that a half-faded body does not hide its own far
+//! side, which a fade this short shows as a moment's thinness rather than as
+//! anything to read. A material that already blends keeps its own mode.
+//! Meshes under a ghost are left alone: a ghost draws with its own
+//! material.
 
 use bevy::prelude::*;
 
@@ -85,7 +88,7 @@ fn start_fades(
                     copy.alpha_mode,
                     AlphaMode::Blend | AlphaMode::Premultiplied | AlphaMode::Add
                 ) {
-                    copy.alpha_mode = AlphaMode::AlphaToCoverage;
+                    copy.alpha_mode = AlphaMode::Blend;
                 }
                 copy.base_color.set_alpha(0.0);
                 let copy = materials.add(copy);
@@ -181,7 +184,7 @@ mod tests {
         let (handle, material) = drawn(&app);
         assert_ne!(handle, own, "drawing with a copy while fading");
         assert!(material.base_color.alpha() < 0.5, "starting clear");
-        assert_eq!(material.alpha_mode, AlphaMode::AlphaToCoverage);
+        assert_eq!(material.alpha_mode, AlphaMode::Blend);
 
         for _ in 0..4 {
             app.update();
