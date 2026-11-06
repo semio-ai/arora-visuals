@@ -71,6 +71,8 @@ pub mod camera_input;
 #[cfg(feature = "view")]
 pub mod drawn;
 #[cfg(feature = "view")]
+pub mod fade;
+#[cfg(feature = "view")]
 pub mod ghost;
 #[cfg(feature = "view")]
 pub mod glow;

@@ -68,6 +68,7 @@ the upgrade off the schedule of a repo that has not adopted it yet.
 | `pick` | a pointer press resolved over the mesh **as drawn**, behind `view` | the whole engine |
 | `camera_input` | the editing camera's bindings over Bevy's pan-orbit controller: Studio's mouse scheme, gestures only from presses on the scene, every one about the view's target, behind `camera_input` | the whole engine and Bevy's camera controller |
 | `active_area` | the part of a view the user can see beside panels, which a camera frames its subject in, easing as the area changes, behind `view` | the whole engine |
+| `fade` | fades every mesh beneath an entity into view over a moment, once, on a copy of each material, behind `view` | the whole engine |
 | `ghost` | draws everything beneath an entity as a ghost of itself, Studio's look, over its own material rather than replacing it, behind `view` | the whole engine |
 | `glow` | feature-edge selection marking, behind `view` | the whole engine |
 | `outline` | the selection outline: one line around the whole of what is selected, drawn over whatever stands in front of it, behind `view` | the whole engine |
