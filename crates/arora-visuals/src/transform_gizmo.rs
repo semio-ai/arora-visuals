@@ -75,6 +75,7 @@ use bevy::render::render_resource::{
 };
 use bevy::shader::ShaderRef;
 
+use crate::axis_line::{AxisLine, AxisLinePlugin, AxisLineSystems};
 use crate::joint_gizmo::{
     distance as joint_distance, dragged, reach as joint_reach, take, JointDrag, JointGizmo,
     JointHeld, JointReach, Rest,
@@ -163,6 +164,10 @@ pub struct TransformGizmo {
     pub colours: [Color; 3],
     /// Write each drag onto the target. Without it the gizmo only reports.
     pub apply: bool,
+    /// While a handle is held, show the dashed line along each axis it
+    /// constrains, through the gizmo's origin and both ways: a move, turn
+    /// or stretch along an axis shows that axis; a plane shows its two.
+    pub guides: bool,
     /// What the host calls this gizmo: the name it goes by in the
     /// [overlay](crate::overlay), where an entity id would mean nothing. Any
     /// string the host chooses — the blackboard key the gizmo writes through,
@@ -188,6 +193,7 @@ impl TransformGizmo {
             axes: [Dir3::X, Dir3::Y, Dir3::Z],
             colours: AXIS_COLOURS,
             apply: true,
+            guides: true,
             key: String::new(),
         }
     }
@@ -462,13 +468,17 @@ pub struct TransformGizmoPlugin;
 impl Plugin for TransformGizmoPlugin {
     fn build(&self, app: &mut App) {
         add_handle_material(app);
+        if !app.is_plugin_added::<AxisLinePlugin>() {
+            app.add_plugins(AxisLinePlugin);
+        }
         app.init_resource::<GizmoPointer>()
             .add_systems(Update, drive.in_set(TransformGizmoSystems))
             .add_systems(
                 PostUpdate,
                 (build_parts, place_parts)
                     .chain()
-                    .after(TransformSystems::Propagate),
+                    .after(TransformSystems::Propagate)
+                    .before(AxisLineSystems),
             );
     }
 }
@@ -1190,6 +1200,39 @@ fn dragged_to(drag: &Drag, ray: Ray3d) -> Option<Moved> {
     Some(Moved::World(GlobalTransform::from(moved)))
 }
 
+/// A guide a gizmo shows along one of its axes while a handle is held.
+#[derive(Component)]
+struct Guide(usize);
+
+/// How far a guide reaches each way, in gizmo units: well past the handles,
+/// so the line reads as the axis rather than as another handle.
+const GUIDE_REACH: f32 = 8.0;
+
+/// The axes a held handle constrains: its own, or a plane's two.
+fn guided(handle: GizmoHandle) -> Vec<usize> {
+    match handle {
+        GizmoHandle::Arrow(axis) | GizmoHandle::Ring(axis) | GizmoHandle::Ball(axis) => {
+            vec![axis]
+        }
+        GizmoHandle::Plane(axis) => (0..3).filter(|other| *other != axis).collect(),
+        GizmoHandle::Joint => Vec::new(),
+    }
+}
+
+/// The guides under gizmos, placed by hand with them.
+type Guides<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Guide,
+        &'static ChildOf,
+        &'static mut AxisLine,
+        &'static mut GlobalTransform,
+    ),
+    (Without<Part>, Without<TransformGizmo>),
+>;
+
 /// Stands each gizmo at its target, sizes it, turns each part onto its axis,
 /// shows only the handles it should, and gives the hot handle its in-hand
 /// look.
@@ -1200,10 +1243,16 @@ fn dragged_to(drag: &Drag, ray: Ray3d) -> Option<Moved> {
 /// they stood a frame ago and trail the view as it turns. That is also why a
 /// gizmo has to stand at the top of the hierarchy.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn place_parts(
+    mut commands: Commands,
+    mut guides: Guides,
     pointer: Res<GizmoPointer>,
-    cameras: Query<(&Camera, &GlobalTransform), (Without<Part>, Without<TransformGizmo>)>,
-    targets: Query<&GlobalTransform, (Without<Part>, Without<TransformGizmo>)>,
+    cameras: Query<
+        (&Camera, &GlobalTransform),
+        (Without<Part>, Without<TransformGizmo>, Without<Guide>),
+    >,
+    targets: Query<&GlobalTransform, (Without<Part>, Without<TransformGizmo>, Without<Guide>)>,
     mut gizmos: Query<
         (
             Entity,
@@ -1291,12 +1340,72 @@ fn place_parts(
                 material.0 = part.materials[look].clone();
             }
         }
+
+        let wanted = match pointer.dragging {
+            Some((held, handle)) if held == entity && gizmo.guides => guided(handle),
+            _ => Vec::new(),
+        };
+        let line = |axis: usize| AxisLine {
+            direction: Dir3::new(place.axes * axis_vector(axis)).unwrap_or(Dir3::X),
+            reach: GUIDE_REACH,
+            both_ways: true,
+            size: gizmo.size,
+            camera: Some(gizmo.camera),
+            colour: gizmo.colours[axis],
+        };
+        let mut present = Vec::new();
+        for (guide, axis, parent, mut shown, mut guide_global) in &mut guides {
+            if parent.parent() != entity {
+                continue;
+            }
+            if !wanted.contains(&axis.0) {
+                commands.entity(guide).despawn();
+                continue;
+            }
+            present.push(axis.0);
+            shown.set_if_neq(line(axis.0));
+            // A guide stands at the gizmo's origin, which was placed by hand
+            // after propagation; so is the guide.
+            *guide_global = *global;
+        }
+        for axis in wanted.into_iter().filter(|axis| !present.contains(axis)) {
+            commands.spawn((
+                Guide(axis),
+                line(axis),
+                Transform::default(),
+                *global,
+                Visibility::default(),
+                ChildOf(entity),
+            ));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A move, turn or stretch shows its own axis; a plane shows its two.
+    #[test]
+    fn a_held_handle_guides_the_axes_it_constrains() {
+        assert_eq!(guided(GizmoHandle::Arrow(1)), vec![1]);
+        assert_eq!(guided(GizmoHandle::Ring(2)), vec![2]);
+        assert_eq!(guided(GizmoHandle::Ball(0)), vec![0]);
+        assert_eq!(guided(GizmoHandle::Plane(1)), vec![0, 2]);
+        assert!(guided(GizmoHandle::Joint).is_empty());
+    }
+
+    /// Placing parts and guides by hand writes transforms its other queries
+    /// read; Bevy refuses overlapping access when the system first runs, not
+    /// when it compiles, so this runs it.
+    #[test]
+    fn placing_parts_runs_without_conflicting_access() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<GizmoPointer>()
+            .add_systems(PostUpdate, place_parts);
+        app.update();
+    }
 
     /// Carrying X onto each axis carries the plane laid out across Y and Z
     /// onto the plane across the other two, in the same handedness.
