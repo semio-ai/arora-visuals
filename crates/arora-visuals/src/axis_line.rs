@@ -130,6 +130,12 @@ struct Tube(Handle<Mesh>);
 pub struct AxisLinePlugin;
 
 impl Plugin for AxisLinePlugin {
+    /// Frames and gizmos each install this, and a host may too; installing it
+    /// again does nothing.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
         if app.is_plugin_added::<MaterialPlugin<AxisLineMaterial>>() {
             return;
@@ -254,10 +260,12 @@ fn place_lines(
             }
         }
 
-        // The line's own space may be scaled; the halves undo that, so the
-        // line keeps its length and width.
-        let scale = at.scale();
-        let undo = 3.0 / (scale.x + scale.y + scale.z).max(f32::EPSILON);
+        // Placed from the line's position and turn alone: its own space may be
+        // scaled, unevenly too, and no scale of it may reach the line's length
+        // or width. Dividing a scale back out only cancels an even one.
+        let (_, turn, origin) = at.to_scale_rotation_translation();
+        let unscaled =
+            GlobalTransform::from(Transform::from_translation(origin).with_rotation(turn));
         for child in children.iter() {
             let Ok((half, mut transform, mut global, mut visibility)) = halves.get_mut(child)
             else {
@@ -269,11 +277,15 @@ fn place_lines(
             };
             visibility.set_if_neq(Visibility::Inherited);
             let along = line.direction.as_vec3() * half.0;
-            *transform = Transform::from_rotation(Quat::from_rotation_arc(Vec3::Y, along))
-                .with_scale(Vec3::new(width / 2.0, line.reach * unit, width / 2.0) * undo);
-            // Placed by hand, after propagation, so the half stands where
-            // its line is this frame.
-            *global = at.mul_transform(*transform);
+            let placed = unscaled.mul_transform(
+                Transform::from_rotation(Quat::from_rotation_arc(Vec3::Y, along))
+                    .with_scale(Vec3::new(width / 2.0, line.reach * unit, width / 2.0)),
+            );
+            // Placed by hand, after propagation, so the half stands where its
+            // line is this frame; its local transform is kept to match, as
+            // nearly as a transform under an uneven scale can.
+            *global = placed;
+            *transform = placed.reparented_to(at);
         }
     }
 }
@@ -352,15 +364,21 @@ mod tests {
         );
     }
 
-    /// A scaled entity's line keeps its reach.
+    /// A scaled entity's line keeps its reach, however unevenly it is
+    /// scaled.
     #[test]
     fn a_scaled_line_keeps_its_reach() {
-        let mut app = app();
-        app.world_mut()
-            .spawn((Transform::from_scale(Vec3::splat(3.0)), line(false)));
-        app.update();
-        app.update();
-        let end = ends(&mut app)[0];
-        assert!(end.abs_diff_eq(Vec3::new(1.0, 0.0, 0.0), 1e-5), "{end:?}");
+        for scale in [Vec3::splat(3.0), Vec3::new(2.0, 4.0, 0.5)] {
+            let mut app = app();
+            app.world_mut()
+                .spawn((Transform::from_scale(scale), line(false)));
+            app.update();
+            app.update();
+            let end = ends(&mut app)[0];
+            assert!(
+                end.abs_diff_eq(Vec3::new(1.0, 0.0, 0.0), 1e-5),
+                "{scale}: {end:?}"
+            );
+        }
     }
 }

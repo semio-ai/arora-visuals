@@ -30,7 +30,7 @@ use std::collections::HashSet;
 
 use bevy::asset::{embedded_asset, embedded_path, AssetPath};
 use bevy::camera::visibility::RenderLayers;
-use bevy::camera::RenderTarget;
+use bevy::camera::{CameraUpdateSystems, RenderTarget};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::mesh::MeshVertexBufferLayoutRef;
@@ -42,6 +42,7 @@ use bevy::render::render_resource::{
 };
 use bevy::shader::ShaderRef;
 
+use crate::active_area::FramingSystems;
 use crate::instance::{EntityInstance, Superseded};
 #[cfg(test)]
 use crate::select::Selection;
@@ -88,13 +89,53 @@ pub struct OutlineOverlay;
 #[derive(Component)]
 struct OutlineMask;
 
-/// What an outlined view owns: its mask camera, the mask, and the quad.
+/// What an outlined view owns: its mask camera, the mask, the quad, and the
+/// render layer the quad is on, with the layers the view had before it
+/// joined that one.
 #[derive(Component)]
 struct OutlineParts {
     mask_camera: Entity,
     overlay: Entity,
     mask: Handle<Image>,
     material: Handle<OutlineMaterial>,
+    layer: usize,
+    before: Option<RenderLayers>,
+}
+
+/// The first of the layers outline quads are drawn on, one per outlined view.
+const OVERLAY_LAYERS_FROM: usize = OUTLINE_LAYER + 1;
+
+/// Which views hold which quad layers: slot `i` is layer
+/// `OVERLAY_LAYERS_FROM + i`. A quad rides its view's camera, so on a layer
+/// another camera drew it would show up in that camera's picture as a stray
+/// rectangle; a layer of its own, which only its view joins, keeps it to the
+/// view it belongs to, whatever other layers that view draws.
+#[derive(Resource, Default)]
+struct OverlayLayers(Vec<Option<Entity>>);
+
+impl OverlayLayers {
+    /// A free layer for `view`, reclaiming any slot whose view is gone.
+    fn take(&mut self, view: Entity, alive: impl Fn(Entity) -> bool) -> usize {
+        let slot = match self
+            .0
+            .iter()
+            .position(|held| held.is_none_or(|holder| !alive(holder)))
+        {
+            Some(slot) => slot,
+            None => {
+                self.0.push(None);
+                self.0.len() - 1
+            }
+        };
+        self.0[slot] = Some(view);
+        OVERLAY_LAYERS_FROM + slot
+    }
+
+    fn free(&mut self, layer: usize) {
+        if let Some(held) = self.0.get_mut(layer - OVERLAY_LAYERS_FROM) {
+            *held = None;
+        }
+    }
 }
 
 /// On a mesh currently in the mask: the layers it had before it joined.
@@ -156,22 +197,37 @@ impl Plugin for OutlinePlugin {
         embedded_asset!(app, "outline.wesl");
         app.add_plugins(MaterialPlugin::<OutlineMaterial>::default())
             .init_resource::<Selections>()
+            .init_resource::<OverlayLayers>()
             .add_systems(
                 Update,
-                (attach_outline, mark_selection, fit_outline).chain(),
+                (detach_outline, attach_outline, mark_selection).chain(),
+            )
+            // The mask follows the view's framing before Bevy computes either
+            // camera's projection; the quad is fitted to the projection Bevy
+            // then computed, sub-view and all.
+            .add_systems(
+                PostUpdate,
+                (
+                    sync_mask.after(FramingSystems).before(CameraUpdateSystems),
+                    fit_overlay.after(CameraUpdateSystems),
+                ),
             );
     }
 }
 
 /// Gives each newly outlined view its mask camera, mask and overlay.
+#[allow(clippy::type_complexity)]
 fn attach_outline(
     mut commands: Commands,
-    views: Query<(Entity, &Camera, &OutlineView), Without<OutlineParts>>,
+    views: Query<(Entity, &Camera, &OutlineView, Option<&RenderLayers>), Without<OutlineParts>>,
+    outlined: Query<(), With<OutlineParts>>,
+    mut layers: ResMut<OverlayLayers>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<OutlineMaterial>>,
 ) {
-    for (view, camera, settings) in &views {
+    for (view, camera, settings, view_layers) in &views {
+        let layer = layers.take(view, |holder| outlined.contains(holder));
         // Resized to the view as soon as the view knows its size.
         let mask = images.add(Image::new_target_texture(
             1,
@@ -206,18 +262,46 @@ fn attach_outline(
                 Mesh3d(meshes.add(Rectangle::new(1.0, 1.0))),
                 MeshMaterial3d(material.clone()),
                 Transform::IDENTITY,
+                RenderLayers::layer(layer),
                 NotShadowCaster,
                 NotShadowReceiver,
                 ChildOf(view),
                 OutlineOverlay,
             ))
             .id();
-        commands.entity(view).insert(OutlineParts {
-            mask_camera,
-            overlay,
-            mask,
-            material,
-        });
+        let before = view_layers.cloned();
+        commands.entity(view).insert((
+            before.clone().unwrap_or_default().with(layer),
+            OutlineParts {
+                mask_camera,
+                overlay,
+                mask,
+                material,
+                layer,
+                before,
+            },
+        ));
+    }
+}
+
+/// Takes an outline away from a view no longer asking for one: its mask
+/// camera and quad go, its layer is freed, and the view has its own layers
+/// back.
+fn detach_outline(
+    mut commands: Commands,
+    views: Query<(Entity, &OutlineParts), Without<OutlineView>>,
+    mut layers: ResMut<OverlayLayers>,
+) {
+    for (view, parts) in &views {
+        commands.entity(parts.mask_camera).despawn();
+        commands.entity(parts.overlay).despawn();
+        layers.free(parts.layer);
+        let mut view = commands.entity(view);
+        match &parts.before {
+            Some(before) => view.insert(before.clone()),
+            None => view.remove::<RenderLayers>(),
+        };
+        view.remove::<OutlineParts>();
     }
 }
 
@@ -285,17 +369,39 @@ fn mark_selection(
     }
 }
 
-/// Keeps the mask the size of the view, the mask camera looking through the
-/// view's lens, and the overlay exactly covering the view.
-fn fit_outline(
+/// Keeps the mask the size of the view and the mask camera looking through
+/// the view's lens — its projection and its sub-view, so a view framed beside
+/// a panel masks what it draws — and keeps the view on its quad's layer if
+/// the host has since replaced the view's layers.
+#[allow(clippy::type_complexity)]
+fn sync_mask(
+    mut commands: Commands,
     selections: Res<Selections>,
-    views: Query<(&Camera, &Projection, &OutlineView, &OutlineParts)>,
-    mut cameras: Query<&mut Projection, (With<OutlineMask>, Without<OutlineParts>)>,
-    mut overlays: Query<&mut Transform, With<OutlineOverlay>>,
+    views: Query<(
+        Entity,
+        &Camera,
+        &Projection,
+        &OutlineView,
+        &OutlineParts,
+        Option<&RenderLayers>,
+    )>,
+    mut cameras: Query<(&mut Camera, &mut Projection), (With<OutlineMask>, Without<OutlineParts>)>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<OutlineMaterial>>,
 ) {
-    for (camera, projection, settings, parts) in &views {
+    for (view, camera, projection, settings, parts, view_layers) in &views {
+        let joined = RenderLayers::layer(parts.layer);
+        if !view_layers.is_some_and(|layers| layers.intersects(&joined)) {
+            commands
+                .entity(view)
+                .insert(view_layers.cloned().unwrap_or_default().with(parts.layer));
+        }
+        if let Ok((mut mask_camera, mut lens)) = cameras.get_mut(parts.mask_camera) {
+            *lens = projection.clone();
+            if mask_camera.sub_camera_view != camera.sub_camera_view {
+                mask_camera.sub_camera_view = camera.sub_camera_view;
+            }
+        }
         let Some(size) = camera.physical_viewport_size() else {
             continue;
         };
@@ -311,9 +417,6 @@ fn fit_outline(
             if let Some(mut image) = images.get_mut(&parts.mask) {
                 image.resize(extent);
             }
-        }
-        if let Ok(mut lens) = cameras.get_mut(parts.mask_camera) {
-            *lens = projection.clone();
         }
         // Only when something changed: touching a material re-uploads it. A
         // resize counts, because it replaces the mask the material binds.
@@ -331,19 +434,46 @@ fn fit_outline(
                 material.outline = wanted;
             }
         }
-        // Just past the near plane, sized to fill the view exactly there.
-        if let (Projection::Perspective(lens), Ok(mut transform)) =
-            (projection, overlays.get_mut(parts.overlay))
-        {
-            let distance = lens.near * 2.0;
-            let height = 2.0 * distance * (lens.fov * 0.5).tan();
-            *transform = Transform::from_xyz(0.0, 0.0, -distance).with_scale(Vec3::new(
-                height * lens.aspect_ratio,
-                height,
-                1.0,
-            ));
+    }
+}
+
+/// How far into the view the quad stands, in normalised device depth: with a
+/// reversed depth range, halfway — twice the near plane's distance under a
+/// perspective, midway between the planes under an orthographic projection.
+/// The quad is drawn over everything whatever its depth; it only has to be
+/// inside the view.
+const OVERLAY_DEPTH: f32 = 0.5;
+
+/// Fits the quad over the whole view, from the projection Bevy computed for
+/// it this frame: the corners of the view at one depth, carried back into the
+/// camera's space. That holds for an orthographic projection as for a
+/// perspective one, and for an off-centre sub-view, where the view's centre
+/// is not the camera's axis. The shader reads the mask by screen position,
+/// so the quad need only cover the view; it is made a little larger, so
+/// rounding never leaves an edge uncovered.
+fn fit_overlay(
+    views: Query<(&Camera, &OutlineParts)>,
+    mut overlays: Query<&mut Transform, With<OutlineOverlay>>,
+) {
+    for (camera, parts) in &views {
+        let Ok(mut transform) = overlays.get_mut(parts.overlay) else {
+            continue;
+        };
+        let wanted = overlay_over(camera.clip_from_view());
+        if *transform != wanted {
+            *transform = wanted;
         }
     }
+}
+
+/// The quad's place in the camera's space under `clip_from_view`.
+fn overlay_over(clip_from_view: Mat4) -> Transform {
+    let view_from_clip = clip_from_view.inverse();
+    let corner = |x: f32, y: f32| view_from_clip.project_point3(Vec3::new(x, y, OVERLAY_DEPTH));
+    let (low, high) = (corner(-1.0, -1.0), corner(1.0, 1.0));
+    let centre = (low + high) / 2.0;
+    let size = (high - low).abs() * 1.02;
+    Transform::from_translation(centre).with_scale(Vec3::new(size.x, size.y, 1.0))
 }
 
 #[cfg(test)]
@@ -353,6 +483,46 @@ mod tests {
     use super::*;
     use crate::binding::{ElementTargets, SceneBindings};
     use crate::meta::AssetMeta;
+    use bevy::camera::{CameraProjection, SubCameraView};
+
+    /// The quad's corners, carried through `clip_from_view`, land just past
+    /// the view's edges on every side: for a perspective, for an orthographic
+    /// projection, and for a view framed off-centre by a sub-view.
+    #[test]
+    fn the_quad_covers_the_view_under_any_projection() {
+        let mut perspective = PerspectiveProjection::default();
+        perspective.update(1280.0, 800.0);
+        let mut orthographic = OrthographicProjection::default_3d();
+        orthographic.update(1280.0, 800.0);
+        let beside_a_panel = SubCameraView {
+            full_size: UVec2::new(900, 800),
+            offset: Vec2::new(0.0, 0.0),
+            size: UVec2::new(1280, 800),
+        };
+        for (name, clip_from_view) in [
+            ("perspective", perspective.get_clip_from_view()),
+            ("orthographic", orthographic.get_clip_from_view()),
+            (
+                "perspective, off-centre",
+                perspective.get_clip_from_view_for_sub(&beside_a_panel),
+            ),
+            (
+                "orthographic, off-centre",
+                orthographic.get_clip_from_view_for_sub(&beside_a_panel),
+            ),
+        ] {
+            let quad = overlay_over(clip_from_view);
+            for (x, y) in [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)] {
+                let corner =
+                    clip_from_view.project_point3(quad.transform_point(Vec3::new(x, y, 0.0)));
+                let wanted = Vec2::new(x, y) * 2.0 * 1.02;
+                assert!(
+                    corner.truncate().abs_diff_eq(wanted, 1e-3),
+                    "{name}: corner {x},{y} lands at {corner:?}"
+                );
+            }
+        }
+    }
 
     /// A world with one indexed instance of two elements, each with a mesh:
     /// one already on a layer of its own, one on no layer at all.

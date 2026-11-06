@@ -123,9 +123,7 @@ pub struct FrameAxesPlugin;
 impl Plugin for FrameAxesPlugin {
     fn build(&self, app: &mut App) {
         add_handle_material(app);
-        if !app.is_plugin_added::<AxisLinePlugin>() {
-            app.add_plugins(AxisLinePlugin);
-        }
+        app.add_plugins(AxisLinePlugin);
         app.add_systems(
             PostUpdate,
             (build_axes, (size_axes, drop_axes))

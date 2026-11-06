@@ -177,10 +177,20 @@ type Cameras<'w, 's> = Query<
     ),
 >;
 
-fn holds(position: Vec2, camera: &Camera) -> bool {
-    camera
-        .logical_viewport_rect()
-        .is_some_and(|rect| rect.contains(position))
+/// The camera a gesture at `position` belongs to: the topmost active one
+/// whose viewport holds it, as picking decides which view a press is on, so
+/// an inactive camera, or a view drawn beneath another, never moves.
+fn camera_under(position: Vec2, cameras: &Cameras) -> Option<Entity> {
+    cameras
+        .iter()
+        .filter(|(_, camera, ..)| {
+            camera.is_active
+                && camera
+                    .logical_viewport_rect()
+                    .is_some_and(|rect| rect.contains(position))
+        })
+        .max_by_key(|(_, camera, ..)| camera.order)
+        .map(|(entity, ..)| entity)
 }
 
 /// Starts an orbit or a pan on a press that reaches the scene.
@@ -205,20 +215,20 @@ fn start_gesture(
         PointerButton::Middle => MouseButton::Middle,
     };
     let position = press.pointer.position;
-    for (entity, camera, bindings, mut controller, _) in &mut cameras {
-        if !holds(position, camera) {
-            continue;
-        }
-        if button == bindings.orbit {
-            controller.start_orbit(None);
-        } else if button == bindings.pan {
-            controller.start_pan(None);
-        } else {
-            continue;
-        }
-        gesture.0 = Some((entity, button, position));
+    let Some(entity) = camera_under(position, &cameras) else {
+        return;
+    };
+    let Ok((_, _, bindings, mut controller, _)) = cameras.get_mut(entity) else {
+        return;
+    };
+    if button == bindings.orbit {
+        controller.start_orbit(None);
+    } else if button == bindings.pan {
+        controller.start_pan(None);
+    } else {
         return;
     }
+    gesture.0 = Some((entity, button, position));
 }
 
 /// Feeds the gesture in hand the cursor's movement, and ends it when its
@@ -283,11 +293,10 @@ fn zoom(
     if gesture.0.is_some() {
         return;
     }
-    let position = scroll.pointer.position;
-    for (_, camera, bindings, mut controller, mut transform) in &mut cameras {
-        if !holds(position, camera) {
-            continue;
-        }
+    let Some(entity) = camera_under(scroll.pointer.position, &cameras) else {
+        return;
+    };
+    if let Ok((_, _, bindings, mut controller, mut transform)) = cameras.get_mut(entity) {
         if coasting && !bindings.inertia {
             return;
         }
@@ -313,7 +322,6 @@ fn zoom(
         {
             anchor.z = -closer;
         }
-        return;
     }
 }
 

@@ -185,12 +185,19 @@ fn on_release(
     mut pressed: ResMut<Pressed>,
     mut picks: ResMut<Picks>,
 ) {
-    if !on_the_scene(release.entity, release.original_event_target(), &windows) {
+    // A release bubbles from where it landed; take it once. Its press is
+    // consumed wherever it landed — over a panel too — or a later release
+    // back over the scene would pair with this gesture's press and pick
+    // something no click chose.
+    if release.entity != release.original_event_target() {
         return;
     }
     let Some(press) = pressed.0.take() else {
         return;
     };
+    if !windows.contains(release.entity) {
+        return;
+    }
     if press.taken {
         return;
     }
@@ -270,24 +277,42 @@ impl ElementMeshes<'_, '_> {
             .then_some((handle.id(), mesh))
     }
 
+    /// Whether a morph is moving the element: any of its weights is not
+    /// zero, so its drawn vertices are not its base mesh's.
+    pub fn morphing(&self, targets: &ElementTargets) -> bool {
+        targets
+            .morph
+            .and_then(|entity| self.weights.get(entity).ok())
+            .is_some_and(|weights| weights.weights().iter().any(|weight| *weight != 0.0))
+    }
+
+    /// The corners of the box around the element as it is drawn, in the
+    /// world: its drawn vertices', morphs applied. Paid in full, so for an
+    /// element a morph is moving; a still one's own bounding box says the
+    /// same for nothing.
+    pub fn drawn_bounds(&self, targets: &ElementTargets) -> Option<[Vec3; 2]> {
+        let drawn = self.drawn(targets)?;
+        let mut points = drawn.positions.iter().map(|point| Vec3::from(*point));
+        let first = points.next()?;
+        Some(points.fold([first, first], |[low, high], point| {
+            [low.min(point), high.max(point)]
+        }))
+    }
+
     /// The distance along `ray` to the nearest triangle of the element as it
     /// is drawn, either side.
     ///
     /// **An element no morph is moving is cast where it stands**: a ray that
     /// misses its bounding box misses it, and one that does not is met with
     /// its own vertices under its transform, with nothing copied. A cast is
-    /// paid on every press and at the start of every gesture and zoom, so
-    /// building the whole robot's vertices again each time is the cost to
-    /// avoid. **An element a morph is moving is cast as drawn**
+    /// paid on every press, over every element, so building the whole
+    /// robot's vertices again each time is the cost to avoid. **An element a
+    /// morph is moving is cast as drawn**
     /// ([`ElementMeshes::drawn`]), with no box first: the box is the base
     /// mesh's, and a morph can carry vertices past it — an opened mouth
     /// below a closed one's box — where a box test would miss a real hit.
     pub fn cast(&self, targets: &ElementTargets, ray: Ray3d) -> Option<f32> {
-        let morphing = targets
-            .morph
-            .and_then(|entity| self.weights.get(entity).ok())
-            .is_some_and(|weights| weights.weights().iter().any(|weight| *weight != 0.0));
-        if morphing {
+        if self.morphing(targets) {
             return self.drawn(targets)?.hit(ray);
         }
         let entity = targets.mesh?;

@@ -11,10 +11,10 @@
 //! alone: an active area is the higher-level answer to the same question, and
 //! two writers of one camera's sub-view would undo each other every frame.
 
-use bevy::camera::SubCameraView;
+use bevy::camera::{CameraUpdateSystems, SubCameraView};
 use bevy::prelude::*;
 
-use crate::active_area::ActiveArea;
+use crate::active_area::{ActiveArea, FramingSystems};
 use crate::instance::{EntityInstance, Superseded};
 
 /// The host's view offset, read each frame. `None` renders the whole view.
@@ -31,7 +31,12 @@ pub struct ViewOffsetPlugin;
 
 impl Plugin for ViewOffsetPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PostUpdate, apply_view_offset);
+        app.add_systems(
+            PostUpdate,
+            apply_view_offset
+                .in_set(FramingSystems)
+                .before(CameraUpdateSystems),
+        );
     }
 }
 

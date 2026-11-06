@@ -20,7 +20,7 @@
 //!
 //! Removing [`ActiveArea`] renders the whole view again.
 
-use bevy::camera::SubCameraView;
+use bevy::camera::{CameraUpdateSystems, SubCameraView};
 use bevy::prelude::*;
 
 /// The part of a camera's viewport the user can see ([module docs](self)).
@@ -39,11 +39,24 @@ const EASE: f32 = 0.03;
 /// Closer than this, in logical pixels, the shown area is the target.
 const SETTLED: f32 = 0.01;
 
+/// Where a camera's framing is set — its active area eased, a host's view
+/// offset applied — in `PostUpdate`, before Bevy computes the camera's
+/// projection from it, so a view is framed where this frame says. Anything
+/// that follows a camera's framing, such as an outline's mask camera, orders
+/// after it.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FramingSystems;
+
 pub struct ActiveAreaPlugin;
 
 impl Plugin for ActiveAreaPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(PostUpdate, (ease_areas, release_areas));
+        app.add_systems(
+            PostUpdate,
+            (ease_areas, release_areas)
+                .in_set(FramingSystems)
+                .before(CameraUpdateSystems),
+        );
     }
 }
 

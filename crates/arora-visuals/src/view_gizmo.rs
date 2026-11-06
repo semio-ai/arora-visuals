@@ -119,7 +119,22 @@ pub struct ViewGizmoPlugin;
 
 impl Plugin for ViewGizmoPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (build_gizmos, place_gizmos).chain());
+        app.add_systems(Update, (drop_gizmos, build_gizmos, place_gizmos).chain());
+    }
+}
+
+/// Takes away a gizmo whose camera no longer has a [`ViewGizmo`], or no
+/// longer exists: its root is not under the camera, so nothing else would,
+/// and its balls would go on asking for views.
+fn drop_gizmos(
+    mut commands: Commands,
+    roots: Query<(Entity, &GizmoRoot)>,
+    cameras: Query<(), With<ViewGizmo>>,
+) {
+    for (root, of) in &roots {
+        if !cameras.contains(of.0) {
+            commands.entity(root).despawn();
+        }
     }
 }
 
@@ -308,6 +323,27 @@ fn place_gizmos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gizmo goes when its camera stops asking for one, and when its
+    /// camera goes.
+    #[test]
+    fn a_gizmo_goes_with_its_camera() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_systems(Update, (drop_gizmos, build_gizmos).chain());
+        let roots = |app: &mut App| {
+            let world = app.world_mut();
+            world.query::<&GizmoRoot>().iter(world).count()
+        };
+        let kept = app.world_mut().spawn(ViewGizmo::default()).id();
+        let dropped = app.world_mut().spawn(ViewGizmo::default()).id();
+        app.update();
+        assert_eq!(roots(&mut app), 2);
+        app.world_mut().entity_mut(kept).remove::<ViewGizmo>();
+        app.world_mut().despawn(dropped);
+        app.update();
+        assert_eq!(roots(&mut app), 0);
+    }
 
     /// The Z-up axes are a right-handed set, as the axes they stand for are:
     /// X cross Y is Z.

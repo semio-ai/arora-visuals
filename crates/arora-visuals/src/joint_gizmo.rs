@@ -309,6 +309,10 @@ pub struct JointGizmoPlugin;
 
 impl Plugin for JointGizmoPlugin {
     fn build(&self, app: &mut App) {
+        // The pointer handling, the pointer state and the resting handle's
+        // material are the transform gizmo's, shared so whichever handle of
+        // either is nearest is the one taken; a joint gizmo needs them all.
+        app.add_plugins(crate::transform_gizmo::TransformGizmoPlugin);
         embedded_asset!(app, "joint_ring.wesl");
         embedded_asset!(app, "joint_bar.wesl");
         app.add_plugins((
@@ -323,6 +327,7 @@ impl Plugin for JointGizmoPlugin {
             PostUpdate,
             (build_parts, place_parts)
                 .chain()
+                .in_set(crate::transform_gizmo::TransformGizmoSystems)
                 .after(TransformSystems::Propagate),
         );
     }

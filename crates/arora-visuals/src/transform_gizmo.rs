@@ -68,6 +68,8 @@ use bevy::camera::visibility::NoFrustumCulling;
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::mesh::MeshVertexBufferLayoutRef;
 use bevy::pbr::{Material, MaterialPipeline, MaterialPipelineKey, MaterialPlugin};
+use bevy::picking::events::PointerPress;
+use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     AsBindGroup, CompareFunction, RenderPipelineDescriptor, ShaderType,
@@ -438,11 +440,17 @@ struct Drag {
     plane: Vec3,
     start_global: GlobalTransform,
     start_local: Transform,
+    /// The transform the drag last reported. A drag that ends where the
+    /// pointer cannot be read ends here: with `apply` off the target has not
+    /// moved, so its own transform would report the drag undone.
+    last: Transform,
 }
 
-/// The gizmo's pointer handling, in `Update`. A host orders anything that
-/// shares the pointer — a camera controller above all — after it, so that
-/// [`GizmoPointer`] is this frame's answer when it reads it.
+/// The gizmos' pointer handling in `Update`, and their placement in
+/// `PostUpdate`. A host orders anything that shares the pointer — a camera
+/// controller above all — after it in `Update`, so that [`GizmoPointer`] is
+/// this frame's answer when it reads it; anything reporting where the gizmos
+/// stand, the overlay among them, orders after it in `PostUpdate`.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TransformGizmoSystems;
 
@@ -471,20 +479,51 @@ pub(crate) fn add_handle_material(app: &mut App) {
 pub struct TransformGizmoPlugin;
 
 impl Plugin for TransformGizmoPlugin {
+    /// The joint gizmo installs this one, and a host may too, in any order;
+    /// installing it again does nothing.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
-        add_handle_material(app);
-        if !app.is_plugin_added::<AxisLinePlugin>() {
-            app.add_plugins(AxisLinePlugin);
+        if app.world().contains_resource::<GizmoPointer>() {
+            return;
         }
+        add_handle_material(app);
+        app.add_plugins(AxisLinePlugin);
         app.init_resource::<GizmoPointer>()
+            .init_resource::<PressedScene>()
+            .add_observer(note_scene_press)
             .add_systems(Update, drive.in_set(TransformGizmoSystems))
             .add_systems(
                 PostUpdate,
                 (build_parts, place_parts)
                     .chain()
+                    .in_set(TransformGizmoSystems)
                     .after(TransformSystems::Propagate)
                     .before(AxisLineSystems),
             );
+    }
+}
+
+/// Whether this frame's left press landed on the scene, rather than on a
+/// panel, a toggle or anything else drawn over it: only such a press takes a
+/// handle, so a click on a control over a handle stays the control's.
+#[derive(Resource, Default)]
+struct PressedScene(bool);
+
+fn note_scene_press(
+    press: On<PointerPress>,
+    windows: Query<(), With<Window>>,
+    mut pressed: ResMut<PressedScene>,
+) {
+    // A press bubbles from where it landed; it is the scene's only where it
+    // landed on the window itself.
+    if press.button == PointerButton::Primary
+        && press.entity == press.original_event_target()
+        && windows.contains(press.entity)
+    {
+        pressed.0 = true;
     }
 }
 
@@ -707,8 +746,8 @@ fn placement(
 }
 
 /// The points marking how far a gizmo's shown handles reach in the world:
-/// its centre, the tip of each axis's handles on the side they face, and a
-/// ring's far side opposite. What the overlay boxes a gizmo by.
+/// its centre, the tip of each axis's handles on the side they face, and
+/// each ring all the way round. What the overlay boxes a gizmo by.
 pub(crate) fn reach_points(
     gizmo: &TransformGizmo,
     facing: &Facing,
@@ -733,10 +772,25 @@ pub(crate) fn reach_points(
     for axis in 0..3 {
         let toward = place.reach(GizmoHandle::Arrow(axis));
         points.push(place.origin + toward * tip * place.unit);
-        points.push(place.origin - toward * ring * place.unit);
+    }
+    // A ring seen at an angle bulges past the points where it crosses the
+    // axes, so each is sampled around its circle, out to its tube's edge.
+    if gizmo.shows(TransformMode::Rotate) {
+        let radius = (RING_RADIUS + TUBE[1]) * place.unit;
+        for axis in 0..3 {
+            let u = place.axes * axis_vector((axis + 1) % 3);
+            let v = place.axes * axis_vector((axis + 2) % 3);
+            for step in 0..RING_SAMPLES {
+                let angle = step as f32 * std::f32::consts::TAU / RING_SAMPLES as f32;
+                points.push(place.origin + (u * angle.cos() + v * angle.sin()) * radius);
+            }
+        }
     }
     Some(points)
 }
+
+/// Points around each ring, for a gizmo's box.
+const RING_SAMPLES: usize = 24;
 
 /// How many metres one gizmo unit is, for a gizmo of `size` standing at
 /// `point`.
@@ -916,8 +970,11 @@ fn drive(
     windows: Query<&Window>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut pointer: ResMut<GizmoPointer>,
+    mut pressed_scene: ResMut<PressedScene>,
     mut held: Local<Option<Held>>,
 ) {
+    // Taken every frame, so a press noted and not acted on cannot linger.
+    let on_scene = std::mem::take(&mut pressed_scene.0);
     let cursor = windows.iter().find_map(Window::cursor_position);
     let ray_through = |camera: Entity| {
         cursor
@@ -973,13 +1030,17 @@ fn drive(
                     },
                     transform: local,
                 });
+                *held = Some(Held::Transform(Drag {
+                    last: local,
+                    ..drag
+                }));
             } else if released {
                 commands.trigger(GizmoDrag {
                     entity: drag.gizmo,
                     target: gizmo.target,
                     handle: drag.handle,
                     phase: DragPhase::End,
-                    transform: locals.get(gizmo.target).copied().unwrap_or_default(),
+                    transform: drag.last,
                 });
             }
             if released {
@@ -1088,7 +1149,7 @@ fn drive(
     };
     pointer.hovered = Some(hovered);
 
-    if !buttons.just_pressed(MouseButton::Left) {
+    if !buttons.just_pressed(MouseButton::Left) || !on_scene {
         return;
     }
     match candidate {
@@ -1119,6 +1180,7 @@ fn drive(
                 plane,
                 start_global: *start_global,
                 start_local: *start_local,
+                last: *start_local,
             }));
             commands.trigger(GizmoDrag {
                 entity,
@@ -1438,6 +1500,7 @@ mod tests {
             plane,
             start_global: GlobalTransform::IDENTITY,
             start_local: Transform::IDENTITY,
+            last: Transform::IDENTITY,
         }
     }
 
