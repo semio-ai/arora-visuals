@@ -37,6 +37,17 @@
 //! an entity with an engine instance. What this crate joins is an animatable
 //! to the thing it moves, which is a different relation at a different level.
 //!
+//! # The pointer
+//!
+//! Picks, the camera's gestures and the gizmos' grabs all take a press only
+//! where it lands on the window itself, so a press on a panel or a control
+//! drawn over the scene is never the scene's. **They read that from Bevy's
+//! picking**: a host needs its pointer input with window picking enabled,
+//! and nothing else in the scene pickable under the pointer. This crate's
+//! own handles and aids are never pickable; a mesh picking backend that picks
+//! a host's meshes takes the press off the window, and the scene stops
+//! answering it.
+//!
 //! # What it costs to be here
 //!
 //! A module that names a Bevy type binds every consumer of this crate to one
