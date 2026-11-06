@@ -79,6 +79,7 @@ impl Plugin for PickPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Picks>()
             .init_resource::<Pressed>()
+            .init_resource::<ReleasedElsewhere>()
             .add_observer(on_press)
             .add_observer(on_release)
             .add_systems(PostUpdate, forget_unreleased_press);
@@ -194,21 +195,30 @@ fn on_release(
     cameras: Query<(&Camera, &GlobalTransform)>,
     elements: ElementMeshes,
     windows: Query<(), With<Window>>,
+    gizmos: Option<Res<GizmoPointer>>,
     mut pressed: ResMut<Pressed>,
+    mut elsewhere: ResMut<ReleasedElsewhere>,
     mut picks: ResMut<Picks>,
 ) {
+    // A release bubbles from where it landed; take it once.
+    if release.entity != release.original_event_target() {
+        return;
+    }
     // Only the window's release decides a pick. Bevy sends a release to
     // everything hovered, in no set order — a label over the scene among
-    // them — so a release anywhere else must leave the press for the
-    // window's. A press no window release takes is forgotten once every
-    // button is up; see `forget_unreleased_press`.
-    if !on_the_scene(release.entity, release.original_event_target(), &windows) {
+    // them — so a release anywhere else leaves the press for the window's,
+    // and only notes that the press has been let go; see
+    // `forget_unreleased_press`.
+    if !windows.contains(release.entity) {
+        elsewhere.0 = true;
         return;
     }
     let Some(press) = pressed.0.take() else {
         return;
     };
-    if press.taken {
+    // A press that took a handle is the gizmo's — including one that took
+    // it in the same frame it reached it, before the press could know.
+    if press.taken || gizmos.is_some_and(|gizmos| gizmos.dragging.is_some()) {
         return;
     }
     let position = release.pointer.position;
@@ -222,12 +232,18 @@ fn on_release(
     }
 }
 
-/// Forgets a press once every button is up and no release on the window has
-/// taken it — a press released over a panel. Left, it would pair with a later
-/// release back over the scene and pick something no click chose. A release
-/// on the window is decided in `PreUpdate`, before this runs.
-fn forget_unreleased_press(buttons: Res<ButtonInput<MouseButton>>, mut pressed: ResMut<Pressed>) {
-    if pressed.0.is_some() && buttons.get_pressed().next().is_none() {
+/// Whether a release this frame landed somewhere other than the window.
+#[derive(Resource, Default)]
+struct ReleasedElsewhere(bool);
+
+/// Forgets a press that was let go this frame without a release on the
+/// window taking it — a press released over a panel. Left, it would pair with
+/// a later release back over the scene and pick something no click chose.
+/// Read from the release, not from mouse buttons, so a touch, which sets no
+/// mouse button, keeps its press while it is held. A release on the window is
+/// decided in `PreUpdate`, before this runs.
+fn forget_unreleased_press(mut elsewhere: ResMut<ReleasedElsewhere>, mut pressed: ResMut<Pressed>) {
+    if std::mem::take(&mut elsewhere.0) {
         pressed.0 = None;
     }
 }
@@ -592,13 +608,13 @@ mod tests {
         assert!(!ray_meets_box(away, &world, &aabb));
     }
 
-    /// A press is kept while a button is down, for its release to decide, and
-    /// forgotten once every button is up with no release on the window having
-    /// taken it.
+    /// A press is kept while it is held — by a touch too, which sets no
+    /// mouse button — and forgotten once let go somewhere other than the
+    /// window.
     #[test]
-    fn a_press_no_window_release_took_is_forgotten() {
+    fn a_press_released_elsewhere_is_forgotten() {
         let mut app = App::new();
-        app.init_resource::<ButtonInput<MouseButton>>()
+        app.init_resource::<ReleasedElsewhere>()
             .init_resource::<Pressed>()
             .add_systems(Update, forget_unreleased_press);
         let pressed = |app: &App| app.world().resource::<Pressed>().0.is_some();
@@ -607,16 +623,15 @@ mod tests {
             under: HashSet::new(),
             taken: false,
         });
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .press(MouseButton::Left);
         app.update();
-        assert!(pressed(&app), "held while the button is down");
-        app.world_mut()
-            .resource_mut::<ButtonInput<MouseButton>>()
-            .release(MouseButton::Left);
         app.update();
-        assert!(!pressed(&app), "forgotten once every button is up");
+        assert!(
+            pressed(&app),
+            "held while not let go, with no mouse button down"
+        );
+        app.world_mut().resource_mut::<ReleasedElsewhere>().0 = true;
+        app.update();
+        assert!(!pressed(&app), "forgotten once let go elsewhere");
     }
 
     fn pair(element: &str) -> (String, String) {

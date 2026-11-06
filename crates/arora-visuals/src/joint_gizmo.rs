@@ -65,10 +65,15 @@ pub struct JointGizmo {
     pub motion: JointMotion,
     /// The axis the joint moves about or along, in the body's own frame.
     pub axis: Dir3,
-    /// The joint's limits. A turning joint with no limits, or limits a whole
-    /// turn or more apart, turns without end.
+    /// The joint's limits, held to when `limited`.
     pub min: f32,
     pub max: f32,
+    /// Whether the joint stops at `min` and `max`. The host's to say from what
+    /// the joint is, not something limits can tell alone: a revolute joint a
+    /// whole turn wide still stops at its ends, and a continuous one turns
+    /// without end whatever limits it carries. [`JointGizmo::new`] takes any
+    /// finite limits in order as stops.
+    pub limited: bool,
     /// Where the joint stands now.
     pub value: f32,
     /// The value at which the body stands in the pose it had when the gizmo
@@ -120,6 +125,7 @@ impl JointGizmo {
             axis,
             min,
             max,
+            limited: min.is_finite() && max.is_finite() && max > min,
             value: rest,
             rest,
             colour,
@@ -145,15 +151,9 @@ impl JointGizmo {
         }
     }
 
-    /// Whether the joint has ends: a slide always does, a turn only when its
-    /// limits are less than a whole turn apart.
+    /// Whether the joint stops at its limits.
     pub fn is_limited(&self) -> bool {
-        match self.motion {
-            JointMotion::Slide => true,
-            JointMotion::Turn => {
-                self.min.is_finite() && self.max.is_finite() && self.max - self.min < TAU
-            }
-        }
+        self.limited
     }
 
     fn clamp(&self, value: f32) -> f32 {
@@ -165,9 +165,12 @@ impl JointGizmo {
     }
 
     /// The range as the ring draws it: measured from where the joint can
-    /// start, so the shader's travelled span never wraps through zero.
+    /// start, so the shader's travelled span never wraps through zero. Limits
+    /// a whole turn or more apart draw as the whole ring, stops or not: there
+    /// is no unreachable part of it to shade.
     fn shown_range(&self) -> ShownRange {
-        ShownRange::of(self.is_limited().then_some((self.min, self.max)))
+        let partial = self.limited && self.max - self.min < TAU;
+        ShownRange::of(partial.then_some((self.min, self.max)))
     }
 }
 
@@ -815,6 +818,18 @@ mod tests {
             0.0,
             Color::WHITE,
         )
+    }
+
+    /// A joint that stops holds its ends however wide they are, and one that
+    /// does not passes them, whatever limits it carries.
+    #[test]
+    fn whether_a_joint_stops_is_its_own() {
+        use std::f32::consts::PI;
+        let mut stopping = joint(JointMotion::Turn, -PI, PI);
+        assert!(stopping.is_limited(), "a whole turn wide, and still stops");
+        assert_eq!(stopping.clamp(4.0), PI);
+        stopping.limited = false;
+        assert_eq!(stopping.clamp(4.0), 4.0);
     }
 
     /// A range shifts to start at zero rather than wrapping, so a range across

@@ -30,7 +30,7 @@ use std::collections::HashSet;
 
 use bevy::asset::{embedded_asset, embedded_path, AssetPath};
 use bevy::camera::visibility::RenderLayers;
-use bevy::camera::{CameraUpdateSystems, RenderTarget};
+use bevy::camera::{CameraUpdateSystems, ImageRenderTarget, RenderTarget};
 use bevy::core_pipeline::tonemapping::Tonemapping;
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::mesh::MeshVertexBufferLayoutRef;
@@ -254,7 +254,13 @@ fn attach_outline(
                     clear_color: ClearColorConfig::Custom(Color::NONE),
                     ..default()
                 },
-                RenderTarget::Image(mask.clone().into()),
+                // At the view's scale factor, so a projection Bevy sizes
+                // from its target — an orthographic one sized to the window —
+                // sizes the mask as it sizes the view.
+                RenderTarget::Image(ImageRenderTarget {
+                    handle: mask.clone(),
+                    scale_factor: camera.target_scaling_factor().unwrap_or(1.0),
+                }),
                 RenderLayers::layer(OUTLINE_LAYER),
                 Msaa::Off,
                 Tonemapping::None,
@@ -389,7 +395,10 @@ fn sync_mask(
         &OutlineParts,
         Option<&RenderLayers>,
     )>,
-    mut cameras: Query<(&mut Camera, &mut Projection), (With<OutlineMask>, Without<OutlineParts>)>,
+    mut cameras: Query<
+        (&mut Camera, &mut Projection, &mut RenderTarget),
+        (With<OutlineMask>, Without<OutlineParts>),
+    >,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<OutlineMaterial>>,
 ) {
@@ -400,7 +409,13 @@ fn sync_mask(
                 .entity(view)
                 .insert(view_layers.cloned().unwrap_or_default().with(parts.layer));
         }
-        if let Ok((mut mask_camera, mut lens)) = cameras.get_mut(parts.mask_camera) {
+        if let Ok((mut mask_camera, mut lens, mut target)) = cameras.get_mut(parts.mask_camera) {
+            let scale = camera.target_scaling_factor().unwrap_or(1.0);
+            if let RenderTarget::Image(image) = &mut *target {
+                if image.scale_factor != scale {
+                    image.scale_factor = scale;
+                }
+            }
             *lens = projection.clone();
             if mask_camera.sub_camera_view != camera.sub_camera_view {
                 mask_camera.sub_camera_view = camera.sub_camera_view;

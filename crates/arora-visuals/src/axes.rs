@@ -240,7 +240,9 @@ fn size_axes(
             continue;
         };
         let scale = at.scale();
-        let wanted = Vec3::splat(unit) / scale.max(Vec3::splat(f32::EPSILON));
+        // By the scale's size: a mirrored axis has a negative scale, whose
+        // length is undone the same as a positive one's.
+        let wanted = Vec3::splat(unit) / scale.abs().max(Vec3::splat(f32::EPSILON));
         if transform.scale != wanted {
             transform.scale = wanted;
         }
@@ -387,28 +389,28 @@ mod tests {
         assert_eq!(count(&mut app), 0);
     }
 
-    /// The arrows keep their length on a scaled node.
+    /// The arrows keep their length on a scaled node, a mirrored one too.
     #[test]
     fn a_scaled_frame_keeps_its_arrow_length() {
-        let mut app = app();
-        app.world_mut().spawn((
-            Transform::from_scale(Vec3::new(2.0, 4.0, 0.5)),
-            FrameAxes::default(),
-        ));
-        app.update();
-        app.update();
         let GizmoSize::World(metres) = GIZMO_SIZE else {
             panic!("the default is sized in the world");
         };
-        let global = *app
-            .world_mut()
-            .query_filtered::<&GlobalTransform, With<AxesOf>>()
-            .single(app.world())
-            .expect("one holder");
-        assert!(
-            global.scale().abs_diff_eq(Vec3::splat(metres), 1e-5),
-            "{:?}",
-            global.scale()
-        );
+        for scale in [Vec3::new(2.0, 4.0, 0.5), Vec3::new(-1.0, 1.0, 1.0)] {
+            let mut app = app();
+            app.world_mut()
+                .spawn((Transform::from_scale(scale), FrameAxes::default()));
+            app.update();
+            app.update();
+            let global = *app
+                .world_mut()
+                .query_filtered::<&GlobalTransform, With<AxesOf>>()
+                .single(app.world())
+                .expect("one holder");
+            assert!(
+                global.scale().abs().abs_diff_eq(Vec3::splat(metres), 1e-5),
+                "{scale}: {:?}",
+                global.scale()
+            );
+        }
     }
 }
