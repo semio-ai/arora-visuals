@@ -279,6 +279,10 @@ fn attach_outline(
                 NotShadowReceiver,
                 ChildOf(view),
                 OutlineOverlay,
+                // It covers the whole view just past the near plane; a mesh
+                // picking backend that could pick it would take every press
+                // off the scene behind it.
+                Pickable::IGNORE,
             ))
             .id();
         commands.entity(view).insert((
