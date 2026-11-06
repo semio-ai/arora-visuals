@@ -31,7 +31,7 @@
 use bevy::camera::primitives::Aabb;
 use bevy::ecs::system::SystemParam;
 use bevy::math::Affine3A;
-use bevy::mesh::morph::{MorphAttributes, MorphWeights};
+use bevy::mesh::morph::{MeshMorphWeights, MorphAttributes, MorphWeights};
 use bevy::mesh::{Indices, PrimitiveTopology};
 use std::collections::{HashMap, HashSet};
 
@@ -304,6 +304,7 @@ pub struct ElementMeshes<'w, 's> {
     handles: Query<'w, 's, &'static Mesh3d>,
     transforms: Query<'w, 's, &'static GlobalTransform>,
     weights: Query<'w, 's, &'static MorphWeights>,
+    mesh_weights: Query<'w, 's, &'static MeshMorphWeights>,
     bounds: Query<'w, 's, &'static Aabb>,
 }
 
@@ -326,45 +327,61 @@ impl ElementMeshes<'_, '_> {
             .is_some_and(|weights| weights.weights().iter().any(|weight| *weight != 0.0))
     }
 
-    /// The corners, in the world, of a box sure to hold the element as its
-    /// morphs draw it: its base mesh's bounding box, widened by each morph
-    /// target's offsets at that target's weight.
+    /// The corners, in the world, of a box sure to hold one mesh as it is
+    /// drawn: its bounding box where no morph moves it, and that box widened
+    /// by each morph target's offsets at that target's weight where one does.
     ///
     /// **Not its drawn vertices' box.** Building those costs every vertex of
     /// every target, which a view paying it each frame for a speaking face
     /// cannot afford. Each target's offsets are boxed once per mesh, in
     /// `offsets`, and widening by them costs one step per target. The box is
     /// conservative — each target widens it as far as that target alone could
-    /// — so it may be larger than the drawn shape, never smaller. `None` for
-    /// an element with no morph targets or no bounding box.
-    pub fn morphed_corners(
-        &self,
-        targets: &ElementTargets,
-        offsets: &mut MorphOffsets,
-    ) -> Option<[Vec3; 8]> {
-        let entity = targets.mesh?;
-        let (id, mesh) = self.mesh(targets)?;
-        let deltas = mesh.try_morph_targets().ok()?;
-        let vertices = mesh.count_vertices();
-        let held = offsets
-            .0
-            .entry(id)
-            .and_modify(|held| {
-                if held.0 != (vertices, deltas.len()) {
-                    *held = ((vertices, deltas.len()), target_offsets(deltas, vertices));
-                }
-            })
-            .or_insert_with(|| ((vertices, deltas.len()), target_offsets(deltas, vertices)));
-        let aabb = self.bounds.get(entity).ok()?;
+    /// — so it may be larger than the drawn shape, never smaller. A mesh's
+    /// weights are its own or its node's, as the mesh names them. `None` for
+    /// a mesh with no bounding box.
+    pub fn mesh_corners(&self, mesh: Entity, offsets: &mut MorphOffsets) -> Option<[Vec3; 8]> {
+        let aabb = self.bounds.get(mesh).ok()?;
+        let world = self.transforms.get(mesh).ok()?.affine();
         let centre = Vec3::from(aabb.center);
         let half = Vec3::from(aabb.half_extents);
-        let weights = targets
-            .morph
-            .and_then(|morph| self.weights.get(morph).ok())
-            .map(MorphWeights::weights)
-            .unwrap_or_default();
-        let [low, high] = widened([centre - half, centre + half], &held.1, weights);
-        let world = self.transforms.get(entity).ok()?.affine();
+        let base = [centre - half, centre + half];
+        let weights: &[f32] = match self.mesh_weights.get(mesh) {
+            Ok(MeshMorphWeights::Value { weights }) => weights,
+            Ok(MeshMorphWeights::Reference(node)) => self
+                .weights
+                .get(*node)
+                .map(MorphWeights::weights)
+                .unwrap_or_default(),
+            Err(_) => &[],
+        };
+        let moving = weights.iter().any(|weight| *weight != 0.0);
+        let asset = self
+            .handles
+            .get(mesh)
+            .ok()
+            .and_then(|handle| Some((handle.0.id(), self.meshes.get(&handle.0)?)));
+        let [low, high] = match (moving, asset) {
+            (true, Some((id, asset))) => match asset.try_morph_targets().ok() {
+                Some(deltas) => {
+                    let vertices = asset.count_vertices();
+                    let held = offsets
+                        .0
+                        .entry(id)
+                        .and_modify(|held| {
+                            if held.0 != (vertices, deltas.len()) {
+                                *held =
+                                    ((vertices, deltas.len()), target_offsets(deltas, vertices));
+                            }
+                        })
+                        .or_insert_with(|| {
+                            ((vertices, deltas.len()), target_offsets(deltas, vertices))
+                        });
+                    widened(base, &held.1, weights)
+                }
+                None => base,
+            },
+            _ => base,
+        };
         Some(std::array::from_fn(|corner| {
             world.transform_point3(Vec3::new(
                 if corner & 1 == 0 { low.x } else { high.x },

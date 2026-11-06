@@ -33,14 +33,13 @@
 
 use std::collections::HashMap;
 
-use bevy::camera::primitives::Aabb;
 use bevy::prelude::*;
 use serde::Serialize;
 
 use crate::instance::{EntityInstance, Superseded};
 use crate::joint_gizmo::{self, JointGizmo, JointMotion, Rest};
 use crate::pick::{ElementMeshes, MorphOffsets};
-use crate::transform_gizmo::{self, Facing, GizmoHandle, GizmoPointer, TransformGizmo};
+use crate::transform_gizmo::{self, Facing, GizmoHandle, GizmoPart, GizmoPointer, TransformGizmo};
 pub use crate::transform_gizmo::{Reading, ReadingUnit};
 
 /// A box on screen, in logical pixels of the camera's target, with its
@@ -171,7 +170,7 @@ fn publish(
     joint_gizmos: Query<(Entity, &JointGizmo, Option<&Rest>, &InheritedVisibility)>,
     cameras: Query<(&Camera, &GlobalTransform)>,
     globals: Query<&GlobalTransform>,
-    bounds: Query<(&GlobalTransform, &Aabb)>,
+    aids: Query<(), With<GizmoPart>>,
     drawn: ElementMeshes,
     mut offsets: Local<MorphOffsets>,
     children: Query<&Children>,
@@ -196,26 +195,24 @@ fn publish(
             .map(|element| (element.id.as_str(), element.node_name.as_str()))
             .collect();
         for (element, targets) in &instance.bindings.elements {
-            // An element a morph is moving is boxed past its base mesh's
-            // bounding box, which is where it stood before the morph and
-            // which the morph can carry it well beyond. Any other element
-            // with a mesh of its own — or a morphing one whose widened box
-            // cannot be had — is boxed by that mesh's bounding box, and a
-            // group by the boxes of everything drawn beneath its node.
-            let morphed = drawn
-                .morphing(targets)
-                .then(|| drawn.morphed_corners(targets, &mut offsets))
-                .flatten();
-            let screen = match morphed {
-                Some(corners) => box_of_points(&corners, camera),
-                None => {
-                    let meshes: Vec<Entity> = match targets.mesh {
-                        Some(mesh) => vec![mesh],
-                        None => children.iter_descendants(targets.node).collect(),
-                    };
-                    box_of_meshes(&meshes, &bounds, camera)
-                }
+            // An element with a mesh of its own is boxed by that mesh, and a
+            // group by everything drawn beneath its node but this crate's own
+            // aids — a frame's arrows or guides there are not the element's.
+            // Each mesh as it is drawn: past its base bounding box where a
+            // morph is moving it, which the morph can carry it well beyond.
+            let meshes: Vec<Entity> = match targets.mesh {
+                Some(mesh) => vec![mesh],
+                None => children
+                    .iter_descendants(targets.node)
+                    .filter(|entity| !aids.contains(*entity))
+                    .collect(),
             };
+            let corners: Vec<Vec3> = meshes
+                .iter()
+                .filter_map(|mesh| drawn.mesh_corners(*mesh, &mut offsets))
+                .flatten()
+                .collect();
+            let screen = box_of_points(&corners, camera);
             if let Some(screen) = screen {
                 frame.elements.push(ElementAnchor {
                     instance: instance.id.clone(),
@@ -264,20 +261,37 @@ fn publish(
         let Some(reach) = joint_gizmo::reach(gizmo, rest, &parent_of(gizmo.target), camera) else {
             continue;
         };
+        // Out to the tube's surface at its thickest, in hand: a ring seen
+        // edge-on, or a bar seen end-on, is that wide and no thinner.
+        let tube = transform_gizmo::TUBE[1] * reach.unit;
+        let joint = &reach.frame;
+        let around = |point: Vec3| {
+            [
+                joint.u,
+                -joint.u,
+                joint.v,
+                -joint.v,
+                joint.axis,
+                -joint.axis,
+            ]
+            .map(|direction| point + direction * tube)
+        };
         let points: Vec<Vec3> = match gizmo.motion {
             JointMotion::Turn => (0..transform_gizmo::RING_SAMPLES)
-                .map(|i| {
+                .flat_map(|i| {
                     let angle =
                         i as f32 * std::f32::consts::TAU / transform_gizmo::RING_SAMPLES as f32;
-                    reach.frame.centre
-                        + (reach.frame.u * angle.cos() + reach.frame.v * angle.sin())
-                            * transform_gizmo::RING_RADIUS
-                            * reach.unit
+                    around(
+                        joint.centre
+                            + (joint.u * angle.cos() + joint.v * angle.sin())
+                                * transform_gizmo::RING_RADIUS
+                                * reach.unit,
+                    )
                 })
                 .collect(),
             JointMotion::Slide => {
-                let (from, to) = joint_gizmo::bar_ends(gizmo, &reach.frame);
-                vec![from, to]
+                let (from, to) = joint_gizmo::bar_ends(gizmo, joint);
+                around(from).into_iter().chain(around(to)).collect()
             }
         };
         if let Some(screen) = box_of_points(&points, camera) {
@@ -348,32 +362,6 @@ fn box_of_points(points: &[Vec3], (camera, at): (&Camera, &GlobalTransform)) -> 
         .map(|point| camera.world_to_viewport(at, *point).ok())
         .collect();
     ScreenBox::around(screen?)
-}
-
-/// The box around the bounding boxes of these meshes, or nothing if any
-/// corner of any is behind the camera.
-fn box_of_meshes(
-    meshes: &[Entity],
-    bounds: &Query<(&GlobalTransform, &Aabb)>,
-    camera: (&Camera, &GlobalTransform),
-) -> Option<ScreenBox> {
-    let mut corners = Vec::new();
-    for mesh in meshes {
-        let Ok((at, aabb)) = bounds.get(*mesh) else {
-            continue;
-        };
-        let centre = Vec3::from(aabb.center);
-        let half = Vec3::from(aabb.half_extents);
-        for corner in 0..8u8 {
-            let sign = Vec3::new(
-                if corner & 1 == 0 { -1.0 } else { 1.0 },
-                if corner & 2 == 0 { -1.0 } else { 1.0 },
-                if corner & 4 == 0 { -1.0 } else { 1.0 },
-            );
-            corners.push(at.transform_point(centre + sign * half));
-        }
-    }
-    box_of_points(&corners, camera)
 }
 
 #[cfg(test)]

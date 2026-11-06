@@ -145,7 +145,7 @@ impl Plugin for AxisLinePlugin {
             .add_systems(Startup, make_tube)
             .add_systems(
                 PostUpdate,
-                (build_lines, place_lines)
+                (drop_lines, build_lines, place_lines)
                     .chain()
                     .in_set(AxisLineSystems)
                     .after(TransformSystems::Propagate),
@@ -212,6 +212,27 @@ fn build_lines(
                 Pickable::IGNORE,
                 ChildOf(entity),
             ));
+        }
+    }
+}
+
+/// Takes a line's halves away from an entity no longer drawing one, leaving
+/// its other children.
+fn drop_lines(
+    mut commands: Commands,
+    mut removed: RemovedComponents<AxisLine>,
+    children: Query<&Children>,
+    halves: Query<(), With<Half>>,
+) {
+    for entity in removed.read() {
+        let Ok(mut line) = commands.get_entity(entity) else {
+            continue;
+        };
+        line.remove::<Built>();
+        for child in children.iter_descendants(entity) {
+            if halves.contains(child) {
+                commands.entity(child).despawn();
+            }
         }
     }
 }
@@ -311,7 +332,7 @@ mod tests {
             .add_systems(Startup, make_tube)
             .add_systems(
                 PostUpdate,
-                (build_lines, place_lines)
+                (drop_lines, build_lines, place_lines)
                     .chain()
                     .after(TransformSystems::Propagate),
             );
@@ -371,6 +392,25 @@ mod tests {
             both[1].abs_diff_eq(Vec3::new(2.0, 0.0, 0.0), 1e-5),
             "{both:?}"
         );
+    }
+
+    /// Taking the line away takes its halves, and leaves the entity's other
+    /// children.
+    #[test]
+    fn removing_a_line_removes_its_halves() {
+        let mut app = app();
+        let entity = app
+            .world_mut()
+            .spawn((Transform::default(), line(true)))
+            .id();
+        let other = app.world_mut().spawn(ChildOf(entity)).id();
+        app.update();
+        app.update();
+        assert_eq!(ends(&mut app).len(), 2);
+        app.world_mut().entity_mut(entity).remove::<AxisLine>();
+        app.update();
+        assert_eq!(ends(&mut app).len(), 0);
+        assert!(app.world().get_entity(other).is_ok());
     }
 
     /// A sheared entity's line runs along its true axis, as its arrows do:

@@ -215,12 +215,27 @@ fn build_axes(
 }
 
 /// Sizes each entity's arrows, undoing its scale so they keep their length.
+///
+/// After propagation, so the size follows this frame's scale and zoom; the
+/// arrows' world transforms are set here too, or they would be drawn at the
+/// size they had a frame ago.
+#[allow(clippy::type_complexity)]
 fn size_axes(
-    shown: Query<(&FrameAxes, &GlobalTransform)>,
-    cameras: Query<(&Camera, &GlobalTransform)>,
-    mut holders: Query<(&AxesOf, &mut Transform, &mut Visibility)>,
+    shown: Query<(&FrameAxes, &GlobalTransform), Without<AxesOf>>,
+    cameras: Query<(&Camera, &GlobalTransform), (Without<AxesOf>, Without<FrameAxes>)>,
+    mut holders: Query<(
+        &AxesOf,
+        &mut Transform,
+        &mut GlobalTransform,
+        &mut Visibility,
+        &Children,
+    )>,
+    mut arrows: Query<
+        (&Transform, &mut GlobalTransform),
+        (Without<AxesOf>, Without<FrameAxes>, Without<Camera>),
+    >,
 ) {
-    for (of, mut transform, mut visibility) in &mut holders {
+    for (of, mut transform, mut global, mut visibility, children) in &mut holders {
         let Ok((axes, at)) = shown.get(of.0) else {
             continue;
         };
@@ -245,6 +260,12 @@ fn size_axes(
         let wanted = Vec3::splat(unit) / scale.abs().max(Vec3::splat(f32::EPSILON));
         if transform.scale != wanted {
             transform.scale = wanted;
+        }
+        *global = at.mul_transform(*transform);
+        for child in children.iter() {
+            if let Ok((local, mut arrow)) = arrows.get_mut(child) {
+                *arrow = global.mul_transform(*local);
+            }
         }
     }
 }

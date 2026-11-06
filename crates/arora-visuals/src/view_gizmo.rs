@@ -26,9 +26,9 @@
 use bevy::picking::events::{PointerClick, PointerOut, PointerOver};
 use bevy::picking::Pickable;
 use bevy::prelude::*;
-use bevy::ui::UiTargetCamera;
+use bevy::ui::{UiSystems, UiTargetCamera};
 
-use crate::active_area::ActiveAreaShown;
+use crate::active_area::{ActiveAreaShown, FramingSystems};
 
 /// A camera's view gizmo. Put it on the camera whose view it shows.
 #[derive(Component, Clone, Debug)]
@@ -119,7 +119,17 @@ pub struct ViewGizmoPlugin;
 
 impl Plugin for ViewGizmoPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, (drop_gizmos, build_gizmos, place_gizmos).chain());
+        // Built and dropped in `Update`; placed in `PostUpdate`, once this
+        // frame's camera turn has propagated and its framing has eased, and
+        // before UI layout reads the placement.
+        app.add_systems(Update, (drop_gizmos, build_gizmos).chain())
+            .add_systems(
+                PostUpdate,
+                place_gizmos
+                    .after(TransformSystems::Propagate)
+                    .after(FramingSystems)
+                    .before(UiSystems::Layout),
+            );
     }
 }
 

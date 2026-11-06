@@ -25,10 +25,18 @@ const RINGS: u32 = 3u;
 const STEPS: u32 = 16u;
 const TAU: f32 = 6.28318530718;
 
+// How much of the selection a sample finds. The mask draws the selection
+// with its own materials, so a translucent part or a ghost leaves only a
+// trace of alpha where it stands; any trace counts as fully there, so a
+// see-through selection is outlined as a solid one is and its inside is never
+// taken for outside. Below a trace is the filtering at the mask's edge, which
+// keeps the line's outer edge soft.
+const TRACE: f32 = 1.0 / 128.0;
+
 fn coverage(uv: vec2<f32>) -> f32 {
     // An explicit level, because a sample inside a loop has no derivatives to
     // choose one from.
-    return textureSampleLevel(mask, mask_sampler, uv, 0.0).a;
+    return clamp(textureSampleLevel(mask, mask_sampler, uv, 0.0).a / TRACE, 0.0, 1.0);
 }
 
 @fragment

@@ -383,7 +383,7 @@ fn mark_selection(
 /// the view's lens — its projection and its sub-view, so a view framed beside
 /// a panel masks what it draws — and keeps the view on its quad's layer if
 /// the host has since replaced the view's layers.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn sync_mask(
     mut commands: Commands,
     selections: Res<Selections>,
@@ -399,10 +399,23 @@ fn sync_mask(
         (&mut Camera, &mut Projection, &mut RenderTarget),
         (With<OutlineMask>, Without<OutlineParts>),
     >,
+    mut overlays: Query<&mut Visibility, With<OutlineOverlay>>,
+    outlined: Query<(), With<Outlined>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<OutlineMaterial>>,
 ) {
+    // With nothing selected there is nothing to outline, and the mask pass
+    // and the quad's dozens of samples a pixel are paid for nothing; both
+    // stand down until a selection appears.
+    let selecting = !outlined.is_empty();
     for (view, camera, projection, settings, parts, view_layers) in &views {
+        if let Ok(mut visibility) = overlays.get_mut(parts.overlay) {
+            visibility.set_if_neq(if selecting {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            });
+        }
         let joined = RenderLayers::layer(parts.layer);
         if !view_layers.is_some_and(|layers| layers.intersects(&joined)) {
             commands
@@ -417,6 +430,14 @@ fn sync_mask(
                 }
             }
             *lens = projection.clone();
+            if mask_camera.is_active != selecting {
+                mask_camera.is_active = selecting;
+            }
+            // Just before the view, wherever the view now stands, so the mask
+            // is drawn before the view reads it.
+            if mask_camera.order != camera.order - 1 {
+                mask_camera.order = camera.order - 1;
+            }
             if mask_camera.sub_camera_view != camera.sub_camera_view {
                 mask_camera.sub_camera_view = camera.sub_camera_view;
             }
