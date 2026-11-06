@@ -165,12 +165,9 @@ impl JointGizmo {
     }
 
     /// The range as the ring draws it: measured from where the joint can
-    /// start, so the shader's travelled span never wraps through zero. Limits
-    /// a whole turn or more apart draw as the whole ring, stops or not: there
-    /// is no unreachable part of it to shade.
+    /// start, so the shader's travelled span never wraps through zero.
     fn shown_range(&self) -> ShownRange {
-        let partial = self.limited && self.max - self.min < TAU;
-        ShownRange::of(partial.then_some((self.min, self.max)))
+        ShownRange::of(self.limited.then_some((self.min, self.max)))
     }
 }
 
@@ -188,15 +185,21 @@ struct ShownRange {
     origin: f32,
     min: f32,
     max: f32,
+    /// Whether progress goes round and round, as an unbounded joint's does,
+    /// rather than running from one stop to the other.
+    wraps: bool,
 }
 
 impl ShownRange {
     fn of(limits: Option<(f32, f32)>) -> Self {
         match limits {
+            // A ring holds a turn at most, so stops a turn or more apart draw
+            // as the whole ring, still read from the lower stop.
             Some((min, max)) => Self {
                 origin: min,
                 min: 0.0,
-                max: max - min,
+                max: (max - min).min(TAU),
+                wraps: false,
             },
             // An unbounded joint turns forever, so its ring is a whole turn
             // read from the joint's own zero.
@@ -204,13 +207,21 @@ impl ShownRange {
                 origin: 0.0,
                 min: 0.0,
                 max: TAU,
+                wraps: true,
             },
         }
     }
 
-    /// Where a joint value sits on the ring.
+    /// Where a joint value sits on the ring. Between stops it is the way
+    /// travelled from the lower one, so the upper stop is the full span and
+    /// never wraps back to nothing — stops exactly a turn apart sit at either
+    /// end of the ring, not both at its start.
     fn place(&self, value: f32) -> f32 {
-        (value - self.origin).rem_euclid(TAU)
+        if self.wraps {
+            (value - self.origin).rem_euclid(TAU)
+        } else {
+            (value - self.origin).clamp(0.0, self.max)
+        }
     }
 }
 
@@ -305,6 +316,7 @@ enum RangeLook {
 struct Built {
     motion: JointMotion,
     limits: (u32, u32),
+    limited: bool,
     colour: Color,
 }
 
@@ -333,7 +345,10 @@ impl Plugin for JointGizmoPlugin {
         ))
         .add_systems(
             Update,
-            pose_bodies.after(crate::transform_gizmo::TransformGizmoSystems),
+            (
+                pose_bodies.after(crate::transform_gizmo::TransformGizmoSystems),
+                drop_parts,
+            ),
         )
         .add_systems(
             PostUpdate,
@@ -537,6 +552,28 @@ fn pose_bodies(
     }
 }
 
+/// Takes the ring or bar away from an entity that is no longer a joint
+/// gizmo, so no control is left drawn that answers nothing. The entity's
+/// other children are its own.
+fn drop_parts(
+    mut commands: Commands,
+    mut removed: RemovedComponents<JointGizmo>,
+    children: Query<&Children>,
+    parts: Query<(), With<JointPart>>,
+) {
+    for entity in removed.read() {
+        let Ok(mut gizmo) = commands.get_entity(entity) else {
+            continue;
+        };
+        gizmo.remove::<(Built, Rest)>();
+        for child in children.iter_descendants(entity) {
+            if parts.contains(child) {
+                commands.entity(child).despawn();
+            }
+        }
+    }
+}
+
 /// Builds the ring or bar of each gizmo that is new or whose joint changed.
 fn build_parts(
     mut commands: Commands,
@@ -551,6 +588,7 @@ fn build_parts(
         let wanted = Built {
             motion: gizmo.motion,
             limits: (gizmo.min.to_bits(), gizmo.max.to_bits()),
+            limited: gizmo.limited,
             colour: gizmo.colour,
         };
         if built == Some(&wanted) {
@@ -830,6 +868,49 @@ mod tests {
         assert_eq!(stopping.clamp(4.0), PI);
         stopping.limited = false;
         assert_eq!(stopping.clamp(4.0), 4.0);
+    }
+
+    /// Stops a whole turn apart sit at either end of the ring, with the way
+    /// between them travelled in order; an unbounded joint goes round.
+    #[test]
+    fn stops_a_turn_apart_run_end_to_end() {
+        use std::f32::consts::PI;
+        let range = ShownRange::of(Some((-PI, PI)));
+        assert_eq!(range.max, TAU);
+        assert!(range.place(-PI).abs() < 1e-6, "the lower stop at the start");
+        assert!((range.place(0.0) - PI).abs() < 1e-6, "halfway at halfway");
+        assert!(
+            (range.place(PI) - TAU).abs() < 1e-6,
+            "the upper stop at the end"
+        );
+        let round = ShownRange::of(None);
+        assert!(
+            round.place(TAU + 1.0) < TAU,
+            "an unbounded joint goes round"
+        );
+    }
+
+    /// Taking the gizmo away takes its ring with it and leaves the entity's
+    /// other children.
+    #[test]
+    fn removing_the_gizmo_removes_its_parts() {
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .add_systems(Update, drop_parts);
+        let gizmo = app
+            .world_mut()
+            .spawn(joint(JointMotion::Turn, -1.0, 1.0))
+            .id();
+        let part = app
+            .world_mut()
+            .spawn((JointPart { hot: false }, ChildOf(gizmo)))
+            .id();
+        let other = app.world_mut().spawn(ChildOf(gizmo)).id();
+        app.update();
+        app.world_mut().entity_mut(gizmo).remove::<JointGizmo>();
+        app.update();
+        assert!(app.world().get_entity(part).is_err(), "the ring is gone");
+        assert!(app.world().get_entity(other).is_ok(), "other children stay");
     }
 
     /// A range shifts to start at zero rather than wrapping, so a range across

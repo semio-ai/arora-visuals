@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 
 use bevy::picking::events::{PointerPress, PointerRelease};
 use bevy::picking::mesh_picking::ray_cast::{ray_mesh_intersection, Backfaces};
+use bevy::picking::pointer::{PointerButton, PointerId};
 use bevy::prelude::*;
 
 use crate::binding::ElementTargets;
@@ -60,16 +61,16 @@ pub struct Picks(pub Vec<Picked>);
 /// and a release over nothing still count as a miss.
 pub const MISS_SLOP: f32 = 2.0;
 
-/// What a press found, kept until its release.
+/// What each pointer's primary press found, kept until its release: a
+/// second finger or a mouse beside a touch keeps a press of its own, so one
+/// pointer's release never decides with another's press.
 #[derive(Resource, Default)]
-struct Pressed(Option<Press>);
+struct Pressed(HashMap<PointerId, Press>);
 
 struct Press {
     position: Vec2,
     /// Every `(instance id, element id)` under the pointer at the press.
     under: HashSet<(String, String)>,
-    /// The press took a gizmo's handle, so its release is the gizmo's.
-    taken: bool,
 }
 
 /// Picks and misses, decided on release as a click ([module docs](self)).
@@ -164,27 +165,25 @@ fn on_press(
     cameras: Query<(&Camera, &GlobalTransform)>,
     elements: ElementMeshes,
     windows: Query<(), With<Window>>,
-    gizmos: Option<Res<GizmoPointer>>,
     mut pressed: ResMut<Pressed>,
 ) {
-    if !on_the_scene(press.entity, press.original_event_target(), &windows) {
+    // A click is the primary button's, or a touch's.
+    if press.button != PointerButton::Primary
+        || !on_the_scene(press.entity, press.original_event_target(), &windows)
+    {
         return;
     }
+    // Whether the press takes a gizmo's handle is not known yet — the gizmo
+    // decides in `Update`, from where the pointer is now, after this — so it
+    // is decided at the release, by whether a gizmo drag is in hand then.
     let position = press.pointer.position;
-    // A gizmo's handles are drawn over the scene but reach the window like
-    // any press on it, so one that takes a handle is the gizmo's, and so is
-    // its release.
-    let taken = gizmos.is_some_and(|gizmos| gizmos.engaged());
-    let all = if taken {
-        HashSet::new()
-    } else {
-        under(position, &instances, &cameras, &elements).all
-    };
-    pressed.0 = Some(Press {
-        position,
-        under: all,
-        taken,
-    });
+    pressed.0.insert(
+        press.pointer.id,
+        Press {
+            position,
+            under: under(position, &instances, &cameras, &elements).all,
+        },
+    );
 }
 
 /// Decides a release as a pick, a miss or nothing ([module docs](self)).
@@ -200,25 +199,29 @@ fn on_release(
     mut elsewhere: ResMut<ReleasedElsewhere>,
     mut picks: ResMut<Picks>,
 ) {
-    // A release bubbles from where it landed; take it once.
-    if release.entity != release.original_event_target() {
+    // A release bubbles from where it landed; take it once. A click is the
+    // primary button's, or a touch's.
+    if release.entity != release.original_event_target() || release.button != PointerButton::Primary
+    {
         return;
     }
+    let pointer = release.pointer.id;
     // Only the window's release decides a pick. Bevy sends a release to
     // everything hovered, in no set order — a label over the scene among
     // them — so a release anywhere else leaves the press for the window's,
     // and only notes that the press has been let go; see
     // `forget_unreleased_press`.
     if !windows.contains(release.entity) {
-        elsewhere.0 = true;
+        elsewhere.0.insert(pointer);
         return;
     }
-    let Some(press) = pressed.0.take() else {
+    let Some(press) = pressed.0.remove(&pointer) else {
         return;
     };
-    // A press that took a handle is the gizmo's — including one that took
-    // it in the same frame it reached it, before the press could know.
-    if press.taken || gizmos.is_some_and(|gizmos| gizmos.dragging.is_some()) {
+    // A press that took a gizmo's handle is the gizmo's, and so is its
+    // release: the drag it began is still in hand as the release arrives,
+    // since the gizmo lets go only in `Update`, after this.
+    if gizmos.is_some_and(|gizmos| gizmos.dragging.is_some()) {
         return;
     }
     let position = release.pointer.position;
@@ -232,9 +235,10 @@ fn on_release(
     }
 }
 
-/// Whether a release this frame landed somewhere other than the window.
+/// The pointers whose release this frame landed somewhere other than the
+/// window.
 #[derive(Resource, Default)]
-struct ReleasedElsewhere(bool);
+struct ReleasedElsewhere(HashSet<PointerId>);
 
 /// Forgets a press that was let go this frame without a release on the
 /// window taking it — a press released over a panel. Left, it would pair with
@@ -243,8 +247,8 @@ struct ReleasedElsewhere(bool);
 /// mouse button, keeps its press while it is held. A release on the window is
 /// decided in `PreUpdate`, before this runs.
 fn forget_unreleased_press(mut elsewhere: ResMut<ReleasedElsewhere>, mut pressed: ResMut<Pressed>) {
-    if std::mem::take(&mut elsewhere.0) {
-        pressed.0 = None;
+    for pointer in elsewhere.0.drain() {
+        pressed.0.remove(&pointer);
     }
 }
 
@@ -617,21 +621,35 @@ mod tests {
         app.init_resource::<ReleasedElsewhere>()
             .init_resource::<Pressed>()
             .add_systems(Update, forget_unreleased_press);
-        let pressed = |app: &App| app.world().resource::<Pressed>().0.is_some();
-        app.world_mut().resource_mut::<Pressed>().0 = Some(Press {
-            position: Vec2::ZERO,
-            under: HashSet::new(),
-            taken: false,
-        });
+        let held = |app: &App, pointer: PointerId| {
+            app.world().resource::<Pressed>().0.contains_key(&pointer)
+        };
+        let touch = PointerId::Touch(1);
+        for pointer in [PointerId::Mouse, touch] {
+            app.world_mut().resource_mut::<Pressed>().0.insert(
+                pointer,
+                Press {
+                    position: Vec2::ZERO,
+                    under: HashSet::new(),
+                },
+            );
+        }
         app.update();
         app.update();
         assert!(
-            pressed(&app),
+            held(&app, touch),
             "held while not let go, with no mouse button down"
         );
-        app.world_mut().resource_mut::<ReleasedElsewhere>().0 = true;
+        app.world_mut()
+            .resource_mut::<ReleasedElsewhere>()
+            .0
+            .insert(touch);
         app.update();
-        assert!(!pressed(&app), "forgotten once let go elsewhere");
+        assert!(!held(&app, touch), "forgotten once let go elsewhere");
+        assert!(
+            held(&app, PointerId::Mouse),
+            "another pointer's press is its own"
+        );
     }
 
     fn pair(element: &str) -> (String, String) {
@@ -642,7 +660,6 @@ mod tests {
         Press {
             position,
             under: elements.iter().map(|element| pair(element)).collect(),
-            taken: false,
         }
     }
 

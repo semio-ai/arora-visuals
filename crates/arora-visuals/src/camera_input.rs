@@ -46,18 +46,21 @@
 //! the mouse's raw motion, so a pan keeps what was pressed under the pointer
 //! as the controller means it to.
 
+use bevy::camera::RenderTarget;
 use bevy::camera_controller::pan_orbit_camera::controller::momentum::Velocity;
 use bevy::camera_controller::pan_orbit_camera::controller::motion::CurrentMotion;
 use bevy::camera_controller::pan_orbit_camera::prelude::{
     DefaultPanOrbitCameraPlugins, PanOrbitCamera,
 };
 use bevy::camera_controller::pan_orbit_camera::SyncCameraPosition;
+use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::input::touch::TouchPhase;
 use bevy::math::DVec3;
-use bevy::picking::events::{PointerPress, PointerScroll};
+use bevy::picking::events::{Pointer, PointerPress, PointerScroll};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
+use bevy::window::PrimaryWindow;
 
 use crate::pick::on_the_scene;
 use crate::transform_gizmo::{GizmoPointer, TransformGizmoSystems};
@@ -188,23 +191,35 @@ type Cameras<'w, 's> = Query<
     ),
 >;
 
-/// The camera a gesture at `position` belongs to, if any: the topmost active
-/// camera of all whose viewport holds it — bound or not, so a view drawn over
-/// a bound one shields it — and only if that camera has bindings. An
-/// inactive camera, or a view beneath another, never moves. Every camera is
-/// taken to draw to the window the pointer is in; a host with several
-/// windows keeps each window's cameras apart.
-fn camera_under(position: Vec2, all: &Query<(Entity, &Camera)>, bound: &Cameras) -> Option<Entity> {
+/// Every camera, with what it draws to, and the primary window, which a
+/// camera drawing to "the primary window" means.
+#[derive(SystemParam)]
+struct AllCameras<'w, 's> {
+    cameras: Query<'w, 's, (Entity, &'static Camera, &'static RenderTarget)>,
+    primary: Query<'w, 's, Entity, With<PrimaryWindow>>,
+}
+
+/// The camera a gesture by `pointer` belongs to, if any: of the cameras
+/// drawing to the window the pointer is in, the topmost active one whose
+/// viewport holds it — bound or not, so a view drawn over a bound one
+/// shields it — and only if that camera has bindings. An inactive camera, a
+/// view beneath another, one in another window and one drawing to an image,
+/// such as an outline's mask, never moves.
+fn camera_under(pointer: &Pointer, all: &AllCameras, bound: &Cameras) -> Option<Entity> {
+    let primary = all.primary.iter().next();
     topmost(
-        position,
-        all.iter().map(|(entity, camera)| {
-            (
-                entity,
-                camera.is_active,
-                camera.order,
-                camera.logical_viewport_rect(),
-            )
-        }),
+        pointer.position,
+        all.cameras
+            .iter()
+            .filter(|(_, _, target)| target.normalize(primary).as_ref() == Some(&pointer.target))
+            .map(|(entity, camera, _)| {
+                (
+                    entity,
+                    camera.is_active,
+                    camera.order,
+                    camera.logical_viewport_rect(),
+                )
+            }),
     )
     .filter(|entity| bound.contains(*entity))
 }
@@ -228,14 +243,18 @@ fn start_gesture(
     press: On<PointerPress>,
     windows: Query<(), With<Window>>,
     gizmos: Option<Res<GizmoPointer>>,
-    all: Query<(Entity, &Camera)>,
+    all: AllCameras,
     mut cameras: Cameras,
     mut gesture: ResMut<Gesture>,
 ) {
     if !on_the_scene(press.entity, press.original_event_target(), &windows) {
         return;
     }
-    if gizmos.is_some_and(|gizmos| gizmos.engaged()) || gesture.0.is_some() {
+    // Only a drag already in hand keeps the gesture from starting. A handle
+    // the pointer is merely over may never be taken — the gizmo takes only
+    // the left button — and when this press does take one, the gesture gives
+    // way to it at once (`drag`).
+    if gizmos.is_some_and(|gizmos| gizmos.dragging.is_some()) || gesture.0.is_some() {
         return;
     }
     let button = match press.button {
@@ -244,7 +263,7 @@ fn start_gesture(
         PointerButton::Middle => MouseButton::Middle,
     };
     let position = press.pointer.position;
-    let Some(entity) = camera_under(position, &all, &cameras) else {
+    let Some(entity) = camera_under(&press.pointer, &all, &cameras) else {
         return;
     };
     let Ok((_, _, bindings, mut controller, _)) = cameras.get_mut(entity) else {
@@ -319,7 +338,7 @@ fn dolly(distance: f64, pixels: f32, zoom_speed: f32) -> f64 {
 fn zoom(
     scroll: On<PointerScroll>,
     windows: Query<(), With<Window>>,
-    all: Query<(Entity, &Camera)>,
+    all: AllCameras,
     mut cameras: Cameras,
     gesture: Res<Gesture>,
     time: Res<Time>,
@@ -334,7 +353,7 @@ fn zoom(
     if gesture.0.is_some() {
         return;
     }
-    let Some(entity) = camera_under(scroll.pointer.position, &all, &cameras) else {
+    let Some(entity) = camera_under(&scroll.pointer, &all, &cameras) else {
         return;
     };
     if let Ok((_, _, bindings, mut controller, mut transform)) = cameras.get_mut(entity) {
