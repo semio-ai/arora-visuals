@@ -59,6 +59,7 @@ use bevy::picking::events::{PointerPress, PointerScroll};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 
+use crate::pick::on_the_scene;
 use crate::transform_gizmo::GizmoPointer;
 
 /// Which inputs move a camera ([module docs](self)).
@@ -201,9 +202,7 @@ fn start_gesture(
     mut cameras: Cameras,
     mut gesture: ResMut<Gesture>,
 ) {
-    // A press bubbles from where it landed; take it once, and only where it
-    // landed on the window rather than on something drawn over the scene.
-    if press.entity != press.original_event_target() || !windows.contains(press.entity) {
+    if !on_the_scene(press.entity, press.original_event_target(), &windows) {
         return;
     }
     if gizmos.is_some_and(|gizmos| gizmos.engaged()) || gesture.0.is_some() {
@@ -284,7 +283,7 @@ fn zoom(
     time: Res<Time>,
     mut trackpad: ResMut<Trackpad>,
 ) {
-    if scroll.entity != scroll.original_event_target() || !windows.contains(scroll.entity) {
+    if !on_the_scene(scroll.entity, scroll.original_event_target(), &windows) {
         return;
     }
     // Read every scroll's phase, taken or not, so the inertia is still told

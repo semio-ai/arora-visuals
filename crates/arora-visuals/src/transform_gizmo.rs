@@ -82,6 +82,7 @@ use crate::joint_gizmo::{
     distance as joint_distance, dragged, reach as joint_reach, take, JointDrag, JointGizmo,
     JointHeld, JointReach, Rest,
 };
+use crate::pick::on_the_scene;
 
 /// What a gizmo's handles can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -517,11 +518,8 @@ fn note_scene_press(
     windows: Query<(), With<Window>>,
     mut pressed: ResMut<PressedScene>,
 ) {
-    // A press bubbles from where it landed; it is the scene's only where it
-    // landed on the window itself.
     if press.button == PointerButton::Primary
-        && press.entity == press.original_event_target()
-        && windows.contains(press.entity)
+        && on_the_scene(press.entity, press.original_event_target(), &windows)
     {
         pressed.0 = true;
     }

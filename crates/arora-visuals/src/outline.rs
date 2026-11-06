@@ -90,8 +90,7 @@ pub struct OutlineOverlay;
 struct OutlineMask;
 
 /// What an outlined view owns: its mask camera, the mask, the quad, and the
-/// render layer the quad is on, with the layers the view had before it
-/// joined that one.
+/// render layer the quad is on, which the view joins beside its own.
 #[derive(Component)]
 struct OutlineParts {
     mask_camera: Entity,
@@ -99,11 +98,13 @@ struct OutlineParts {
     mask: Handle<Image>,
     material: Handle<OutlineMaterial>,
     layer: usize,
-    before: Option<RenderLayers>,
 }
 
-/// The first of the layers outline quads are drawn on, one per outlined view.
-const OVERLAY_LAYERS_FROM: usize = OUTLINE_LAYER + 1;
+/// The first of the render layers outline quads are drawn on, one per
+/// outlined view, upward from here. **A host must not draw its own entities
+/// on these**: an outlined view joins its quad's layer, so anything else on
+/// it would be drawn into that view.
+pub const OVERLAY_LAYERS_FROM: usize = OUTLINE_LAYER + 1;
 
 /// Which views hold which quad layers: slot `i` is layer
 /// `OVERLAY_LAYERS_FROM + i`. A quad rides its view's camera, so on a layer
@@ -209,7 +210,9 @@ impl Plugin for OutlinePlugin {
                 PostUpdate,
                 (
                     sync_mask.after(FramingSystems).before(CameraUpdateSystems),
-                    fit_overlay.after(CameraUpdateSystems),
+                    fit_overlay
+                        .after(CameraUpdateSystems)
+                        .after(TransformSystems::Propagate),
                 ),
             );
     }
@@ -220,14 +223,17 @@ impl Plugin for OutlinePlugin {
 fn attach_outline(
     mut commands: Commands,
     views: Query<(Entity, &Camera, &OutlineView, Option<&RenderLayers>), Without<OutlineParts>>,
-    outlined: Query<(), With<OutlineParts>>,
+    owners: Query<(), Or<(With<OutlineView>, With<OutlineParts>)>>,
     mut layers: ResMut<OverlayLayers>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<OutlineMaterial>>,
 ) {
     for (view, camera, settings, view_layers) in &views {
-        let layer = layers.take(view, |holder| outlined.contains(holder));
+        // A holder is alive while it still asks for an outline, so a view
+        // attaching earlier in this same pass, whose parts are not yet
+        // inserted, keeps its layer.
+        let layer = layers.take(view, |holder| owners.contains(holder));
         // Resized to the view as soon as the view knows its size.
         let mask = images.add(Image::new_target_texture(
             1,
@@ -269,39 +275,37 @@ fn attach_outline(
                 OutlineOverlay,
             ))
             .id();
-        let before = view_layers.cloned();
         commands.entity(view).insert((
-            before.clone().unwrap_or_default().with(layer),
+            view_layers.cloned().unwrap_or_default().with(layer),
             OutlineParts {
                 mask_camera,
                 overlay,
                 mask,
                 material,
                 layer,
-                before,
             },
         ));
     }
 }
 
 /// Takes an outline away from a view no longer asking for one: its mask
-/// camera and quad go, its layer is freed, and the view has its own layers
-/// back.
+/// camera and quad go, its layer is freed, and the view leaves that layer
+/// alone — whatever other layers it has now, the host's to keep, including
+/// any set since the outline came.
 fn detach_outline(
     mut commands: Commands,
-    views: Query<(Entity, &OutlineParts), Without<OutlineView>>,
+    views: Query<(Entity, &OutlineParts, Option<&RenderLayers>), Without<OutlineView>>,
     mut layers: ResMut<OverlayLayers>,
 ) {
-    for (view, parts) in &views {
+    for (view, parts, view_layers) in &views {
         commands.entity(parts.mask_camera).despawn();
         commands.entity(parts.overlay).despawn();
         layers.free(parts.layer);
-        let mut view = commands.entity(view);
-        match &parts.before {
-            Some(before) => view.insert(before.clone()),
-            None => view.remove::<RenderLayers>(),
-        };
-        view.remove::<OutlineParts>();
+        let left = view_layers
+            .cloned()
+            .unwrap_or_default()
+            .without(parts.layer);
+        commands.entity(view).insert(left).remove::<OutlineParts>();
     }
 }
 
@@ -451,18 +455,27 @@ const OVERLAY_DEPTH: f32 = 0.5;
 /// is not the camera's axis. The shader reads the mask by screen position,
 /// so the quad need only cover the view; it is made a little larger, so
 /// rounding never leaves an edge uncovered.
+///
+/// Fitted after propagation, and its world transform set here too, so the
+/// quad stands where this frame's projection says rather than a frame
+/// behind it.
+#[allow(clippy::type_complexity)]
 fn fit_overlay(
-    views: Query<(&Camera, &OutlineParts)>,
-    mut overlays: Query<&mut Transform, With<OutlineOverlay>>,
+    views: Query<(&Camera, &GlobalTransform, &OutlineParts)>,
+    mut overlays: Query<
+        (&mut Transform, &mut GlobalTransform),
+        (With<OutlineOverlay>, Without<OutlineParts>),
+    >,
 ) {
-    for (camera, parts) in &views {
-        let Ok(mut transform) = overlays.get_mut(parts.overlay) else {
+    for (camera, at, parts) in &views {
+        let Ok((mut transform, mut global)) = overlays.get_mut(parts.overlay) else {
             continue;
         };
         let wanted = overlay_over(camera.clip_from_view());
         if *transform != wanted {
             *transform = wanted;
         }
+        *global = at.mul_transform(wanted);
     }
 }
 
@@ -484,6 +497,73 @@ mod tests {
     use crate::binding::{ElementTargets, SceneBindings};
     use crate::meta::AssetMeta;
     use bevy::camera::{CameraProjection, SubCameraView};
+
+    fn outline_app() -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<Image>()
+            .init_asset::<Mesh>()
+            .init_asset::<OutlineMaterial>()
+            .init_resource::<OverlayLayers>()
+            .add_systems(Update, (detach_outline, attach_outline).chain());
+        app
+    }
+
+    fn quad_layer(app: &mut App, view: Entity) -> usize {
+        app.world()
+            .get::<OutlineParts>(view)
+            .expect("outlined")
+            .layer
+    }
+
+    /// Views outlined in the same frame each get a quad layer of their own.
+    #[test]
+    fn views_outlined_together_get_layers_of_their_own() {
+        let mut app = outline_app();
+        let first = app
+            .world_mut()
+            .spawn((Camera::default(), OutlineView::default()))
+            .id();
+        let second = app
+            .world_mut()
+            .spawn((Camera::default(), OutlineView::default()))
+            .id();
+        app.update();
+        assert_ne!(quad_layer(&mut app, first), quad_layer(&mut app, second));
+    }
+
+    /// Taking an outline away leaves the view every layer but the quad's,
+    /// including one the host gave it after the outline came.
+    #[test]
+    fn removing_an_outline_keeps_the_hosts_layers() {
+        let mut app = outline_app();
+        let view = app
+            .world_mut()
+            .spawn((
+                Camera::default(),
+                OutlineView::default(),
+                RenderLayers::layer(0),
+            ))
+            .id();
+        app.update();
+        let quad = quad_layer(&mut app, view);
+        let given = app
+            .world()
+            .get::<RenderLayers>(view)
+            .cloned()
+            .unwrap()
+            .with(5);
+        app.world_mut().entity_mut(view).insert(given);
+        app.world_mut().entity_mut(view).remove::<OutlineView>();
+        app.update();
+        let left = app.world().get::<RenderLayers>(view).cloned().unwrap();
+        assert_eq!(
+            left,
+            RenderLayers::from_layers(&[0, 5]),
+            "quad layer {quad}"
+        );
+        assert!(app.world().get::<OutlineParts>(view).is_none());
+    }
 
     /// The quad's corners, carried through `clip_from_view`, land just past
     /// the view's edges on every side: for a perspective, for an orthographic

@@ -260,32 +260,40 @@ fn place_lines(
             }
         }
 
-        // Placed from the line's position and turn alone: its own space may be
-        // scaled, unevenly too, and no scale of it may reach the line's length
-        // or width. Dividing a scale back out only cancels an even one.
-        let (_, turn, origin) = at.to_scale_rotation_translation();
-        let unscaled =
-            GlobalTransform::from(Transform::from_translation(origin).with_rotation(turn));
+        // A line runs along its entity's axis as the entity actually holds it
+        // in the world — under a parent's uneven scale and a turn that axis
+        // is sheared off the entity's own rotation, and the frame's arrows,
+        // which are its children, follow the true one. Its length and width
+        // are its own, so no scale of the entity reaches them. An axis the
+        // entity has scaled to nothing has no direction, and its line hides.
+        let affine = at.affine();
+        let origin = at.translation();
+        let invertible = affine.matrix3.determinant().abs() > f32::EPSILON;
         for child in children.iter() {
             let Ok((half, mut transform, mut global, mut visibility)) = halves.get_mut(child)
             else {
                 continue;
             };
-            let Some((unit, width)) = shown else {
+            let axis = affine.transform_vector3(line.direction.as_vec3() * half.0);
+            let (Some((unit, width)), Ok(along)) = (shown, Dir3::new(axis)) else {
                 visibility.set_if_neq(Visibility::Hidden);
                 continue;
             };
             visibility.set_if_neq(Visibility::Inherited);
-            let along = line.direction.as_vec3() * half.0;
-            let placed = unscaled.mul_transform(
-                Transform::from_rotation(Quat::from_rotation_arc(Vec3::Y, along))
-                    .with_scale(Vec3::new(width / 2.0, line.reach * unit, width / 2.0)),
-            );
+            let placed = GlobalTransform::from(Transform {
+                translation: origin,
+                rotation: Quat::from_rotation_arc(Vec3::Y, *along),
+                scale: Vec3::new(width / 2.0, line.reach * unit, width / 2.0),
+            });
             // Placed by hand, after propagation, so the half stands where its
-            // line is this frame; its local transform is kept to match, as
-            // nearly as a transform under an uneven scale can.
+            // line is this frame. Its local transform is kept to match where
+            // the entity's transform can be undone; where it cannot, the
+            // world placement is the one drawn, and the local is left alone
+            // rather than set to what a singular inverse makes of it.
             *global = placed;
-            *transform = placed.reparented_to(at);
+            if invertible {
+                *transform = placed.reparented_to(at);
+            }
         }
     }
 }
@@ -362,6 +370,59 @@ mod tests {
             both[1].abs_diff_eq(Vec3::new(2.0, 0.0, 0.0), 1e-5),
             "{both:?}"
         );
+    }
+
+    /// A sheared entity's line runs along its true axis, as its arrows do:
+    /// a child turned under a parent's uneven scale.
+    #[test]
+    fn a_sheared_line_follows_its_true_axis() {
+        let mut app = app();
+        let parent = app
+            .world_mut()
+            .spawn(Transform::from_scale(Vec3::new(1.0, 3.0, 1.0)))
+            .id();
+        let child = app
+            .world_mut()
+            .spawn((
+                Transform::from_rotation(Quat::from_rotation_z(0.6)),
+                line(false),
+                ChildOf(parent),
+            ))
+            .id();
+        app.update();
+        app.update();
+        let axis = app
+            .world()
+            .get::<GlobalTransform>(child)
+            .unwrap()
+            .affine()
+            .transform_vector3(Vec3::X)
+            .normalize();
+        let end = ends(&mut app)[0];
+        assert!(
+            end.normalize().abs_diff_eq(axis, 1e-4),
+            "{end:?} against {axis:?}"
+        );
+        assert!((end.length() - 1.0).abs() < 1e-4, "{end:?}");
+    }
+
+    /// An axis scaled to nothing hides its line rather than drawing NaN.
+    #[test]
+    fn a_collapsed_axis_hides_its_line() {
+        let mut app = app();
+        app.world_mut()
+            .spawn((Transform::from_scale(Vec3::new(0.0, 1.0, 1.0)), line(false)));
+        app.update();
+        app.update();
+        let world = app.world_mut();
+        let halves: Vec<(Visibility, Transform)> = world
+            .query::<(&Half, &Visibility, &Transform)>()
+            .iter(world)
+            .map(|(_, visibility, transform)| (*visibility, *transform))
+            .collect();
+        assert_eq!(halves.len(), 1);
+        assert_eq!(halves[0].0, Visibility::Hidden);
+        assert!(halves[0].1.is_finite(), "{:?}", halves[0].1);
     }
 
     /// A scaled entity's line keeps its reach, however unevenly it is
