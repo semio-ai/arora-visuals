@@ -29,6 +29,10 @@ pub struct FrameAxes {
     /// `camera`, and shows nothing without one.
     pub size: GizmoSize,
     pub camera: Option<Entity>,
+    /// The entity's directions the arrows name X, Y and Z: its own by
+    /// default, or [`Z_UP`](crate::transform_gizmo::TransformGizmo::Z_UP) to label a Y-up frame as a Z-up
+    /// world names it, as the gizmos can.
+    pub axes: [Dir3; 3],
     /// X's, Y's and Z's colours.
     pub colours: [Color; 3],
 }
@@ -39,6 +43,7 @@ impl Default for FrameAxes {
         Self {
             size: GizmoSize::World(0.3),
             camera: None,
+            axes: [Dir3::X, Dir3::Y, Dir3::Z],
             colours: AXIS_COLOURS,
         }
     }
@@ -48,9 +53,10 @@ impl Default for FrameAxes {
 #[derive(Component)]
 struct AxesOf(Entity);
 
-/// The colours the arrows were built in, so a change rebuilds them.
+/// The directions and colours the arrows were built in, so a change
+/// rebuilds them.
 #[derive(Component, PartialEq)]
-struct Built([Color; 3]);
+struct Built([Dir3; 3], [Color; 3]);
 
 pub struct FrameAxesPlugin;
 
@@ -76,7 +82,8 @@ fn build_axes(
     mut materials: ResMut<Assets<HandleMaterial>>,
 ) {
     for (entity, axes, built) in &shown {
-        if built.is_some_and(|built| built.0 == axes.colours) {
+        let wanted = Built(axes.axes, axes.colours);
+        if built == Some(&wanted) {
             continue;
         }
         for (holder, of) in &holders {
@@ -84,7 +91,7 @@ fn build_axes(
                 commands.entity(holder).despawn();
             }
         }
-        commands.entity(entity).insert(Built(axes.colours));
+        commands.entity(entity).insert(wanted);
 
         let shaft = meshes.add(Cylinder::new(TUBE[0], SHAFT_LENGTH));
         // The head stands on the shaft's end, its base at the piece's origin.
@@ -110,12 +117,13 @@ fn build_axes(
                 },
             });
             // The meshes stand along Y; each arrow is turned onto its axis.
-            let onto = Quat::from_rotation_arc(Vec3::Y, Vec3::AXES[index]);
+            let along = axes.axes[index].as_vec3();
+            let onto = Quat::from_rotation_arc(Vec3::Y, along);
             for (mesh, from) in [(&shaft, SHAFT_LENGTH / 2.0), (&head, SHAFT_LENGTH)] {
                 commands.spawn((
                     Mesh3d(mesh.clone()),
                     MeshMaterial3d(material.clone()),
-                    Transform::from_translation(Vec3::AXES[index] * from).with_rotation(onto),
+                    Transform::from_translation(along * from).with_rotation(onto),
                     NotShadowCaster,
                     Pickable::IGNORE,
                     ChildOf(holder),
@@ -215,6 +223,38 @@ mod tests {
         app.world_mut().entity_mut(body).remove::<FrameAxes>();
         app.update();
         assert_eq!(arrows(&mut app), 0);
+    }
+
+    /// Under the Z-up labelling, Z's arrow — the third colour — stands along
+    /// Bevy's up.
+    #[test]
+    fn a_z_up_frame_puts_z_up() {
+        let mut app = app();
+        app.world_mut().spawn((
+            Transform::default(),
+            FrameAxes {
+                axes: crate::transform_gizmo::TransformGizmo::Z_UP,
+                ..default()
+            },
+        ));
+        app.update();
+        let blue = LinearRgba::from(AXIS_COLOURS[2]).to_vec4();
+        let world = app.world_mut();
+        let pieces: Vec<(Vec3, Handle<HandleMaterial>)> = world
+            .query::<(&Transform, &MeshMaterial3d<HandleMaterial>)>()
+            .iter(world)
+            .map(|(at, material)| (at.translation, material.0.clone()))
+            .collect();
+        let materials = world.resource::<Assets<HandleMaterial>>();
+        let z: Vec<Vec3> = pieces
+            .into_iter()
+            .filter(|(_, material)| materials.get(material).unwrap().handle.colour == blue)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(z.len(), 2, "a shaft and a head");
+        for at in z {
+            assert!(at.normalize().abs_diff_eq(Vec3::Y, 1e-5), "{at:?}");
+        }
     }
 
     /// The arrows keep their length on a scaled node.
