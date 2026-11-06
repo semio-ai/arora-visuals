@@ -37,6 +37,17 @@
 //! an entity with an engine instance. What this crate joins is an animatable
 //! to the thing it moves, which is a different relation at a different level.
 //!
+//! # The pointer
+//!
+//! Picks, the camera's gestures and the gizmos' grabs all take a press only
+//! where it lands on the window itself, so a press on a panel or a control
+//! drawn over the scene is never the scene's. **They read that from Bevy's
+//! picking**: a host needs its pointer input with window picking enabled,
+//! and nothing else in the scene pickable under the pointer. This crate's
+//! own handles and aids are never pickable; a mesh picking backend that picks
+//! a host's meshes takes the press off the window, and the scene stops
+//! answering it.
+//!
 //! # What it costs to be here
 //!
 //! A module that names a Bevy type binds every consumer of this crate to one
@@ -48,28 +59,52 @@
 //! standing example: colour science, no imports, no lockstep. **A module that
 //! can stay free of Bevy should stay free of Bevy.**
 
+#[cfg(feature = "view")]
+pub mod active_area;
+#[cfg(feature = "view")]
+pub mod axes;
+#[cfg(feature = "view")]
+pub mod axis_line;
 pub mod binding;
+#[cfg(feature = "camera_input")]
+pub mod camera_input;
 #[cfg(feature = "view")]
 pub mod drawn;
+#[cfg(feature = "view")]
+pub mod ghost;
 #[cfg(feature = "view")]
 pub mod glow;
 pub mod hold;
 pub mod instance;
+#[cfg(feature = "view")]
+pub mod joint_gizmo;
 pub mod meta;
 #[cfg(feature = "view")]
+pub mod outline;
+#[cfg(feature = "view")]
+pub mod overlay;
+#[cfg(feature = "view")]
 pub mod pick;
+#[cfg(feature = "view")]
+pub mod select;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
 pub mod target;
 pub mod tone;
+#[cfg(feature = "view")]
+pub mod transform_gizmo;
 pub mod value;
+#[cfg(feature = "view_gizmo")]
+pub mod view_gizmo;
+#[cfg(feature = "view")]
+pub mod view_offset;
 
 pub use binding::{ElementTargets, SceneBinding, SceneBindings};
 pub use hold::{HoldTarget, Holds};
 pub use instance::{ClearCamera, EntityInstance, Superseded, ViewOf, CLEAR_ORDER};
+pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 #[cfg(feature = "view")]
 pub use pick::{Picked, Picks};
-pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 pub use target::OffscreenTarget;
 pub use tone::ToneMapping;
 pub use value::Decoded;

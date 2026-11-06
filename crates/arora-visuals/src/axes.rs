@@ -1,0 +1,437 @@
+//! Showing a reference frame: three arrows along an entity's own X, Y and Z,
+//! from its origin, dashed lines reaching well past them, or both, so where
+//! a body or a joint's frame sits and how it is turned can be seen.
+//!
+//! **A view, not a default.** Nothing shows axes until a host puts
+//! [`FrameAxes`] on an entity — a body, a joint, an element's node, a gizmo's
+//! target — and removing it takes them away again. Any number of entities may
+//! show theirs at once.
+//!
+//! The arrows are the transform gizmo's, at its length and without its
+//! handles: unlit, in its axis colours but faint, so they read as a reference
+//! rather than as something to take, and drawn over everything, so a frame
+//! inside a body still shows. They follow the entity's position and turn but not its
+//! scale, so a scaled node's axes keep their length; [`FrameAxes::size`] sets
+//! that length, in the world or on screen, as a gizmo's size does. They are
+//! never picked, cast no shadow, and are left alone by a ghost.
+//!
+//! The lines are [`AxisLine`]s, the guides a gizmo shows along a held
+//! handle's axis, measured in the arrows' length. Run them both ways when the
+//! arrows show too, since the arrows already say which way is positive, and
+//! one way when the lines show alone.
+
+use bevy::light::NotShadowCaster;
+use bevy::prelude::*;
+
+use crate::axis_line::{AxisLine, AxisLinePlugin};
+use crate::transform_gizmo::{
+    add_handle_material, unit_size, GizmoPart, GizmoSize, HandleMaterial, HandleUniform,
+    AXIS_COLOURS, CONE_LENGTH, CONE_RADIUS, GIZMO_SIZE, SHAFT_LENGTH, TUBE,
+};
+
+/// Shows this entity's reference frame ([module docs](self)).
+#[derive(Component, Clone, Debug)]
+pub struct FrameAxes {
+    /// How long each arrow is. A size on screen is measured through
+    /// `camera`, and shows nothing without one.
+    pub size: GizmoSize,
+    pub camera: Option<Entity>,
+    /// The entity's directions the arrows name X, Y and Z: its own by
+    /// default, or [`Z_UP`](crate::transform_gizmo::TransformGizmo::Z_UP) to label a Y-up frame as a Z-up
+    /// world names it, as the gizmos can.
+    pub axes: [Dir3; 3],
+    /// X's, Y's and Z's colours.
+    pub colours: [Color; 3],
+    /// Whether the arrows show.
+    pub arrows: bool,
+    /// The dashed lines along the axes, if they show.
+    pub lines: Option<FrameLines>,
+}
+
+/// A frame's dashed lines ([module docs](self)).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameLines {
+    /// How far each reaches from the origin, in arrow lengths.
+    pub reach: f32,
+    /// Whether each runs back through the origin as far again.
+    pub both_ways: bool,
+}
+
+impl Default for FrameLines {
+    /// Four arrow lengths, both ways, as beside arrows.
+    fn default() -> Self {
+        Self {
+            reach: 4.0,
+            both_ways: true,
+        }
+    }
+}
+
+impl Default for FrameAxes {
+    /// Arrows the transform gizmo's length, in its colours.
+    fn default() -> Self {
+        Self {
+            size: GIZMO_SIZE,
+            camera: None,
+            axes: [Dir3::X, Dir3::Y, Dir3::Z],
+            colours: AXIS_COLOURS,
+            arrows: true,
+            lines: None,
+        }
+    }
+}
+
+/// How opaque a frame's arrows are: clearly fainter than a gizmo's handles,
+/// which are at least three quarters opaque, so an arrow marking an axis is
+/// never mistaken for a handle to take.
+const ARROW_OPACITY: f32 = 0.4;
+
+/// The arrows showing an entity's axes, held under it; `0` is the entity.
+#[derive(Component)]
+struct AxesOf(Entity);
+
+/// One of the lines showing an entity's axes, under it; `0` is the entity.
+#[derive(Component)]
+struct LinesOf(Entity);
+
+/// What an entity's axes were built as, so a change rebuilds them.
+#[derive(Component, PartialEq)]
+struct Built {
+    axes: [Dir3; 3],
+    colours: [Color; 3],
+    arrows: bool,
+    lines: Option<FrameLines>,
+    size: GizmoSize,
+    camera: Option<Entity>,
+}
+
+impl Built {
+    fn of(axes: &FrameAxes) -> Self {
+        Self {
+            axes: axes.axes,
+            colours: axes.colours,
+            arrows: axes.arrows,
+            lines: axes.lines,
+            size: axes.size,
+            camera: axes.camera,
+        }
+    }
+}
+
+pub struct FrameAxesPlugin;
+
+impl Plugin for FrameAxesPlugin {
+    fn build(&self, app: &mut App) {
+        add_handle_material(app);
+        app.add_plugins(AxisLinePlugin);
+        app.add_systems(
+            PostUpdate,
+            (build_axes, (size_axes, drop_axes))
+                .chain()
+                .after(TransformSystems::Propagate),
+        );
+    }
+}
+
+/// Builds the arrows and lines for each entity newly showing its axes, or
+/// showing them differently.
+fn build_axes(
+    mut commands: Commands,
+    shown: Query<(Entity, &FrameAxes, Option<&Built>)>,
+    holders: Query<(Entity, &AxesOf)>,
+    lines: Query<(Entity, &LinesOf)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<HandleMaterial>>,
+) {
+    for (entity, axes, built) in &shown {
+        let wanted = Built::of(axes);
+        if built == Some(&wanted) {
+            continue;
+        }
+        despawn_shown(&mut commands, entity, &holders, &lines);
+        commands.entity(entity).insert(wanted);
+
+        if let Some(style) = axes.lines {
+            for (index, colour) in axes.colours.into_iter().enumerate() {
+                commands.spawn((
+                    LinesOf(entity),
+                    AxisLine {
+                        direction: axes.axes[index],
+                        reach: style.reach,
+                        both_ways: style.both_ways,
+                        size: axes.size,
+                        camera: axes.camera,
+                        colour,
+                    },
+                    Transform::default(),
+                    Visibility::default(),
+                    ChildOf(entity),
+                ));
+            }
+        }
+        if !axes.arrows {
+            continue;
+        }
+
+        let shaft = meshes.add(Cylinder::new(TUBE[0], SHAFT_LENGTH));
+        // The head stands on the shaft's end, its base at the piece's origin.
+        let head = meshes.add(
+            Mesh::from(Cone {
+                radius: CONE_RADIUS,
+                height: CONE_LENGTH,
+            })
+            .translated_by(Vec3::Y * CONE_LENGTH / 2.0),
+        );
+        let holder = commands
+            .spawn((
+                AxesOf(entity),
+                Transform::default(),
+                Visibility::default(),
+                ChildOf(entity),
+            ))
+            .id();
+        for (index, colour) in axes.colours.into_iter().enumerate() {
+            let material = materials.add(HandleMaterial {
+                handle: HandleUniform {
+                    colour: LinearRgba::from(colour.with_alpha(ARROW_OPACITY)).to_vec4(),
+                },
+            });
+            // The meshes stand along Y; each arrow is turned onto its axis.
+            let along = axes.axes[index].as_vec3();
+            let onto = Quat::from_rotation_arc(Vec3::Y, along);
+            for (mesh, from) in [(&shaft, SHAFT_LENGTH / 2.0), (&head, SHAFT_LENGTH)] {
+                commands.spawn((
+                    Mesh3d(mesh.clone()),
+                    MeshMaterial3d(material.clone()),
+                    Transform::from_translation(along * from).with_rotation(onto),
+                    GizmoPart,
+                    NotShadowCaster,
+                    Pickable::IGNORE,
+                    ChildOf(holder),
+                ));
+            }
+        }
+    }
+}
+
+/// Sizes each entity's arrows, undoing its scale so they keep their length.
+///
+/// After propagation, so the size follows this frame's scale and zoom; the
+/// arrows' world transforms are set here too, or they would be drawn at the
+/// size they had a frame ago.
+#[allow(clippy::type_complexity)]
+fn size_axes(
+    shown: Query<(&FrameAxes, &GlobalTransform), Without<AxesOf>>,
+    cameras: Query<(&Camera, &GlobalTransform), (Without<AxesOf>, Without<FrameAxes>)>,
+    mut holders: Query<(
+        &AxesOf,
+        &mut Transform,
+        &mut GlobalTransform,
+        &mut Visibility,
+        &Children,
+    )>,
+    mut arrows: Query<
+        (&Transform, &mut GlobalTransform),
+        (Without<AxesOf>, Without<FrameAxes>, Without<Camera>),
+    >,
+) {
+    for (of, mut transform, mut global, mut visibility, children) in &mut holders {
+        let Ok((axes, at)) = shown.get(of.0) else {
+            continue;
+        };
+        let camera = axes.camera.and_then(|camera| cameras.get(camera).ok());
+        let unit = match (axes.size, camera) {
+            (GizmoSize::World(metres), _) => Some(metres),
+            (size, Some(camera)) => unit_size(size, camera, at.translation()),
+            (GizmoSize::Pixels(_), None) => None,
+        };
+        let shown = if unit.is_some() {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        visibility.set_if_neq(shown);
+        let Some(unit) = unit else {
+            continue;
+        };
+        let scale = at.scale();
+        // By the scale's size: a mirrored axis has a negative scale, whose
+        // length is undone the same as a positive one's.
+        let wanted = Vec3::splat(unit) / scale.abs().max(Vec3::splat(f32::EPSILON));
+        if transform.scale != wanted {
+            transform.scale = wanted;
+        }
+        *global = at.mul_transform(*transform);
+        for child in children.iter() {
+            if let Ok((local, mut arrow)) = arrows.get_mut(child) {
+                *arrow = global.mul_transform(*local);
+            }
+        }
+    }
+}
+
+/// Takes the arrows and lines away from an entity no longer showing its
+/// axes.
+fn drop_axes(
+    mut commands: Commands,
+    mut removed: RemovedComponents<FrameAxes>,
+    holders: Query<(Entity, &AxesOf)>,
+    lines: Query<(Entity, &LinesOf)>,
+) {
+    for entity in removed.read() {
+        if let Ok(mut built) = commands.get_entity(entity) {
+            built.remove::<Built>();
+        }
+        despawn_shown(&mut commands, entity, &holders, &lines);
+    }
+}
+
+/// Despawns whatever shows `entity`'s axes.
+fn despawn_shown(
+    commands: &mut Commands,
+    entity: Entity,
+    holders: &Query<(Entity, &AxesOf)>,
+    lines: &Query<(Entity, &LinesOf)>,
+) {
+    let arrows = holders
+        .iter()
+        .filter(|(_, of)| of.0 == entity)
+        .map(|(e, _)| e);
+    let dashed = lines
+        .iter()
+        .filter(|(_, of)| of.0 == entity)
+        .map(|(e, _)| e);
+    for shown in arrows.chain(dashed) {
+        commands.entity(shown).despawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), TransformPlugin))
+            .init_asset::<Mesh>()
+            .init_asset::<HandleMaterial>()
+            .add_systems(
+                PostUpdate,
+                (build_axes, (size_axes, drop_axes))
+                    .chain()
+                    .after(TransformSystems::Propagate),
+            );
+        app
+    }
+
+    fn arrows(app: &mut App) -> usize {
+        app.world_mut()
+            .query_filtered::<(), With<MeshMaterial3d<HandleMaterial>>>()
+            .iter(app.world())
+            .count()
+    }
+
+    /// Showing a frame puts three arrows under it, each a shaft and a head,
+    /// and taking it away removes them.
+    #[test]
+    fn showing_axes_adds_three_arrows_and_hiding_them_removes_them() {
+        let mut app = app();
+        let body = app
+            .world_mut()
+            .spawn((Transform::default(), FrameAxes::default()))
+            .id();
+        app.update();
+        assert_eq!(arrows(&mut app), 6);
+        app.world_mut().entity_mut(body).remove::<FrameAxes>();
+        app.update();
+        assert_eq!(arrows(&mut app), 0);
+    }
+
+    /// Under the Z-up labelling, Z's arrow — the third colour — stands along
+    /// Bevy's up.
+    #[test]
+    fn a_z_up_frame_puts_z_up() {
+        let mut app = app();
+        app.world_mut().spawn((
+            Transform::default(),
+            FrameAxes {
+                axes: crate::transform_gizmo::TransformGizmo::Z_UP,
+                ..default()
+            },
+        ));
+        app.update();
+        let blue = LinearRgba::from(AXIS_COLOURS[2].with_alpha(ARROW_OPACITY)).to_vec4();
+        let world = app.world_mut();
+        let pieces: Vec<(Vec3, Handle<HandleMaterial>)> = world
+            .query::<(&Transform, &MeshMaterial3d<HandleMaterial>)>()
+            .iter(world)
+            .map(|(at, material)| (at.translation, material.0.clone()))
+            .collect();
+        let materials = world.resource::<Assets<HandleMaterial>>();
+        let z: Vec<Vec3> = pieces
+            .into_iter()
+            .filter(|(_, material)| materials.get(material).unwrap().handle.colour == blue)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(z.len(), 2, "a shaft and a head");
+        for at in z {
+            assert!(at.normalize().abs_diff_eq(Vec3::Y, 1e-5), "{at:?}");
+        }
+    }
+
+    /// Lines alone show three dashed lines and no arrows; taking the axes
+    /// away removes them too.
+    #[test]
+    fn lines_alone_show_three_lines_and_no_arrows() {
+        let mut app = app();
+        let body = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                FrameAxes {
+                    arrows: false,
+                    lines: Some(FrameLines {
+                        reach: 4.0,
+                        both_ways: false,
+                    }),
+                    ..default()
+                },
+            ))
+            .id();
+        app.update();
+        let count = |app: &mut App| {
+            let world = app.world_mut();
+            world.query::<&AxisLine>().iter(world).count()
+        };
+        assert_eq!(count(&mut app), 3);
+        assert_eq!(arrows(&mut app), 0);
+        app.world_mut().entity_mut(body).remove::<FrameAxes>();
+        app.update();
+        assert_eq!(count(&mut app), 0);
+    }
+
+    /// The arrows keep their length on a scaled node, a mirrored one too.
+    #[test]
+    fn a_scaled_frame_keeps_its_arrow_length() {
+        let GizmoSize::World(metres) = GIZMO_SIZE else {
+            panic!("the default is sized in the world");
+        };
+        for scale in [Vec3::new(2.0, 4.0, 0.5), Vec3::new(-1.0, 1.0, 1.0)] {
+            let mut app = app();
+            app.world_mut()
+                .spawn((Transform::from_scale(scale), FrameAxes::default()));
+            app.update();
+            app.update();
+            let global = *app
+                .world_mut()
+                .query_filtered::<&GlobalTransform, With<AxesOf>>()
+                .single(app.world())
+                .expect("one holder");
+            assert!(
+                global.scale().abs().abs_diff_eq(Vec3::splat(metres), 1e-5),
+                "{scale}: {:?}",
+                global.scale()
+            );
+        }
+    }
+}

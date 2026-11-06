@@ -66,7 +66,18 @@ the upgrade off the schedule of a repo that has not adopted it yet.
 | `instance` | `EntityInstance` — one entity being drawn: its GLB, its bindings, its camera, whether it is on screen yet | `bevy_ecs` |
 | `drawn` | when an instance is actually drawable, behind `view` | the whole engine |
 | `pick` | a pointer press resolved over the mesh **as drawn**, behind `view` | the whole engine |
+| `camera_input` | the editing camera's bindings over Bevy's pan-orbit controller: Studio's mouse scheme, gestures only from presses on the scene, every one about the view's target, behind `camera_input` | the whole engine and Bevy's camera controller |
+| `active_area` | the part of a view the user can see beside panels, which a camera frames its subject in, easing as the area changes, behind `view` | the whole engine |
+| `ghost` | draws everything beneath an entity as a ghost of itself, Studio's look, over its own material rather than replacing it, behind `view` | the whole engine |
 | `glow` | feature-edge selection marking, behind `view` | the whole engine |
+| `outline` | the selection outline: one line around the whole of what is selected, drawn over whatever stands in front of it, behind `view` | the whole engine |
+| `axes` | an entity's reference frame shown as three arrows along its own axes, off until a host asks for it, behind `view` | the whole engine |
+| `joint_gizmo` | a ring to turn a joint or a bar to slide it, within its limits and shaded to show its range, sharing the transform gizmo's look and pointer handling, behind `view` | the whole engine |
+| `transform_gizmo` | handles to move, turn and scale an entity — any of the three modes, together or one at a time — spawned on their own and pointed at a target, behind `view` | the whole engine |
+| `overlay` | what a host needs to draw labels and tooltips over the view: element and gizmo boxes on screen, and the gizmo the pointer has, by the host's names, each frame to a resource and a sink, behind `view` | the whole engine |
+| `view_offset` | the host's view offset, applied to each instance's camera so its subject stays centred beside a panel, behind `view` | the whole engine |
+| `view_gizmo` | the corner gizmo of labelled axes that turns with the camera; a press on a ball asks for the view down that axis, behind `view_gizmo` | the whole engine, and the UI stack |
+| `select` | what is selected, and which element meshes a selection covers, behind `view` | the whole engine |
 | `snapshot` | headless offscreen render and pixel readback, behind `snapshot` | the whole engine |
 
 Two features gate the modules that build a real Bevy app, because nothing
@@ -86,7 +97,8 @@ drawn. None of those is about what the asset is.
 the two look alike on one kind of geometry and not the other. Feature edges
 approximate a silhouette on nearly flat meshes with few creases — a face's 2D
 shapes — and read as a wireframe over a curved 3D body. One line around the
-whole of what is selected is a mask-and-dilate pass, and it is not here.
+whole of what is selected is a mask-and-dilate pass, and that is `outline`.
+Both read the same selections.
 
 It exists because **a frame is the only artifact that answers the question a
 renderer is asked.** Every cheaper signal is a proxy that can be right while

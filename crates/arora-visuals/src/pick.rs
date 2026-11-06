@@ -10,23 +10,39 @@
 //! one renderer's workaround.
 //!
 //! Bevy's picking is used only to deliver the press: with no mesh backend
-//! registered, every press reaches the window entity and is resolved here.
+//! registered, every press on the scene reaches the window entity and is
+//! resolved here. **A press that lands anywhere else is not the scene's.** A UI
+//! backend delivers a press on a panel to the panel's node, and resolving that
+//! one too would select whatever element happens to sit behind the panel.
 //!
-//! The press goes to the instances whose rectangle holds the pointer, the one
-//! drawn last first. The nearest element its ray meets is the pick; a press
-//! meeting no element of any of them is a miss of the topmost; a press outside
-//! every drawn rectangle belongs to no instance.
+//! The pointer goes to the instances whose rectangle holds it, the one drawn
+//! last first, and the nearest element its ray meets is the one under it.
+//!
+//! **A pick is a click, decided as Studio's scene decides one.** The press
+//! notes every element under the pointer; the release picks the element under
+//! it then, if that element was among them — however far the pointer moved
+//! in between, so a press and release on one element picks it. A release over
+//! no element is a miss of the topmost instance, but only if the pointer
+//! moved [`MISS_SLOP`] pixels or less: a drag that turns the view and ends
+//! over empty space is not a request to clear the selection. A release over a
+//! different element than any the press found picks nothing. A press or
+//! release outside every drawn rectangle belongs to no instance.
 
+use bevy::camera::primitives::Aabb;
 use bevy::ecs::system::SystemParam;
 use bevy::math::Affine3A;
-use bevy::mesh::morph::{MorphAttributes, MorphWeights};
+use bevy::mesh::morph::{MeshMorphWeights, MorphAttributes, MorphWeights};
 use bevy::mesh::{Indices, PrimitiveTopology};
-use bevy::picking::events::PointerPress;
+use std::collections::{HashMap, HashSet};
+
+use bevy::picking::events::{PointerPress, PointerRelease};
 use bevy::picking::mesh_picking::ray_cast::{ray_mesh_intersection, Backfaces};
+use bevy::picking::pointer::{PointerButton, PointerId};
 use bevy::prelude::*;
 
 use crate::binding::ElementTargets;
 use crate::instance::{EntityInstance, Superseded};
+use crate::transform_gizmo::GizmoPointer;
 
 /// A pointer press on an instance: the element under it, by the ids the
 /// asset's own `RobotData` declares, or `None` for a press that hit no
@@ -41,20 +57,51 @@ pub struct Picked {
 #[derive(Resource, Default)]
 pub struct Picks(pub Vec<Picked>);
 
-/// Resolve a press to a pick or a miss ([module docs](self)).
-pub fn on_press(
-    press: On<PointerPress>,
-    instances: Query<&EntityInstance, Without<Superseded>>,
-    cameras: Query<(&Camera, &GlobalTransform)>,
-    elements: ElementMeshes,
-    mut picks: ResMut<Picks>,
-) {
-    // The press bubbles up from its target; resolve it once.
-    if press.entity != press.original_event_target() {
-        return;
+/// How far, in logical pixels, the pointer may move between press and release
+/// and a release over nothing still count as a miss.
+pub const MISS_SLOP: f32 = 2.0;
+
+/// What each pointer's primary press found, kept until its release: a
+/// second finger or a mouse beside a touch keeps a press of its own, so one
+/// pointer's release never decides with another's press.
+#[derive(Resource, Default)]
+struct Pressed(HashMap<PointerId, Press>);
+
+struct Press {
+    position: Vec2,
+    /// Every `(instance id, element id)` under the pointer at the press.
+    under: HashSet<(String, String)>,
+}
+
+/// Picks and misses, decided on release as a click ([module docs](self)).
+pub struct PickPlugin;
+
+impl Plugin for PickPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<Picks>()
+            .init_resource::<Pressed>()
+            .init_resource::<ReleasedElsewhere>()
+            .add_observer(on_press)
+            .add_observer(on_release)
+            .add_systems(PostUpdate, forget_unreleased_press);
     }
-    let position = press.pointer.position;
-    let mut under: Vec<(&EntityInstance, &Camera, &GlobalTransform)> = instances
+}
+
+/// What the pointer is over at `position`: the element nearest it, every
+/// element under it, and the topmost instance whose rectangle holds it.
+struct Under {
+    nearest: Option<(String, String)>,
+    all: HashSet<(String, String)>,
+    topmost: Option<String>,
+}
+
+fn under(
+    position: Vec2,
+    instances: &Query<&EntityInstance, Without<Superseded>>,
+    cameras: &Query<(&Camera, &GlobalTransform)>,
+    elements: &ElementMeshes,
+) -> Under {
+    let mut held: Vec<(&EntityInstance, &Camera, &GlobalTransform)> = instances
         .iter()
         .filter(|instance| instance.ready)
         .filter_map(|instance| {
@@ -70,38 +117,163 @@ pub fn on_press(
     // Every element of every instance under the pointer, with the order of
     // the camera it was seen through. Collected across instances rather than
     // resolved one instance at a time: where several share a camera they
-    // share a ray, and the nearest of all of them is the pick.
+    // share a ray, and the nearest of all of them is the one under it.
     let mut hits: Vec<(isize, f32)> = Vec::new();
-    let mut hit_of: Vec<(usize, &String)> = Vec::new();
-    for (index, (instance, camera, transform)) in under.iter().enumerate() {
+    let mut hit_of: Vec<(String, String)> = Vec::new();
+    for (instance, camera, transform) in &held {
         let Ok(ray) = camera.viewport_to_world(transform, position) else {
             continue;
         };
         for (id, targets) in &instance.bindings.elements {
-            let Some(distance) = elements.drawn(targets).and_then(|mesh| mesh.hit(ray)) else {
+            let Some(distance) = elements.cast(targets, ray) else {
                 continue;
             };
             hits.push((camera.order, distance));
-            hit_of.push((index, id));
+            hit_of.push((instance.id.clone(), id.clone()));
         }
     }
-    if let Some(won) = winner(&hits) {
-        let (index, element_id) = hit_of[won];
-        let instance = under[index].0;
-        log::info!("{}: picked element {element_id}", instance.id);
-        picks.0.push(Picked {
-            instance_id: instance.id.clone(),
-            element_id: Some(element_id.clone()),
-        });
+    held.sort_by_key(|(_, camera, _)| std::cmp::Reverse(camera.order));
+    Under {
+        nearest: winner(&hits).map(|won| hit_of[won].clone()),
+        all: hit_of.into_iter().collect(),
+        topmost: held.first().map(|(instance, ..)| instance.id.clone()),
+    }
+}
+
+/// Whether a pointer event is the scene's: it bubbles up from its target, so
+/// it is taken once, and only where it landed on the window rather than on
+/// something drawn over the scene. The one rule every pointer handler here
+/// shares — picks, the camera's gestures, a gizmo's grab — so a press on a
+/// panel is never the scene's to any of them.
+///
+/// It leans on Bevy's picking reaching the window, which needs its pointer
+/// input and its window picking enabled, and on nothing else in the scene
+/// being pickable under the pointer: a mesh picking backend that picks this
+/// crate's handles or a host's meshes takes the press off the window.
+pub(crate) fn on_the_scene(
+    entity: Entity,
+    original: Entity,
+    windows: &Query<(), With<Window>>,
+) -> bool {
+    entity == original && windows.contains(entity)
+}
+
+/// Notes what a press found, for its release to decide by.
+fn on_press(
+    press: On<PointerPress>,
+    instances: Query<&EntityInstance, Without<Superseded>>,
+    cameras: Query<(&Camera, &GlobalTransform)>,
+    elements: ElementMeshes,
+    windows: Query<(), With<Window>>,
+    mut pressed: ResMut<Pressed>,
+) {
+    // A click is the primary button's, or a touch's.
+    if press.button != PointerButton::Primary
+        || !on_the_scene(press.entity, press.original_event_target(), &windows)
+    {
         return;
     }
-    under.sort_by_key(|(_, camera, _)| std::cmp::Reverse(camera.order));
-    if let Some((instance, _, _)) = under.first() {
-        log::info!("{}: a press on no element", instance.id);
-        picks.0.push(Picked {
-            instance_id: instance.id.clone(),
-            element_id: None,
-        });
+    // Whether the press takes a gizmo's handle is not known yet — the gizmo
+    // decides in `Update`, from where the pointer is now, after this — so it
+    // is decided at the release, by whether a gizmo drag is in hand then.
+    let position = press.pointer.position;
+    pressed.0.insert(
+        press.pointer.id,
+        Press {
+            position,
+            under: under(position, &instances, &cameras, &elements).all,
+        },
+    );
+}
+
+/// Decides a release as a pick, a miss or nothing ([module docs](self)).
+#[allow(clippy::too_many_arguments)]
+fn on_release(
+    release: On<PointerRelease>,
+    instances: Query<&EntityInstance, Without<Superseded>>,
+    cameras: Query<(&Camera, &GlobalTransform)>,
+    elements: ElementMeshes,
+    windows: Query<(), With<Window>>,
+    gizmos: Option<Res<GizmoPointer>>,
+    mut pressed: ResMut<Pressed>,
+    mut elsewhere: ResMut<ReleasedElsewhere>,
+    mut picks: ResMut<Picks>,
+) {
+    // A release bubbles from where it landed; take it once. A click is the
+    // primary button's, or a touch's.
+    if release.entity != release.original_event_target() || release.button != PointerButton::Primary
+    {
+        return;
+    }
+    let pointer = release.pointer.id;
+    // Only the window's release decides a pick. Bevy sends a release to
+    // everything hovered, in no set order — a label over the scene among
+    // them — so a release anywhere else leaves the press for the window's,
+    // and only notes that the press has been let go; see
+    // `forget_unreleased_press`.
+    if !windows.contains(release.entity) {
+        elsewhere.0.insert(pointer);
+        return;
+    }
+    let Some(press) = pressed.0.remove(&pointer) else {
+        return;
+    };
+    // A press that took a gizmo's handle is the gizmo's, and so is its
+    // release: the drag it began is still in hand as the release arrives,
+    // since the gizmo lets go only in `Update`, after this.
+    if gizmos.is_some_and(|gizmos| gizmos.dragging.is_some()) {
+        return;
+    }
+    let position = release.pointer.position;
+    let found = under(position, &instances, &cameras, &elements);
+    if let Some(picked) = decide(&press, found, position) {
+        match &picked.element_id {
+            Some(element) => log::info!("{}: picked element {element}", picked.instance_id),
+            None => log::info!("{}: a click on no element", picked.instance_id),
+        }
+        picks.0.push(picked);
+    }
+}
+
+/// The pointers whose release this frame landed somewhere other than the
+/// window.
+#[derive(Resource, Default)]
+struct ReleasedElsewhere(HashSet<PointerId>);
+
+/// Forgets a press that was let go this frame without a release on the
+/// window taking it — a press released over a panel. Left, it would pair with
+/// a later release back over the scene and pick something no click chose.
+/// Read from the release, not from mouse buttons, so a touch, which sets no
+/// mouse button, keeps its press while it is held. A release on the window is
+/// decided in `PreUpdate`, before this runs.
+fn forget_unreleased_press(mut elsewhere: ResMut<ReleasedElsewhere>, mut pressed: ResMut<Pressed>) {
+    for pointer in elsewhere.0.drain() {
+        pressed.0.remove(&pointer);
+    }
+}
+
+/// What a release decides, given what its press found and what is under the
+/// pointer now ([module docs](self)).
+fn decide(press: &Press, found: Under, position: Vec2) -> Option<Picked> {
+    match found.nearest {
+        Some(nearest) if press.under.contains(&nearest) => {
+            let (instance_id, element_id) = nearest;
+            Some(Picked {
+                instance_id,
+                element_id: Some(element_id),
+            })
+        }
+        // Over an element the press did not find: not a click on anything.
+        Some(_) => None,
+        None => {
+            if position.distance(press.position) > MISS_SLOP {
+                return None;
+            }
+            Some(Picked {
+                instance_id: found.topmost?,
+                element_id: None,
+            })
+        }
     }
 }
 
@@ -132,6 +304,8 @@ pub struct ElementMeshes<'w, 's> {
     handles: Query<'w, 's, &'static Mesh3d>,
     transforms: Query<'w, 's, &'static GlobalTransform>,
     weights: Query<'w, 's, &'static MorphWeights>,
+    mesh_weights: Query<'w, 's, &'static MeshMorphWeights>,
+    bounds: Query<'w, 's, &'static Aabb>,
 }
 
 impl ElementMeshes<'_, '_> {
@@ -142,6 +316,110 @@ impl ElementMeshes<'_, '_> {
         let mesh = self.meshes.get(handle)?;
         (mesh.primitive_topology() == PrimitiveTopology::TriangleList)
             .then_some((handle.id(), mesh))
+    }
+
+    /// Whether a morph is moving the element: any of its weights is not
+    /// zero, so its drawn vertices are not its base mesh's.
+    pub fn morphing(&self, targets: &ElementTargets) -> bool {
+        targets
+            .morph
+            .and_then(|entity| self.weights.get(entity).ok())
+            .is_some_and(|weights| weights.weights().iter().any(|weight| *weight != 0.0))
+    }
+
+    /// The corners, in the world, of a box sure to hold one mesh as it is
+    /// drawn: its bounding box where no morph moves it, and that box widened
+    /// by each morph target's offsets at that target's weight where one does.
+    ///
+    /// **Not its drawn vertices' box.** Building those costs every vertex of
+    /// every target, which a view paying it each frame for a speaking face
+    /// cannot afford. Each target's offsets are boxed once per mesh, in
+    /// `offsets`, and widening by them costs one step per target. The box is
+    /// conservative — each target widens it as far as that target alone could
+    /// — so it may be larger than the drawn shape, never smaller. A mesh's
+    /// weights are its own or its node's, as the mesh names them. `None` for
+    /// a mesh with no bounding box.
+    pub fn mesh_corners(&self, mesh: Entity, offsets: &mut MorphOffsets) -> Option<[Vec3; 8]> {
+        let aabb = self.bounds.get(mesh).ok()?;
+        let world = self.transforms.get(mesh).ok()?.affine();
+        let centre = Vec3::from(aabb.center);
+        let half = Vec3::from(aabb.half_extents);
+        let base = [centre - half, centre + half];
+        let weights: &[f32] = match self.mesh_weights.get(mesh) {
+            Ok(MeshMorphWeights::Value { weights }) => weights,
+            Ok(MeshMorphWeights::Reference(node)) => self
+                .weights
+                .get(*node)
+                .map(MorphWeights::weights)
+                .unwrap_or_default(),
+            Err(_) => &[],
+        };
+        let moving = weights.iter().any(|weight| *weight != 0.0);
+        let asset = self
+            .handles
+            .get(mesh)
+            .ok()
+            .and_then(|handle| Some((handle.0.id(), self.meshes.get(&handle.0)?)));
+        let [low, high] = match (moving, asset) {
+            (true, Some((id, asset))) => match asset.try_morph_targets().ok() {
+                Some(deltas) => {
+                    let vertices = asset.count_vertices();
+                    let held = offsets
+                        .0
+                        .entry(id)
+                        .and_modify(|held| {
+                            if held.0 != (vertices, deltas.len()) {
+                                *held =
+                                    ((vertices, deltas.len()), target_offsets(deltas, vertices));
+                            }
+                        })
+                        .or_insert_with(|| {
+                            ((vertices, deltas.len()), target_offsets(deltas, vertices))
+                        });
+                    widened(base, &held.1, weights)
+                }
+                None => base,
+            },
+            _ => base,
+        };
+        Some(std::array::from_fn(|corner| {
+            world.transform_point3(Vec3::new(
+                if corner & 1 == 0 { low.x } else { high.x },
+                if corner & 2 == 0 { low.y } else { high.y },
+                if corner & 4 == 0 { low.z } else { high.z },
+            ))
+        }))
+    }
+
+    /// The distance along `ray` to the nearest triangle of the element as it
+    /// is drawn, either side.
+    ///
+    /// **An element no morph is moving is cast where it stands**: a ray that
+    /// misses its bounding box misses it, and one that does not is met with
+    /// its own vertices under its transform, with nothing copied. A cast is
+    /// paid on every press, over every element, so building the whole
+    /// robot's vertices again each time is the cost to avoid. **An element a
+    /// morph is moving is cast as drawn**
+    /// ([`ElementMeshes::drawn`]), with no box first: the box is the base
+    /// mesh's, and a morph can carry vertices past it — an opened mouth
+    /// below a closed one's box — where a box test would miss a real hit.
+    pub fn cast(&self, targets: &ElementTargets, ray: Ray3d) -> Option<f32> {
+        if self.morphing(targets) {
+            return self.drawn(targets)?.hit(ray);
+        }
+        let entity = targets.mesh?;
+        let (_, mesh) = self.mesh(targets)?;
+        let world = self.transforms.get(entity).ok()?.affine();
+        if let Ok(aabb) = self.bounds.get(entity) {
+            if !ray_meets_box(ray, &world, aabb) {
+                return None;
+            }
+        }
+        let positions = mesh
+            .try_attribute(Mesh::ATTRIBUTE_POSITION)
+            .ok()?
+            .as_float3()?;
+        cast_triangles(ray, &world, positions, mesh.try_indices().ok())
     }
 
     /// The element's mesh as it is drawn this frame: its vertices with the
@@ -170,6 +448,46 @@ impl ElementMeshes<'_, '_> {
     }
 }
 
+/// Each mesh's morph targets' offset boxes, kept between frames by whoever
+/// widens boxes by them, and remade when a mesh's vertex or offset count
+/// changes.
+/// One mesh's held offset boxes, with the vertex and offset counts they were
+/// made from.
+type HeldOffsets = ((usize, usize), Vec<[Vec3; 2]>);
+
+#[derive(Default)]
+pub struct MorphOffsets(HashMap<AssetId<Mesh>, HeldOffsets>);
+
+/// The box of each morph target's offsets: `deltas` is every target's
+/// offsets in turn, `vertices` to a target.
+fn target_offsets(deltas: &[MorphAttributes], vertices: usize) -> Vec<[Vec3; 2]> {
+    if vertices == 0 {
+        return Vec::new();
+    }
+    deltas
+        .chunks(vertices)
+        .map(|target| {
+            target
+                .iter()
+                .fold([Vec3::ZERO, Vec3::ZERO], |[low, high], delta| {
+                    [low.min(delta.position), high.max(delta.position)]
+                })
+        })
+        .collect()
+}
+
+/// `base` widened by each target's offset box at its weight: as far as that
+/// target could carry any vertex, either way, for a negative weight too.
+fn widened(base: [Vec3; 2], offsets: &[[Vec3; 2]], weights: &[f32]) -> [Vec3; 2] {
+    offsets
+        .iter()
+        .zip(weights)
+        .fold(base, |[low, high], ([least, most], weight)| {
+            let (a, b) = (*least * *weight, *most * *weight);
+            [low + a.min(b), high + a.max(b)]
+        })
+}
+
 /// A mesh's triangles as drawn, in world space.
 pub struct DrawnMesh<'a> {
     pub positions: Vec<[f32; 3]>,
@@ -179,21 +497,62 @@ pub struct DrawnMesh<'a> {
 impl DrawnMesh<'_> {
     /// The distance along `ray` to the nearest triangle it meets, either
     /// side, since an asset's materials may be double-sided.
-    fn hit(&self, ray: Ray3d) -> Option<f32> {
-        let world = Affine3A::IDENTITY;
-        let cull = Backfaces::Include;
-        let positions = &self.positions;
-        match self.indices {
-            Some(Indices::U16(i)) => {
-                ray_mesh_intersection(ray, &world, positions, None, Some(i), None, cull)
-            }
-            Some(Indices::U32(i)) => {
-                ray_mesh_intersection(ray, &world, positions, None, Some(i), None, cull)
-            }
-            None => ray_mesh_intersection::<u32>(ray, &world, positions, None, None, None, cull),
-        }
-        .map(|hit| hit.distance)
+    pub(crate) fn hit(&self, ray: Ray3d) -> Option<f32> {
+        cast_triangles(ray, &Affine3A::IDENTITY, &self.positions, self.indices)
     }
+}
+
+/// The distance along `ray` to the nearest triangle of these, placed by
+/// `world`, either side, since an asset's materials may be double-sided.
+fn cast_triangles(
+    ray: Ray3d,
+    world: &Affine3A,
+    positions: &[[f32; 3]],
+    indices: Option<&Indices>,
+) -> Option<f32> {
+    let cull = Backfaces::Include;
+    match indices {
+        Some(Indices::U16(i)) => {
+            ray_mesh_intersection(ray, world, positions, None, Some(i), None, cull)
+        }
+        Some(Indices::U32(i)) => {
+            ray_mesh_intersection(ray, world, positions, None, Some(i), None, cull)
+        }
+        None => ray_mesh_intersection::<u32>(ray, world, positions, None, None, None, cull),
+    }
+    .map(|hit| hit.distance)
+}
+
+/// Whether `ray` meets a mesh's bounding box, the box in the mesh's own space
+/// and placed by `world`: the ray is carried into that space rather than the
+/// box out of it, so the box stays a box.
+fn ray_meets_box(ray: Ray3d, world: &Affine3A, aabb: &Aabb) -> bool {
+    let to_local = world.inverse();
+    let origin = to_local.transform_point3(ray.origin);
+    let direction = to_local.transform_vector3(*ray.direction);
+    let (min, max) = (
+        Vec3::from(aabb.center - aabb.half_extents),
+        Vec3::from(aabb.center + aabb.half_extents),
+    );
+    // The slab test: the ray is inside the box between where it has entered
+    // every pair of faces and before it has left any.
+    let (mut near, mut far) = (0.0_f32, f32::INFINITY);
+    for axis in 0..3 {
+        if direction[axis].abs() < f32::EPSILON {
+            if origin[axis] < min[axis] || origin[axis] > max[axis] {
+                return false;
+            }
+            continue;
+        }
+        let a = (min[axis] - origin[axis]) / direction[axis];
+        let b = (max[axis] - origin[axis]) / direction[axis];
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+        if near > far {
+            return false;
+        }
+    }
+    true
 }
 
 /// `base` positions moved by each morph target at its weight. `deltas` holds
@@ -227,6 +586,133 @@ pub fn morphed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box widened by a target at a weight holds wherever that target can
+    /// carry a vertex at it, a negative weight included, and a target at no
+    /// weight leaves it alone.
+    #[test]
+    fn a_widened_box_holds_what_the_morph_can_reach() {
+        let base = [Vec3::splat(-1.0), Vec3::splat(1.0)];
+        // One target that opens a mouth: down by up to 0.5, and no further up.
+        let offsets = [[Vec3::new(0.0, -0.5, 0.0), Vec3::ZERO]];
+        let [low, high] = widened(base, &offsets, &[1.0]);
+        assert_eq!(low, Vec3::new(-1.0, -1.5, -1.0));
+        assert_eq!(high, Vec3::splat(1.0));
+        let [low, high] = widened(base, &offsets, &[-2.0]);
+        assert_eq!(low, Vec3::splat(-1.0));
+        assert_eq!(high, Vec3::new(1.0, 2.0, 1.0));
+        assert_eq!(widened(base, &offsets, &[0.0]), base);
+    }
+
+    /// Each target's offsets are boxed apart from the others'.
+    #[test]
+    fn each_target_is_boxed_on_its_own() {
+        let offset = |y: f32| MorphAttributes::new(Vec3::new(0.0, y, 0.0), Vec3::ZERO, Vec3::ZERO);
+        let deltas = [offset(1.0), offset(0.5), offset(-2.0), offset(0.0)];
+        let boxes = target_offsets(&deltas, 2);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(boxes[0], [Vec3::ZERO, Vec3::new(0.0, 1.0, 0.0)]);
+        assert_eq!(boxes[1], [Vec3::new(0.0, -2.0, 0.0), Vec3::ZERO]);
+    }
+
+    /// A ray meets a placed box when it passes through it, and not when it
+    /// passes beside it or the box is behind it.
+    #[test]
+    fn a_ray_meets_a_box_it_passes_through() {
+        let aabb = Aabb::from_min_max(Vec3::splat(-1.0), Vec3::splat(1.0));
+        let world = Affine3A::from_translation(Vec3::new(5.0, 0.0, 0.0));
+        let toward = Ray3d::new(Vec3::ZERO, Dir3::X);
+        assert!(ray_meets_box(toward, &world, &aabb));
+        let beside = Ray3d::new(Vec3::new(0.0, 3.0, 0.0), Dir3::X);
+        assert!(!ray_meets_box(beside, &world, &aabb));
+        let away = Ray3d::new(Vec3::ZERO, Dir3::NEG_X);
+        assert!(!ray_meets_box(away, &world, &aabb));
+    }
+
+    /// A press is kept while it is held — by a touch too, which sets no
+    /// mouse button — and forgotten once let go somewhere other than the
+    /// window.
+    #[test]
+    fn a_press_released_elsewhere_is_forgotten() {
+        let mut app = App::new();
+        app.init_resource::<ReleasedElsewhere>()
+            .init_resource::<Pressed>()
+            .add_systems(Update, forget_unreleased_press);
+        let held = |app: &App, pointer: PointerId| {
+            app.world().resource::<Pressed>().0.contains_key(&pointer)
+        };
+        let touch = PointerId::Touch(1);
+        for pointer in [PointerId::Mouse, touch] {
+            app.world_mut().resource_mut::<Pressed>().0.insert(
+                pointer,
+                Press {
+                    position: Vec2::ZERO,
+                    under: HashSet::new(),
+                },
+            );
+        }
+        app.update();
+        app.update();
+        assert!(
+            held(&app, touch),
+            "held while not let go, with no mouse button down"
+        );
+        app.world_mut()
+            .resource_mut::<ReleasedElsewhere>()
+            .0
+            .insert(touch);
+        app.update();
+        assert!(!held(&app, touch), "forgotten once let go elsewhere");
+        assert!(
+            held(&app, PointerId::Mouse),
+            "another pointer's press is its own"
+        );
+    }
+
+    fn pair(element: &str) -> (String, String) {
+        ("robot".to_string(), element.to_string())
+    }
+
+    fn press_on(elements: &[&str], position: Vec2) -> Press {
+        Press {
+            position,
+            under: elements.iter().map(|element| pair(element)).collect(),
+        }
+    }
+
+    fn found(nearest: Option<&str>) -> Under {
+        Under {
+            nearest: nearest.map(pair),
+            all: HashSet::new(),
+            topmost: Some("robot".to_string()),
+        }
+    }
+
+    /// A release on an element the press found picks it, however far the
+    /// pointer moved between the two — as a click in Studio's scene does.
+    #[test]
+    fn a_release_on_an_element_the_press_found_picks_it() {
+        let press = press_on(&["head", "body"], Vec2::ZERO);
+        let picked = decide(&press, found(Some("body")), Vec2::new(80.0, 0.0)).unwrap();
+        assert_eq!(picked.element_id.as_deref(), Some("body"));
+    }
+
+    /// A release on an element the press never found is not a click on it.
+    #[test]
+    fn a_release_on_another_element_picks_nothing() {
+        let press = press_on(&["head"], Vec2::ZERO);
+        assert!(decide(&press, found(Some("arm")), Vec2::ZERO).is_none());
+    }
+
+    /// A release over nothing is a miss only within the slop: a drag that
+    /// turned the view and ended over empty space clears nothing.
+    #[test]
+    fn a_release_over_nothing_misses_only_within_the_slop() {
+        let press = press_on(&[], Vec2::ZERO);
+        let miss = decide(&press, found(None), Vec2::new(MISS_SLOP, 0.0)).unwrap();
+        assert!(miss.element_id.is_none());
+        assert!(decide(&press, found(None), Vec2::new(MISS_SLOP + 1.0, 0.0)).is_none());
+    }
 
     /// Instances on one camera resolve by depth, which is what a world with a
     /// single camera over it needs and what resolving one instance at a time
