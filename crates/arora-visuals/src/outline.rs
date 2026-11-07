@@ -515,7 +515,7 @@ fn fit_overlay(
         if *transform != wanted {
             *transform = wanted;
         }
-        *global = at.mul_transform(wanted);
+        global.set_if_neq(at.mul_transform(wanted));
     }
 }
 

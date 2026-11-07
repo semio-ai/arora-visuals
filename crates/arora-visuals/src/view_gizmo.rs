@@ -305,27 +305,27 @@ fn place_gizmos(
                     // turned to point along the axis, and moved out so it
                     // starts at the centre.
                     let reach = offset.length();
-                    *transform = UiTransform {
+                    transform.set_if_neq(UiTransform {
                         translation: Val2::px(
                             offset.x * UNIT * BAR_LENGTH / 2.0,
                             offset.y * UNIT * BAR_LENGTH / 2.0,
                         ),
                         scale: Vec2::new(reach.max(1e-3), 1.0),
                         rotation: Rot2::radians(offset.y.atan2(offset.x)),
-                    };
+                    });
                     depth * BAR_LENGTH / 2.0
                 }
                 Part::Ball { axis, positive } => {
                     let (offset, depth) = project(axis, if positive { 1.0 } else { -1.0 });
-                    *transform = UiTransform {
+                    transform.set_if_neq(UiTransform {
                         translation: Val2::px(offset.x * UNIT, offset.y * UNIT),
                         scale: Vec2::splat(if hovered { HOVERED } else { 1.0 }),
                         rotation: Rot2::IDENTITY,
-                    };
+                    });
                     depth
                 }
             };
-            *z = ZIndex((depth * 1000.0) as i32);
+            z.set_if_neq(ZIndex((depth * 1000.0) as i32));
         }
     }
 }

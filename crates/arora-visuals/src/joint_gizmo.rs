@@ -719,8 +719,8 @@ fn place_parts(
         let Some(unit) = unit_size(gizmo.size, camera, frame.centre) else {
             continue;
         };
-        *transform = Transform::IDENTITY;
-        *global = GlobalTransform::IDENTITY;
+        transform.set_if_neq(Transform::IDENTITY);
+        global.set_if_neq(GlobalTransform::IDENTITY);
 
         let range = gizmo.shown_range();
         let placed = match gizmo.motion {
@@ -744,8 +744,8 @@ fn place_parts(
             else {
                 continue;
             };
-            *at = placed;
-            *part_global = GlobalTransform::from(placed);
+            at.set_if_neq(placed);
+            part_global.set_if_neq(GlobalTransform::from(placed));
             let shown = part.hot == in_hand;
             let wanted = if shown {
                 Visibility::Inherited

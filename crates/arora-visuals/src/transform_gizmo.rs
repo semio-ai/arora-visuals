@@ -1397,6 +1397,11 @@ type Guides<'w, 's> = Query<
 /// transforms of the gizmo and its parts itself, or they would be drawn where
 /// they stood a frame ago and trail the view as it turns. That is also why a
 /// gizmo has to stand at the top of the hierarchy.
+///
+/// Every write is skipped when it would not change the value: a still view
+/// then leaves the gizmo's transforms and visibilities unchanged, so nothing
+/// downstream re-extracts them, and a host that draws only on change sees no
+/// change.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn place_parts(
@@ -1453,8 +1458,10 @@ fn place_parts(
             }
             place.facing = toward;
         }
-        *transform = Transform::from_translation(place.origin).with_scale(Vec3::splat(place.unit));
-        *global = GlobalTransform::from(*transform);
+        transform.set_if_neq(
+            Transform::from_translation(place.origin).with_scale(Vec3::splat(place.unit)),
+        );
+        global.set_if_neq(GlobalTransform::from(*transform));
         for child in children.iter() {
             let Ok((mut part, mut at, mut part_global, mut visibility, mut mesh, mut material)) =
                 parts.get_mut(child)
@@ -1474,19 +1481,19 @@ fn place_parts(
                     place.facing[(index + 2) % 3],
                 ),
             };
-            *at = Transform {
+            at.set_if_neq(Transform {
                 translation: turn * (part.offset * flip),
                 rotation: turn * Quat::from_rotation_arc(Vec3::Y, Vec3::X * flip.x),
                 scale: Vec3::ONE,
-            };
-            *part_global = global.mul_transform(*at);
+            });
+            part_global.set_if_neq(global.mul_transform(*at));
             let shown = part.handle.mode().is_some_and(|mode| gizmo.shows(mode))
                 && !(part.stem && gizmo.shows(TransformMode::Translate));
-            *visibility = if shown {
+            visibility.set_if_neq(if shown {
                 Visibility::Inherited
             } else {
                 Visibility::Hidden
-            };
+            });
             let is_hot = hot == Some((entity, part.handle));
             if part.hot != is_hot {
                 part.hot = is_hot;
@@ -1521,7 +1528,7 @@ fn place_parts(
             shown.set_if_neq(line(axis.0));
             // A guide stands at the gizmo's origin, which was placed by hand
             // after propagation; so is the guide.
-            *guide_global = *global;
+            guide_global.set_if_neq(*global);
         }
         for axis in wanted.into_iter().filter(|axis| !present.contains(axis)) {
             commands.spawn((
