@@ -45,14 +45,21 @@
 //! Drags are measured as the cursor's movement in logical pixels rather than
 //! the mouse's raw motion, so a pan keeps what was pressed under the pointer
 //! as the controller means it to.
+//!
+//! **A drag carries on past the window's edge**, as Studio's does: the cursor
+//! is followed through the moves the platform reports while the button is
+//! held, which go on outside the window — a browser captures the pointer to
+//! the canvas on the press — and not through the window's cursor position,
+//! which goes empty outside it. Followed that way, a drag out and back would
+//! stall at the edge and then jump by everything it travelled outside.
 
-use bevy::camera::RenderTarget;
+use bevy::camera::{NormalizedRenderTarget, RenderTarget};
+use bevy::camera_controller::pan_orbit_camera::SyncCameraPosition;
 use bevy::camera_controller::pan_orbit_camera::controller::momentum::Velocity;
 use bevy::camera_controller::pan_orbit_camera::controller::motion::CurrentMotion;
 use bevy::camera_controller::pan_orbit_camera::prelude::{
     DefaultPanOrbitCameraPlugins, PanOrbitCamera,
 };
-use bevy::camera_controller::pan_orbit_camera::SyncCameraPosition;
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::input::touch::TouchPhase;
@@ -60,7 +67,7 @@ use bevy::math::DVec3;
 use bevy::picking::events::{Pointer, PointerPress, PointerScroll};
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
-use bevy::window::PrimaryWindow;
+use bevy::window::{CursorMoved, PrimaryWindow};
 
 use crate::pick::on_the_scene;
 use crate::transform_gizmo::{GizmoPointer, TransformGizmoSystems};
@@ -112,10 +119,19 @@ impl Default for CameraBindings {
     }
 }
 
-/// The gesture in hand: its camera, the button holding it, and where the
-/// cursor was last frame.
+/// The gesture in hand.
 #[derive(Resource, Default)]
-struct Gesture(Option<(Entity, MouseButton, Vec2)>);
+struct Gesture(Option<Held>);
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Held {
+    camera: Entity,
+    button: MouseButton,
+    /// The window the press landed in, whose cursor the gesture follows.
+    window: Entity,
+    /// Where that cursor was last frame, in logical pixels.
+    last: Vec2,
+}
 
 /// Where a trackpad's scrolling stands, read from the phases its scrolls
 /// carry. The fingers' scrolling runs from a start to an end; the inertia
@@ -263,6 +279,10 @@ fn start_gesture(
         PointerButton::Middle => MouseButton::Middle,
     };
     let position = press.pointer.position;
+    let NormalizedRenderTarget::Window(window) = &press.pointer.target else {
+        return;
+    };
+    let window = window.entity();
     let Some(entity) = camera_under(&press.pointer, &all, &cameras) else {
         return;
     };
@@ -276,22 +296,35 @@ fn start_gesture(
     } else {
         return;
     }
-    gesture.0 = Some((entity, button, position));
+    gesture.0 = Some(Held {
+        camera: entity,
+        button,
+        window,
+        last: position,
+    });
 }
 
 /// Feeds the gesture in hand the cursor's movement, and ends it when its
 /// button comes up — at once, or carrying on, as the bindings ask.
 fn drag(
     buttons: Res<ButtonInput<MouseButton>>,
-    windows: Query<&Window>,
+    mut moves: MessageReader<CursorMoved>,
     gizmos: Option<Res<GizmoPointer>>,
     mut cameras: Query<(&mut PanOrbitCamera, &CameraBindings)>,
     mut gesture: ResMut<Gesture>,
 ) {
-    let Some((entity, button, last)) = gesture.0 else {
+    // Where the latest move in the gesture's window put the cursor, wherever
+    // that is relative to the window's bounds. Every move is read every
+    // frame, so a gesture's first frame sees only the moves since the frame
+    // before it, not ones queued while no gesture was in hand.
+    let moved = moves.read().fold(None, |latest, moved| match gesture.0 {
+        Some(held) if moved.window == held.window => Some(moved.position),
+        _ => latest,
+    });
+    let Some(held) = gesture.0 else {
         return;
     };
-    let Ok((mut controller, bindings)) = cameras.get_mut(entity) else {
+    let Ok((mut controller, bindings)) = cameras.get_mut(held.camera) else {
         gesture.0 = None;
         return;
     };
@@ -305,7 +338,7 @@ fn drag(
         gesture.0 = None;
         return;
     }
-    if !buttons.pressed(button) {
+    if !buttons.pressed(held.button) {
         controller.end_move();
         if !bindings.inertia {
             controller.current_motion = CurrentMotion::Stationary;
@@ -313,13 +346,17 @@ fn drag(
         gesture.0 = None;
         return;
     }
-    // Off the window the cursor has no position; the gesture holds still
-    // until it returns rather than ending.
-    let Some(cursor) = windows.iter().find_map(Window::cursor_position) else {
-        return;
-    };
-    controller.send_screenspace_input(cursor - last);
-    gesture.0 = Some((entity, button, cursor));
+    // The cursor is followed on the window or off it ([module docs](self)).
+    // The movement is sent every frame, zero when the cursor held still: the
+    // controller keeps applying the last input it was sent until another
+    // replaces it, so a frame that sent nothing would turn the view again by
+    // the previous frame's movement.
+    let cursor = moved.unwrap_or(held.last);
+    controller.send_screenspace_input(cursor - held.last);
+    gesture.0 = Some(Held {
+        last: cursor,
+        ..held
+    });
 }
 
 /// The camera's distance to its target after scrolling `pixels` — upward
@@ -504,6 +541,97 @@ mod tests {
         assert!(raised.forward().as_vec3().abs_diff_eq(facing, 1e-5));
         let above = Transform::from_xyz(0.0, 1.0, 3.0).looking_at(target, Vec3::Y);
         assert!(above_floor(&above, 3.0, floor).is_none());
+    }
+
+    /// A drag follows the cursor out past the window's edge and back, by
+    /// the moves the window reports, and ignores another window's. A frame
+    /// with no move sends no movement, rather than nothing, which would leave
+    /// the controller applying the movement before it.
+    #[test]
+    fn a_drag_follows_the_cursor_off_the_window_and_back() {
+        use bevy::camera_controller::pan_orbit_camera::controller::inputs::MotionInputs;
+
+        fn last_input(world: &mut World, camera: Entity) -> Option<Vec2> {
+            match &world.get::<PanOrbitCamera>(camera)?.current_motion {
+                CurrentMotion::UserControlled {
+                    motion_inputs:
+                        MotionInputs::OrbitZoom {
+                            screenspace_inputs, ..
+                        },
+                    ..
+                } => screenspace_inputs
+                    .iter_unsmoothed()
+                    .next()
+                    .map(|(_, input)| input),
+                _ => None,
+            }
+        }
+
+        let mut world = World::new();
+        world.init_resource::<Messages<CursorMoved>>();
+        let mut buttons = ButtonInput::<MouseButton>::default();
+        buttons.press(MouseButton::Left);
+        world.insert_resource(buttons);
+        let window = world.spawn_empty().id();
+        let other = world.spawn_empty().id();
+        let mut controller = PanOrbitCamera::default();
+        controller.start_orbit(None);
+        let camera = world.spawn((controller, CameraBindings::default())).id();
+        world.insert_resource(Gesture(Some(Held {
+            camera,
+            button: MouseButton::Left,
+            window,
+            last: Vec2::new(10.0, 10.0),
+        })));
+        // One system for the whole drag, as in an app, so its reader keeps its
+        // place between frames rather than rereading the frame before.
+        let drag = world.register_system(drag);
+        let step = |world: &mut World, moves: &[(Entity, Vec2)]| {
+            for &(window, position) in moves {
+                world.write_message(CursorMoved {
+                    window,
+                    position,
+                    delta: None,
+                });
+            }
+            world.run_system(drag).unwrap();
+            world.resource_mut::<Messages<CursorMoved>>().update();
+            world.resource::<Gesture>().0.map(|held| held.last)
+        };
+        let off = Vec2::new(-40.0, 10.0);
+        assert_eq!(
+            step(&mut world, &[(window, off)]),
+            Some(off),
+            "followed off the window"
+        );
+        assert_eq!(last_input(&mut world, camera), Some(Vec2::new(-50.0, 0.0)));
+        assert_eq!(
+            step(
+                &mut world,
+                &[
+                    (window, Vec2::new(-80.0, 12.0)),
+                    (other, Vec2::new(5.0, 5.0))
+                ]
+            ),
+            Some(Vec2::new(-80.0, 12.0)),
+            "another window's move is not the gesture's",
+        );
+        assert_eq!(
+            step(&mut world, &[]),
+            Some(Vec2::new(-80.0, 12.0)),
+            "no move is no movement"
+        );
+        assert_eq!(
+            last_input(&mut world, camera),
+            Some(Vec2::ZERO),
+            "and says so"
+        );
+        let back = Vec2::new(30.0, 12.0);
+        assert_eq!(
+            step(&mut world, &[(window, back)]),
+            Some(back),
+            "and back on"
+        );
     }
 
     /// Fingers that come back down after a pause start a gesture of their
