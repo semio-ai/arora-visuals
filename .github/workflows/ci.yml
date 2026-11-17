@@ -1,0 +1,44 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      # Bevy's windowing and input crates link these system libraries on
+      # Linux; without them the `view` features fail to build, not to test.
+      - name: Install Bevy's Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libasound2-dev libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Every feature at once: a consumer may enable any combination, and the
+      # gated modules are most of the crate. winit builds on Linux only with a
+      # display backend chosen, which a consumer's app does and a library
+      # leaves to it, so CI picks X11 here.
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features --features bevy/x11 -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --workspace --all-features --features bevy/x11
+
+      # The package a release would upload, built and checked from the
+      # packaged sources with every feature, so a file the package leaves out
+      # fails here rather than on publish, including one only a gated module
+      # reads.
+      - name: Package
+        run: cargo publish --locked -p arora-visuals --dry-run --all-features --features bevy/x11

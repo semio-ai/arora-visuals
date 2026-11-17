@@ -261,10 +261,10 @@ fn size_axes(
         if transform.scale != wanted {
             transform.scale = wanted;
         }
-        *global = at.mul_transform(*transform);
+        global.set_if_neq(at.mul_transform(*transform));
         for child in children.iter() {
             if let Ok((local, mut arrow)) = arrows.get_mut(child) {
-                *arrow = global.mul_transform(*local);
+                arrow.set_if_neq(global.mul_transform(*local));
             }
         }
     }

@@ -131,6 +131,28 @@ once and hands the same JSON to both parses. It composes rather than extends:
 it owns a struct holding an `AssetMeta` and its own parse, so neither can grow
 a dependency on the other.
 
+## Depending on it
+
+Take it from crates.io by version, with the features the consumer draws with:
+
+```toml
+arora-visuals = { version = "0.1", features = ["view"] }
+```
+
+**Every repo that links it must name it the same way.** Cargo identifies a
+dependency by its source, so a crate taken from crates.io by one repo and from
+git by another is two crates, and the types one hands the other do not match.
+A product that embeds a second product built on this crate — a robot scene
+showing a Vizij face — only links once if both take it from crates.io within
+one semver-compatible range.
+
+To build against a local checkout, put a `[patch.crates-io]` entry pointing at
+it in the consuming workspace's untracked `.cargo/config.toml`. A build under a
+path patch rewrites `Cargo.lock`, so restore the lockfile before committing.
+
+A release is a version bump on `main`: the release workflow publishes the
+crate whenever its manifest names a version crates.io does not have yet.
+
 ## Consumers
 
 - `arora-scene` — robots and world: the robot reading of `RobotData`, joints

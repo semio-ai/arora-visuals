@@ -312,9 +312,9 @@ fn place_lines(
             // the entity's transform can be undone; where it cannot, the
             // world placement is the one drawn, and the local is left alone
             // rather than set to what a singular inverse makes of it.
-            *global = placed;
+            global.set_if_neq(placed);
             if invertible {
-                *transform = placed.reparented_to(at);
+                transform.set_if_neq(placed.reparented_to(at));
             }
         }
     }
