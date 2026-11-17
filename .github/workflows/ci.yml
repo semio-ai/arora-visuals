@@ -27,12 +27,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # Every feature at once: a consumer may enable any combination, and the
-      # gated modules are most of the crate.
+      # gated modules are most of the crate. winit builds on Linux only with a
+      # display backend chosen, which a consumer's app does and a library
+      # leaves to it, so CI picks X11 here.
       - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features --features bevy/x11 -- -D warnings
 
       - name: Test
-        run: cargo test --locked --workspace --all-features
+        run: cargo test --locked --workspace --all-features --features bevy/x11
 
       # The package a release would upload, built and checked from the
       # packaged sources, so a file the package leaves out fails here rather
