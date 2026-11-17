@@ -7,6 +7,12 @@ on:
   push:
     branches: [main]
 
+# One release run at a time, none cancelled: two runs that both found the
+# version missing would both try to upload it.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -26,17 +32,21 @@ jobs:
             | jq -r '.packages[] | select(.name=="arora-visuals") | .version')
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
-      # crates.io requires a User-Agent; without one the API answers 403, the
-      # check reads as "not published", and the job tries a redundant upload.
+      # Only a 404 means the version is missing. Any other failure (a rate
+      # limit, a server error, a network fault) fails the run rather than
+      # trying an upload that may duplicate a published version. crates.io
+      # answers 403 to a request without a User-Agent.
       - name: Check whether crates.io has it
         id: published
         run: |
-          if curl -sf -H "User-Agent: arora-visuals-ci (github.com/semio-ai/arora-visuals)" \
-               "https://crates.io/api/v1/crates/arora-visuals/${{ steps.version.outputs.version }}" >/dev/null; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "User-Agent: arora-visuals-ci (github.com/semio-ai/arora-visuals)" \
+            "https://crates.io/api/v1/crates/arora-visuals/${{ steps.version.outputs.version }}")
+          case "$status" in
+            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::crates.io answered $status; cannot tell whether the version exists"; exit 1 ;;
+          esac
 
       # Trusted publishing exchanges this workflow's GitHub identity for a
       # short-lived crates.io token. It needs the crate to exist already, with

@@ -37,7 +37,8 @@ jobs:
         run: cargo test --locked --workspace --all-features --features bevy/x11
 
       # The package a release would upload, built and checked from the
-      # packaged sources, so a file the package leaves out fails here rather
-      # than on publish.
+      # packaged sources with every feature, so a file the package leaves out
+      # fails here rather than on publish, including one only a gated module
+      # reads.
       - name: Package
-        run: cargo publish --locked -p arora-visuals --dry-run
+        run: cargo publish --locked -p arora-visuals --dry-run --all-features --features bevy/x11
