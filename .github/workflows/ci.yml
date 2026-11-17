@@ -1,0 +1,41 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      # Bevy's windowing and input crates link these system libraries on
+      # Linux; without them the `view` features fail to build, not to test.
+      - name: Install Bevy's Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libasound2-dev libwayland-dev libxkbcommon-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Every feature at once: a consumer may enable any combination, and the
+      # gated modules are most of the crate.
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --workspace --all-features
+
+      # The package a release would upload, built and checked from the
+      # packaged sources, so a file the package leaves out fails here rather
+      # than on publish.
+      - name: Package
+        run: cargo publish --locked -p arora-visuals --dry-run

@@ -1,0 +1,57 @@
+name: Release
+
+# Publishes arora-visuals to crates.io on push to main, when its manifest names
+# a version crates.io does not have yet. A release is therefore a version bump;
+# a merge that leaves the version alone publishes nothing.
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # crates.io trusted publishing (OIDC): no stored token
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Read the manifest version
+        id: version
+        run: |
+          ver=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name=="arora-visuals") | .version')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+
+      # crates.io requires a User-Agent; without one the API answers 403, the
+      # check reads as "not published", and the job tries a redundant upload.
+      - name: Check whether crates.io has it
+        id: published
+        run: |
+          if curl -sf -H "User-Agent: arora-visuals-ci (github.com/semio-ai/arora-visuals)" \
+               "https://crates.io/api/v1/crates/arora-visuals/${{ steps.version.outputs.version }}" >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Trusted publishing exchanges this workflow's GitHub identity for a
+      # short-lived crates.io token. It needs the crate to exist already, with
+      # this repository and workflow registered as its Trusted Publisher.
+      - name: Authenticate to crates.io
+        if: steps.published.outputs.exists == 'false'
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Install Bevy's Linux dependencies
+        if: steps.published.outputs.exists == 'false'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libudev-dev libasound2-dev libwayland-dev libxkbcommon-dev
+
+      - name: Publish
+        if: steps.published.outputs.exists == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked -p arora-visuals
