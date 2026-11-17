@@ -178,11 +178,11 @@ fn build_gizmos(
                 Pickable::IGNORE,
             ))
             .with_children(|root| {
-                for axis in 0..3 {
+                for (axis, colour) in gizmo.colours.iter().enumerate() {
                     root.spawn((
                         Part::Bar(axis),
                         centred(UNIT * BAR_LENGTH, BAR_THICKNESS),
-                        BackgroundColor(gizmo.colours[axis]),
+                        BackgroundColor(*colour),
                         Pickable::IGNORE,
                     ));
                 }
