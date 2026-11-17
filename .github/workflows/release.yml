@@ -3,6 +3,11 @@ name: Release
 # Publishes arora-visuals to crates.io on push to main, when its manifest names
 # a version crates.io does not have yet. A release is therefore a version bump;
 # a merge that leaves the version alone publishes nothing.
+#
+# Until the crate is on crates.io at all, this publishes nothing and says so.
+# crates.io takes a new crate's first upload only from a person: trusted
+# publishing is configured on a crate that already exists. The README's
+# "Releasing" section has the steps; after them, this workflow takes over.
 on:
   push:
     branches: [main]
@@ -32,16 +37,28 @@ jobs:
             | jq -r '.packages[] | select(.name=="arora-visuals") | .version')
           echo "version=$ver" >> "$GITHUB_OUTPUT"
 
-      # Only a 404 means the version is missing. Any other failure (a rate
-      # limit, a server error, a network fault) fails the run rather than
-      # trying an upload that may duplicate a published version. crates.io
-      # answers 403 to a request without a User-Agent.
+      # Only a 404 means the crate, or the version, is missing. Any other
+      # failure (a rate limit, a server error, a network fault) fails the run
+      # rather than trying an upload that may duplicate a published version.
+      # crates.io answers 403 to a request without a User-Agent.
       - name: Check whether crates.io has it
         id: published
         run: |
-          status=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "User-Agent: arora-visuals-ci (github.com/semio-ai/arora-visuals)" \
-            "https://crates.io/api/v1/crates/arora-visuals/${{ steps.version.outputs.version }}")
+          ask() {
+            curl -s -o /dev/null -w '%{http_code}' \
+              -H "User-Agent: arora-visuals-ci (github.com/semio-ai/arora-visuals)" \
+              "https://crates.io/api/v1/crates/$1"
+          }
+          crate=$(ask arora-visuals)
+          case "$crate" in
+            200) ;;
+            404)
+              echo "::notice::arora-visuals is not on crates.io yet; its first upload is a person's (see the README's Releasing section), so nothing is published"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+            *) echo "::error::crates.io answered $crate; cannot tell whether the crate exists"; exit 1 ;;
+          esac
+          status=$(ask "arora-visuals/${{ steps.version.outputs.version }}")
           case "$status" in
             200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
             404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;

@@ -133,25 +133,48 @@ a dependency on the other.
 
 ## Depending on it
 
-Take it from crates.io by version, with the features the consumer draws with:
+**It is not on crates.io yet**, so take it from this repository's `main`,
+with the features the consumer draws with:
 
 ```toml
-arora-visuals = { version = "0.1", features = ["view"] }
+arora-visuals = { git = "https://github.com/semio-ai/arora-visuals", branch = "main", features = ["view"] }
 ```
+
+`Cargo.lock` pins the commit, so a build is reproducible even though `main`
+moves. Once the crate is published, consumers move to a version instead:
+`arora-visuals = { version = "0.1", features = ["view"] }`.
 
 **Every repo that links it must name it the same way.** Cargo identifies a
 dependency by its source, so a crate taken from crates.io by one repo and from
 git by another is two crates, and the types one hands the other do not match.
-A product that embeds a second product built on this crate — a robot scene
-showing a Vizij face — only links once if both take it from crates.io within
-one semver-compatible range.
+A product that embeds a second product built on this crate (a robot scene
+showing a Vizij face) links it once only if both take it from the same place:
+the same git URL and branch now, the same semver-compatible range on
+crates.io later. Publishing is what makes the second one possible, and is
+needed once a second product links the crate.
 
-To build against a local checkout, put a `[patch.crates-io]` entry pointing at
-it in the consuming workspace's untracked `.cargo/config.toml`. A build under a
-path patch rewrites `Cargo.lock`, so restore the lockfile before committing.
+To build against a local checkout, put a `[patch]` entry pointing at it in the
+consuming workspace's untracked `.cargo/config.toml`:
+`[patch."https://github.com/semio-ai/arora-visuals"]` while consumers take it
+from git, `[patch.crates-io]` once they take it from crates.io. A build under
+a path patch rewrites `Cargo.lock`, so restore the lockfile before committing.
 
-A release is a version bump on `main`: the release workflow publishes the
-crate whenever its manifest names a version crates.io does not have yet.
+## Releasing
+
+Arora's crates are published from their repositories and owned on crates.io
+by the `github:semio-ai:studio` team; this crate follows the same pattern.
+
+1. **The first upload is a person's.** crates.io configures trusted
+   publishing only on a crate that already exists, so a member of the studio
+   team runs `cargo publish -p arora-visuals` from `main`.
+2. **Then the team owns it:** `cargo owner --add github:semio-ai:studio
+   arora-visuals`.
+3. **Then CI publishes.** On crates.io, under the crate's Settings → Trusted
+   Publishing, add `semio-ai/arora-visuals` with the workflow `release.yml`.
+
+From then on a release is a version bump on `main`: the release workflow
+publishes whenever the manifest names a version crates.io does not have yet.
+Until step 1, that workflow publishes nothing and says so in its run.
 
 ## Consumers
 
