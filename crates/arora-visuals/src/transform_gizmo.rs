@@ -633,20 +633,22 @@ fn note_scene_press(
 }
 
 /// The handle a press with `button` is the host's on, if it is: any button
-/// but the primary, on the handle under the pointer, while no handle is
-/// held. A held handle stays `hovered` for the whole drag, wherever the
-/// pointer goes, so a press during one is on nothing in particular.
+/// but the primary, on the handle `under` the press, while no handle is held.
 ///
-/// It reads the hover the last frame left: picking triggers presses in
-/// `PreUpdate`, before [`drive`] recomputes the hover in `Update`.
+/// `under` is asked at the press's own position rather than read from
+/// [`GizmoPointer::hovered`], which the last frame left: a pointer that
+/// moved onto or off a handle and pressed between two frames would be taken
+/// for where it was. During a drag the held handle stays hovered wherever
+/// the pointer goes, so a press then is on nothing in particular.
 pub(crate) fn hosts_press(
     button: PointerButton,
     pointer: &GizmoPointer,
+    under: impl FnOnce() -> Option<(Entity, GizmoHandle)>,
 ) -> Option<(Entity, GizmoHandle)> {
     if button == PointerButton::Primary || pointer.dragging.is_some() {
         return None;
     }
-    pointer.hovered
+    under()
 }
 
 /// Whether a part looks as the one in hand does: its handle is the one the
@@ -665,12 +667,14 @@ fn report_other_press(
     press: On<PointerPress>,
     windows: Query<(), With<Window>>,
     pointer: Res<GizmoPointer>,
+    finder: HandleFinder,
     mut commands: Commands,
 ) {
     if !on_the_scene(press.entity, press.original_event_target(), &windows) {
         return;
     }
-    if let Some((entity, handle)) = hosts_press(press.button, &pointer) {
+    let position = press.pointer.position;
+    if let Some((entity, handle)) = hosts_press(press.button, &pointer, || finder.at(position)) {
         commands.trigger(GizmoPress {
             entity,
             handle,
@@ -1107,6 +1111,146 @@ enum Candidate {
     Joint(Entity, JointReach, Ray3d),
 }
 
+impl Candidate {
+    /// The gizmo and the handle this is.
+    fn grip(&self) -> (Entity, GizmoHandle) {
+        match self {
+            Candidate::Transform(entity, handle, ..) => (*entity, *handle),
+            Candidate::Joint(entity, ..) => (*entity, GizmoHandle::Joint),
+        }
+    }
+}
+
+/// The handle nearest `cursor` within reach, of any visible gizmo, through
+/// each gizmo's own camera: what the pointer is over. Hover, a take and a
+/// press with another button all ask this one search, so they cannot
+/// disagree about what a pointer is on.
+fn nearest_handle<'a>(
+    cursor: Vec2,
+    gizmos: impl Iterator<
+        Item = (
+            Entity,
+            &'a TransformGizmo,
+            &'a InheritedVisibility,
+            Option<&'a Facing>,
+        ),
+    >,
+    joints: impl Iterator<
+        Item = (
+            Entity,
+            &'a JointGizmo,
+            Option<&'a Rest>,
+            &'a InheritedVisibility,
+        ),
+    >,
+    cameras: &Query<(&Camera, &GlobalTransform)>,
+    globals: &Query<&GlobalTransform>,
+    parent_of: impl Fn(Entity) -> GlobalTransform,
+) -> Option<Candidate> {
+    let mut nearest: Option<(f32, Candidate)> = None;
+    let mut offer = |distance: f32, candidate: Candidate| {
+        if distance <= REACH_PX && nearest.as_ref().is_none_or(|(best, _)| distance < *best) {
+            nearest = Some((distance, candidate));
+        }
+    };
+    for (entity, gizmo, visible, facing) in gizmos {
+        if !visible.get() {
+            continue;
+        }
+        // Facing comes with the parts; until they are built, nothing shows.
+        let Some(facing) = facing else {
+            continue;
+        };
+        let (Ok(camera), Ok(target)) = (cameras.get(gizmo.camera), globals.get(gizmo.target))
+        else {
+            continue;
+        };
+        let Ok(ray) = camera.0.viewport_to_world(camera.1, cursor) else {
+            continue;
+        };
+        let Some(place) = placement(gizmo, facing.0, target, camera) else {
+            continue;
+        };
+        for handle in GizmoHandle::ALL {
+            if !handle.mode().is_some_and(|mode| gizmo.shows(mode)) {
+                continue;
+            }
+            if let Some(distance) = distance_to(handle, &place, cursor, ray, camera) {
+                offer(distance, Candidate::Transform(entity, handle, place, ray));
+            }
+        }
+    }
+    for (entity, gizmo, rest, visible) in joints {
+        if !visible.get() {
+            continue;
+        }
+        let Ok(camera) = cameras.get(gizmo.camera) else {
+            continue;
+        };
+        let Ok(ray) = camera.0.viewport_to_world(camera.1, cursor) else {
+            continue;
+        };
+        let Some(reach) = joint_reach(gizmo, rest, &parent_of(gizmo.target), camera) else {
+            continue;
+        };
+        if let Some(distance) = joint_distance(gizmo, &reach, cursor, camera) {
+            offer(distance, Candidate::Joint(entity, reach, ray));
+        }
+    }
+    nearest.map(|(_, candidate)| candidate)
+}
+
+/// What [`nearest_handle`] reads, for an observer that asks it of a press.
+#[derive(bevy::ecs::system::SystemParam)]
+pub(crate) struct HandleFinder<'w, 's> {
+    gizmos: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static TransformGizmo,
+            &'static InheritedVisibility,
+            Option<&'static Facing>,
+        ),
+    >,
+    joints: Query<
+        'w,
+        's,
+        (
+            Entity,
+            &'static JointGizmo,
+            Option<&'static Rest>,
+            &'static InheritedVisibility,
+        ),
+    >,
+    cameras: Query<'w, 's, (&'static Camera, &'static GlobalTransform)>,
+    globals: Query<'w, 's, &'static GlobalTransform>,
+    parents: Query<'w, 's, &'static ChildOf>,
+}
+
+impl HandleFinder<'_, '_> {
+    /// The gizmo and handle under `position`, in the window's logical pixels.
+    pub(crate) fn at(&self, position: Vec2) -> Option<(Entity, GizmoHandle)> {
+        let parent_of = |target: Entity| {
+            self.parents
+                .get(target)
+                .ok()
+                .and_then(|child_of| self.globals.get(child_of.parent()).ok())
+                .copied()
+                .unwrap_or(GlobalTransform::IDENTITY)
+        };
+        nearest_handle(
+            position,
+            self.gizmos.iter(),
+            self.joints.iter(),
+            &self.cameras,
+            &self.globals,
+            parent_of,
+        )
+        .map(|candidate| candidate.grip())
+    }
+}
+
 /// Finds the handle under the pointer, and takes, drags and lets go of
 /// handles with the left button — for transform and joint gizmos alike, so
 /// whichever handle of either is nearest the pointer is the one taken.
@@ -1249,63 +1393,17 @@ fn drive(
     let Some(cursor) = cursor else {
         return;
     };
-    let mut nearest: Option<(f32, Candidate)> = None;
-    let mut offer = |distance: f32, candidate: Candidate| {
-        if distance <= REACH_PX && nearest.as_ref().is_none_or(|(best, _)| distance < *best) {
-            nearest = Some((distance, candidate));
-        }
-    };
-    for (entity, gizmo, visible, facing) in &gizmos {
-        if !visible.get() {
-            continue;
-        }
-        // Facing comes with the parts; until they are built, nothing shows.
-        let Some(facing) = facing else {
-            continue;
-        };
-        let (Ok(camera), Ok(target)) = (cameras.get(gizmo.camera), globals.get(gizmo.target))
-        else {
-            continue;
-        };
-        let Ok(ray) = camera.0.viewport_to_world(camera.1, cursor) else {
-            continue;
-        };
-        let Some(place) = placement(gizmo, facing.0, target, camera) else {
-            continue;
-        };
-        for handle in GizmoHandle::ALL {
-            if !handle.mode().is_some_and(|mode| gizmo.shows(mode)) {
-                continue;
-            }
-            if let Some(distance) = distance_to(handle, &place, cursor, ray, camera) {
-                offer(distance, Candidate::Transform(entity, handle, place, ray));
-            }
-        }
-    }
-    for (entity, gizmo, rest, visible) in &joints {
-        if !visible.get() {
-            continue;
-        }
-        let Ok(camera) = cameras.get(gizmo.camera) else {
-            continue;
-        };
-        let Ok(ray) = camera.0.viewport_to_world(camera.1, cursor) else {
-            continue;
-        };
-        let Some(reach) = joint_reach(gizmo, rest, &parent_of(gizmo.target), camera) else {
-            continue;
-        };
-        if let Some(distance) = joint_distance(gizmo, &reach, cursor, camera) {
-            offer(distance, Candidate::Joint(entity, reach, ray));
-        }
-    }
-    let Some((_, candidate)) = nearest else {
+    let Some(candidate) = nearest_handle(
+        cursor,
+        gizmos.iter(),
+        joints.iter(),
+        &cameras,
+        &globals,
+        parent_of,
+    ) else {
         return;
     };
-    let hovered = match &candidate {
-        Candidate::Transform(entity, handle, ..) => (*entity, *handle),
-        Candidate::Joint(entity, ..) => (*entity, GizmoHandle::Joint),
-    };
+    let hovered = candidate.grip();
     pointer.hovered = Some(hovered);
 
     if !buttons.just_pressed(MouseButton::Left) || !on_scene {
@@ -1619,42 +1717,56 @@ mod tests {
     use super::*;
 
     /// A press with a button other than the primary on a handle is the
-    /// host's; the primary's never is, nor a press over no handle.
+    /// host's, by the handle under the press, whatever the last frame left
+    /// hovered; the primary's never is, nor a press over no handle, nor one
+    /// during a drag.
     #[test]
     fn only_another_buttons_press_on_a_handle_is_the_hosts() {
-        let gizmo = Entity::from_raw_u32(7).unwrap();
-        let over = GizmoPointer {
-            hovered: Some((gizmo, GizmoHandle::Ring(2))),
+        let [gizmo, stale] = [7, 8].map(|i| Entity::from_raw_u32(i).unwrap());
+        let ring = (gizmo, GizmoHandle::Ring(2));
+        let left_over = GizmoPointer {
+            hovered: Some((stale, GizmoHandle::Arrow(0))),
             ..default()
         };
         assert_eq!(
-            hosts_press(PointerButton::Secondary, &over),
-            Some((gizmo, GizmoHandle::Ring(2)))
+            hosts_press(PointerButton::Secondary, &left_over, || Some(ring)),
+            Some(ring),
+            "the handle under the press, not the one last hovered"
         );
         assert_eq!(
-            hosts_press(PointerButton::Middle, &over),
-            Some((gizmo, GizmoHandle::Ring(2)))
+            hosts_press(PointerButton::Middle, &GizmoPointer::default(), || Some(
+                ring
+            )),
+            Some(ring)
         );
-        assert_eq!(hosts_press(PointerButton::Primary, &over), None);
         assert_eq!(
-            hosts_press(PointerButton::Secondary, &GizmoPointer::default()),
+            hosts_press(PointerButton::Secondary, &left_over, || None),
+            None,
+            "moved off the handle hovered last frame"
+        );
+        assert_eq!(
+            hosts_press(PointerButton::Primary, &GizmoPointer::default(), || Some(
+                ring
+            )),
             None
         );
         let held = GizmoPointer {
-            dragging: Some((gizmo, GizmoHandle::Ring(2))),
-            ..over
+            hovered: Some(ring),
+            dragging: Some(ring),
+            ..default()
         };
         assert_eq!(
-            hosts_press(PointerButton::Secondary, &held),
+            hosts_press(PointerButton::Secondary, &held, || Some(ring)),
             None,
             "a press during a drag is on no handle"
         );
     }
 
-    /// A secondary press on the window, over a handle, triggers a
-    /// `GizmoPress` for it; a primary one, or one during a drag, does not.
+    /// A press triggers no `GizmoPress` when nothing is under it, though the
+    /// last frame left a handle hovered: the observer asks where the press
+    /// is, rather than trusting a hover the pointer may have left since.
     #[test]
-    fn a_press_with_another_button_triggers_a_gizmo_press() {
+    fn a_press_over_nothing_triggers_no_gizmo_press_whatever_was_hovered() {
         use bevy::camera::NormalizedRenderTarget;
         use bevy::picking::backend::HitData;
         use bevy::picking::events::Pointer;
@@ -1662,50 +1774,35 @@ mod tests {
         use bevy::window::WindowRef;
 
         #[derive(Resource, Default)]
-        struct Heard(Vec<(Entity, GizmoHandle, PointerButton)>);
+        struct Heard(usize);
 
         let mut world = World::new();
         world.init_resource::<Heard>();
         world.add_observer(report_other_press);
-        world.add_observer(|press: On<GizmoPress>, mut heard: ResMut<Heard>| {
-            heard.0.push((press.entity, press.handle, press.button));
-        });
+        world.add_observer(|_: On<GizmoPress>, mut heard: ResMut<Heard>| heard.0 += 1);
         let window = world.spawn(Window::default()).id();
         let gizmo = world.spawn_empty().id();
-        let press = |world: &mut World, button, pointer: GizmoPointer| {
-            world.insert_resource(pointer);
-            let target =
-                NormalizedRenderTarget::Window(WindowRef::Entity(window).normalize(None).unwrap());
-            world.trigger(PointerPress {
-                entity: window,
-                pointer: Pointer::new(
-                    PointerId::Mouse,
-                    Location {
-                        target,
-                        position: Vec2::new(5.0, 5.0),
-                    },
-                ),
-                button,
-                hit: HitData::new(window, 0.0, None, None),
-                count: 1,
-            });
-            world.flush();
-            std::mem::take(&mut world.resource_mut::<Heard>().0)
-        };
-        let over = || GizmoPointer {
+        world.insert_resource(GizmoPointer {
             hovered: Some((gizmo, GizmoHandle::Arrow(0))),
             ..default()
-        };
-        assert_eq!(
-            press(&mut world, PointerButton::Secondary, over()),
-            vec![(gizmo, GizmoHandle::Arrow(0), PointerButton::Secondary)]
-        );
-        assert!(press(&mut world, PointerButton::Primary, over()).is_empty());
-        let held = GizmoPointer {
-            dragging: Some((gizmo, GizmoHandle::Arrow(0))),
-            ..over()
-        };
-        assert!(press(&mut world, PointerButton::Secondary, held).is_empty());
+        });
+        let target =
+            NormalizedRenderTarget::Window(WindowRef::Entity(window).normalize(None).unwrap());
+        world.trigger(PointerPress {
+            entity: window,
+            pointer: Pointer::new(
+                PointerId::Mouse,
+                Location {
+                    target,
+                    position: Vec2::new(5.0, 5.0),
+                },
+            ),
+            button: PointerButton::Secondary,
+            hit: HitData::new(window, 0.0, None, None),
+            count: 1,
+        });
+        world.flush();
+        assert_eq!(world.resource::<Heard>().0, 0);
     }
 
     /// A highlighted handle looks hot without the pointer; the others, and

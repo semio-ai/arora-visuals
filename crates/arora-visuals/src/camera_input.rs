@@ -72,7 +72,7 @@ use bevy::prelude::*;
 use bevy::window::{CursorMoved, PrimaryWindow};
 
 use crate::pick::on_the_scene;
-use crate::transform_gizmo::{hosts_press, GizmoPointer, TransformGizmoSystems};
+use crate::transform_gizmo::{hosts_press, GizmoPointer, HandleFinder, TransformGizmoSystems};
 
 /// Which inputs move a camera ([module docs](self)).
 #[derive(Component, Clone, Copy, Debug)]
@@ -261,6 +261,7 @@ fn start_gesture(
     press: On<PointerPress>,
     windows: Query<(), With<Window>>,
     gizmos: Option<Res<GizmoPointer>>,
+    finder: HandleFinder,
     all: AllCameras,
     mut cameras: Cameras,
     mut gesture: ResMut<Gesture>,
@@ -273,8 +274,10 @@ fn start_gesture(
     // (`GizmoPress`). A primary press on a handle the pointer is merely over
     // may never take it, and when it does, the gesture gives way to it at
     // once (`drag`).
+    let position = press.pointer.position;
     if gizmos.as_ref().is_some_and(|gizmos| {
-        gizmos.dragging.is_some() || hosts_press(press.button, gizmos).is_some()
+        gizmos.dragging.is_some()
+            || hosts_press(press.button, gizmos, || finder.at(position)).is_some()
     }) || gesture.0.is_some()
     {
         return;
