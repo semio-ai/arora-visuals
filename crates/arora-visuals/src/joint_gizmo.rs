@@ -94,8 +94,10 @@ pub struct JointGizmo {
     /// Pose the body from `value`. Without it the gizmo only keeps `value`.
     pub apply: bool,
     /// Draw the gizmo as though it were in hand, without its being so: the
-    /// look of a held control, for a still image. It takes nothing from the
-    /// pointer, so the view and every other control work as ever.
+    /// look of a held control, for a still image, or for a host pointing at
+    /// this control from elsewhere, such as the row for it in a list beside
+    /// the view. It takes nothing from the pointer, so the view and every
+    /// other control work as ever.
     pub show_in_hand: bool,
     /// What the host calls this gizmo: the name it goes by in the
     /// [overlay](crate::overlay), where an entity id would mean nothing. Any
