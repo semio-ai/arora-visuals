@@ -336,8 +336,8 @@ pub struct GizmoPointer {
     pub hovered: Option<(Entity, GizmoHandle)>,
     /// The handle being dragged, and its gizmo.
     pub dragging: Option<(Entity, GizmoHandle)>,
-    /// A drag its gizmo ended by going inert, while the button that took it
-    /// is still down. Nothing is held, but the press is still the gizmo's:
+    /// A drag ended by its gizmo going inert or being taken away, while the
+    /// button that took it is still down. Nothing is held, but the press is still the gizmo's:
     /// its release is no click, and the view does not take it up. See
     /// [`GizmoPointer::owns_button`].
     pub ended: Option<(Entity, GizmoHandle)>,
@@ -428,7 +428,8 @@ impl GizmoPointer {
     }
 
     /// Whether the left button now down is a gizmo's: it took a handle, and
-    /// the drag is in hand or was ended by its gizmo going inert. Until it
+    /// the drag is in hand or was ended by its gizmo going inert or being
+    /// taken away. Until it
     /// comes up, its release is not a click and no gesture of the view's
     /// starts from it.
     pub fn owns_button(&self) -> bool {
@@ -1987,7 +1988,12 @@ mod tests {
         app.update();
         buttons(&mut app).clear();
         assert_eq!(phases(&app).last(), Some(&DragPhase::End));
-        assert!(!pointer(&app).2, "the button is free once it is up");
+        let (hovered, _, owned) = pointer(&app);
+        assert!(!owned, "the button is free once it is up");
+        assert!(
+            hovered.is_some(),
+            "and the handle let go of is still hovered"
+        );
     }
 
     /// A gizmo taken away mid-drag lets go of the drag and of what it read,

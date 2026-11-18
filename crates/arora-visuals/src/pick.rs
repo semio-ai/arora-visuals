@@ -221,7 +221,7 @@ fn on_release(
     // A press that took a gizmo's handle is the gizmo's, and so is its
     // release: the button is still the gizmo's as the release arrives, since
     // the gizmo lets go of it only in `Update`, after this — whether its drag
-    // is in hand or was ended by the gizmo going inert.
+    // is in hand or was ended by the gizmo going inert or being taken away.
     if gizmos.is_some_and(|gizmos| gizmos.owns_button()) {
         return;
     }
