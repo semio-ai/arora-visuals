@@ -664,7 +664,8 @@ fn note_scene_press(
 }
 
 /// The handle a press with `button` is the host's on, if it is: any button
-/// but the primary, on the handle `under` the press, while no handle is held.
+/// but the primary, on the handle `under` the press, while the left button is
+/// not a gizmo's ([`GizmoPointer::owns_button`]).
 ///
 /// `under` is asked at the press's own position rather than read from
 /// [`GizmoPointer::hovered`], which the last frame left: a pointer that

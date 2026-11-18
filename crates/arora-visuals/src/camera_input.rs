@@ -272,10 +272,9 @@ fn start_gesture(
     // A button a gizmo already owns keeps the gesture from starting — a drag
     // in hand, or one ended by its gizmo going inert or being taken away —
     // and so does a press with any button but the primary on a handle, which
-    // is the host's
-    // (`GizmoPress`). A primary press on a handle the pointer is merely over
-    // may never take it, and when it does, the gesture gives way to it at
-    // once (`drag`).
+    // is the host's (`GizmoPress`). A primary press on a handle the pointer
+    // is merely over may never take it, and when it does, the gesture gives
+    // way to it at once (`drag`).
     let pointer = &press.pointer;
     if gizmos.as_ref().is_some_and(|gizmos| {
         keeps_press(press.button, gizmos, || {
