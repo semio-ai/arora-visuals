@@ -176,6 +176,11 @@ pub struct TransformGizmo {
     /// string the host chooses — the blackboard key the gizmo writes through,
     /// say — since this crate reads nothing into it.
     pub key: String,
+    /// Handles drawn as the one under the pointer is, whatever the pointer
+    /// does: a host pointing at this gizmo from elsewhere, such as the row
+    /// for it in a list beside the view. It takes nothing from the pointer,
+    /// so hovering and dragging work as ever.
+    pub highlight: Vec<GizmoHandle>,
 }
 
 impl TransformGizmo {
@@ -198,6 +203,7 @@ impl TransformGizmo {
             apply: true,
             guides: true,
             key: String::new(),
+            highlight: Vec::new(),
         }
     }
 
@@ -228,7 +234,7 @@ impl TransformGizmo {
 /// gizmo's ring or bar, which is its only handle. `Joint` is here so that
 /// [`GizmoPointer`] can name either kind; the transform gizmo's own code never
 /// meets it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum GizmoHandle {
     Arrow(usize),
     Plane(usize),
@@ -292,6 +298,20 @@ pub struct GizmoDrag {
     pub phase: DragPhase,
     /// The target's local transform as the drag has it now.
     pub transform: Transform,
+}
+
+/// A press with a button other than the primary on a gizmo's handle, triggered
+/// on the gizmo. The primary button takes a handle; any other is the host's,
+/// to open a menu for the control, say, and starts no turn or pan of the
+/// view.
+#[derive(EntityEvent, Clone, Copy, Debug)]
+pub struct GizmoPress {
+    /// The gizmo.
+    pub entity: Entity,
+    pub handle: GizmoHandle,
+    pub button: PointerButton,
+    /// Where the press was, in the window's logical pixels.
+    pub position: Vec2,
 }
 
 /// What the pointer is doing with the gizmos.
@@ -579,6 +599,7 @@ impl Plugin for TransformGizmoPlugin {
         app.init_resource::<GizmoPointer>()
             .init_resource::<PressedScene>()
             .add_observer(note_scene_press)
+            .add_observer(report_other_press)
             .add_systems(Update, drive.in_set(TransformGizmoSystems))
             .add_systems(
                 PostUpdate,
@@ -606,6 +627,39 @@ fn note_scene_press(
         && on_the_scene(press.entity, press.original_event_target(), &windows)
     {
         pressed.0 = true;
+    }
+}
+
+/// The handle a press with `button` is the host's on, if it is: any button
+/// but the primary, on the handle under the pointer. Read before the press
+/// changes what is hovered, which it does from the next frame.
+pub(crate) fn hosts_press(
+    button: PointerButton,
+    pointer: &GizmoPointer,
+) -> Option<(Entity, GizmoHandle)> {
+    if button == PointerButton::Primary {
+        return None;
+    }
+    pointer.hovered
+}
+
+/// Reports a press that is the host's ([`hosts_press`]) as a [`GizmoPress`].
+fn report_other_press(
+    press: On<PointerPress>,
+    windows: Query<(), With<Window>>,
+    pointer: Res<GizmoPointer>,
+    mut commands: Commands,
+) {
+    if !on_the_scene(press.entity, press.original_event_target(), &windows) {
+        return;
+    }
+    if let Some((entity, handle)) = hosts_press(press.button, &pointer) {
+        commands.trigger(GizmoPress {
+            entity,
+            handle,
+            button: press.button,
+            position: press.pointer.position,
+        });
     }
 }
 
@@ -1494,7 +1548,8 @@ fn place_parts(
             } else {
                 Visibility::Hidden
             });
-            let is_hot = hot == Some((entity, part.handle));
+            let is_hot =
+                hot == Some((entity, part.handle)) || gizmo.highlight.contains(&part.handle);
             if part.hot != is_hot {
                 part.hot = is_hot;
                 let look = usize::from(is_hot);
@@ -1546,6 +1601,46 @@ fn place_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A press with a button other than the primary on a handle is the
+    /// host's; the primary's never is, nor a press over no handle.
+    #[test]
+    fn only_another_buttons_press_on_a_handle_is_the_hosts() {
+        let gizmo = Entity::from_raw_u32(7).unwrap();
+        let over = GizmoPointer {
+            hovered: Some((gizmo, GizmoHandle::Ring(2))),
+            ..default()
+        };
+        assert_eq!(
+            hosts_press(PointerButton::Secondary, &over),
+            Some((gizmo, GizmoHandle::Ring(2)))
+        );
+        assert_eq!(
+            hosts_press(PointerButton::Middle, &over),
+            Some((gizmo, GizmoHandle::Ring(2)))
+        );
+        assert_eq!(hosts_press(PointerButton::Primary, &over), None);
+        assert_eq!(
+            hosts_press(PointerButton::Secondary, &GizmoPointer::default()),
+            None
+        );
+    }
+
+    /// A handle reads back from the JSON it is written as, so a host can name
+    /// the one it means.
+    #[test]
+    fn a_handle_reads_back_from_its_json() {
+        for handle in [
+            GizmoHandle::Arrow(0),
+            GizmoHandle::Plane(1),
+            GizmoHandle::Ring(2),
+            GizmoHandle::Ball(0),
+            GizmoHandle::Joint,
+        ] {
+            let json = serde_json::to_string(&handle).unwrap();
+            assert_eq!(serde_json::from_str::<GizmoHandle>(&json).unwrap(), handle);
+        }
+    }
 
     /// A drag reads in its handle's own measure: an arrow's move along its
     /// axis, a plane's move along each of its two, a ring's turn about its

@@ -54,12 +54,12 @@
 //! stall at the edge and then jump by everything it travelled outside.
 
 use bevy::camera::{NormalizedRenderTarget, RenderTarget};
-use bevy::camera_controller::pan_orbit_camera::SyncCameraPosition;
 use bevy::camera_controller::pan_orbit_camera::controller::momentum::Velocity;
 use bevy::camera_controller::pan_orbit_camera::controller::motion::CurrentMotion;
 use bevy::camera_controller::pan_orbit_camera::prelude::{
     DefaultPanOrbitCameraPlugins, PanOrbitCamera,
 };
+use bevy::camera_controller::pan_orbit_camera::SyncCameraPosition;
 use bevy::ecs::system::SystemParam;
 use bevy::input::mouse::MouseScrollUnit;
 use bevy::input::touch::TouchPhase;
@@ -70,7 +70,7 @@ use bevy::prelude::*;
 use bevy::window::{CursorMoved, PrimaryWindow};
 
 use crate::pick::on_the_scene;
-use crate::transform_gizmo::{GizmoPointer, TransformGizmoSystems};
+use crate::transform_gizmo::{hosts_press, GizmoPointer, TransformGizmoSystems};
 
 /// Which inputs move a camera ([module docs](self)).
 #[derive(Component, Clone, Copy, Debug)]
@@ -266,11 +266,15 @@ fn start_gesture(
     if !on_the_scene(press.entity, press.original_event_target(), &windows) {
         return;
     }
-    // Only a drag already in hand keeps the gesture from starting. A handle
-    // the pointer is merely over may never be taken — the gizmo takes only
-    // the left button — and when this press does take one, the gesture gives
-    // way to it at once (`drag`).
-    if gizmos.is_some_and(|gizmos| gizmos.dragging.is_some()) || gesture.0.is_some() {
+    // A drag already in hand keeps the gesture from starting, and so does a
+    // press with any button but the primary on a handle, which is the host's
+    // (`GizmoPress`). A primary press on a handle the pointer is merely over
+    // may never take it, and when it does, the gesture gives way to it at
+    // once (`drag`).
+    if gizmos.as_ref().is_some_and(|gizmos| {
+        gizmos.dragging.is_some() || hosts_press(press.button, gizmos).is_some()
+    }) || gesture.0.is_some()
+    {
         return;
     }
     let button = match press.button {
