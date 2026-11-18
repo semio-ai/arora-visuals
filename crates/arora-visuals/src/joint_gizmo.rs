@@ -254,7 +254,7 @@ pub struct JointDrag {
 /// it is the pose of: a gizmo pointed at another body finds that body's pose
 /// afresh, rather than posing it from where the last one stood.
 #[derive(Component, Clone, Copy)]
-pub(crate) struct Rest(Transform, Entity);
+pub(crate) struct Rest(pub(crate) Transform, pub(crate) Entity);
 
 /// What a range material needs to shade a joint's span.
 #[derive(ShaderType, Debug, Clone, Default)]
