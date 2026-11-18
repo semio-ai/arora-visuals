@@ -337,9 +337,9 @@ pub struct GizmoPointer {
     /// The handle being dragged, and its gizmo.
     pub dragging: Option<(Entity, GizmoHandle)>,
     /// A drag ended by its gizmo going inert or being taken away, while the
-    /// button that took it is still down. Nothing is held, but the press is still the gizmo's:
-    /// its release is no click, and the view does not take it up. See
-    /// [`GizmoPointer::owns_button`].
+    /// button that took it is still down. Nothing is held, but the press is
+    /// still the gizmo's: its release is no click, and the view does not take
+    /// it up. See [`GizmoPointer::owns_button`].
     pub ended: Option<(Entity, GizmoHandle)>,
     /// How far the transform gizmo's drag in hand has gone, in its handle's
     /// own measure ([`Reading`]); empty when no transform handle is held.
@@ -429,9 +429,8 @@ impl GizmoPointer {
 
     /// Whether the left button now down is a gizmo's: it took a handle, and
     /// the drag is in hand or was ended by its gizmo going inert or being
-    /// taken away. Until it
-    /// comes up, its release is not a click and no gesture of the view's
-    /// starts from it.
+    /// taken away. Until it comes up, its release is not a click and no
+    /// gesture of the view's starts from it.
     pub fn owns_button(&self) -> bool {
         self.dragging.is_some() || self.ended.is_some()
     }
