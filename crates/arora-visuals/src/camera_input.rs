@@ -8,7 +8,9 @@
 //! **A gesture is the camera's only if it begins on the scene.** A press that
 //! lands on a UI node — a panel, a toggle, a slider — reaches that node and
 //! not the window, so it never starts one; neither does a press that takes a
-//! gizmo's handle. Once begun, a gesture is the camera's until its button
+//! gizmo's handle, nor a press with another button on a handle, which is the
+//! host's (`GizmoPress`): a right-drag begun within a handle's reach does not
+//! pan. Once begun, a gesture is the camera's until its button
 //! comes up, wherever the pointer goes, so nothing it passes over can take
 //! it. A scroll over the scene zooms; over UI it does not.
 //!

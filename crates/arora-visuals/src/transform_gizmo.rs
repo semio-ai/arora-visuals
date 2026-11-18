@@ -633,16 +633,31 @@ fn note_scene_press(
 }
 
 /// The handle a press with `button` is the host's on, if it is: any button
-/// but the primary, on the handle under the pointer. Read before the press
-/// changes what is hovered, which it does from the next frame.
+/// but the primary, on the handle under the pointer, while no handle is
+/// held. A held handle stays `hovered` for the whole drag, wherever the
+/// pointer goes, so a press during one is on nothing in particular.
+///
+/// It reads the hover the last frame left: picking triggers presses in
+/// `PreUpdate`, before [`drive`] recomputes the hover in `Update`.
 pub(crate) fn hosts_press(
     button: PointerButton,
     pointer: &GizmoPointer,
 ) -> Option<(Entity, GizmoHandle)> {
-    if button == PointerButton::Primary {
+    if button == PointerButton::Primary || pointer.dragging.is_some() {
         return None;
     }
     pointer.hovered
+}
+
+/// Whether a part looks as the one in hand does: its handle is the one the
+/// pointer has, or one the host highlights.
+fn looks_hot(
+    hot: Option<(Entity, GizmoHandle)>,
+    entity: Entity,
+    gizmo: &TransformGizmo,
+    handle: GizmoHandle,
+) -> bool {
+    hot == Some((entity, handle)) || gizmo.highlight.contains(&handle)
 }
 
 /// Reports a press that is the host's ([`hosts_press`]) as a [`GizmoPress`].
@@ -1550,8 +1565,7 @@ fn place_parts(
             } else {
                 Visibility::Hidden
             });
-            let is_hot =
-                hot == Some((entity, part.handle)) || gizmo.highlight.contains(&part.handle);
+            let is_hot = looks_hot(hot, entity, gizmo, part.handle);
             if part.hot != is_hot {
                 part.hot = is_hot;
                 let look = usize::from(is_hot);
@@ -1626,6 +1640,96 @@ mod tests {
             hosts_press(PointerButton::Secondary, &GizmoPointer::default()),
             None
         );
+        let held = GizmoPointer {
+            dragging: Some((gizmo, GizmoHandle::Ring(2))),
+            ..over
+        };
+        assert_eq!(
+            hosts_press(PointerButton::Secondary, &held),
+            None,
+            "a press during a drag is on no handle"
+        );
+    }
+
+    /// A secondary press on the window, over a handle, triggers a
+    /// `GizmoPress` for it; a primary one, or one during a drag, does not.
+    #[test]
+    fn a_press_with_another_button_triggers_a_gizmo_press() {
+        use bevy::camera::NormalizedRenderTarget;
+        use bevy::picking::backend::HitData;
+        use bevy::picking::events::Pointer;
+        use bevy::picking::pointer::{Location, PointerId};
+        use bevy::window::WindowRef;
+
+        #[derive(Resource, Default)]
+        struct Heard(Vec<(Entity, GizmoHandle, PointerButton)>);
+
+        let mut world = World::new();
+        world.init_resource::<Heard>();
+        world.add_observer(report_other_press);
+        world.add_observer(|press: On<GizmoPress>, mut heard: ResMut<Heard>| {
+            heard.0.push((press.entity, press.handle, press.button));
+        });
+        let window = world.spawn(Window::default()).id();
+        let gizmo = world.spawn_empty().id();
+        let press = |world: &mut World, button, pointer: GizmoPointer| {
+            world.insert_resource(pointer);
+            let target =
+                NormalizedRenderTarget::Window(WindowRef::Entity(window).normalize(None).unwrap());
+            world.trigger(PointerPress {
+                entity: window,
+                pointer: Pointer::new(
+                    PointerId::Mouse,
+                    Location {
+                        target,
+                        position: Vec2::new(5.0, 5.0),
+                    },
+                ),
+                button,
+                hit: HitData::new(window, 0.0, None, None),
+                count: 1,
+            });
+            world.flush();
+            std::mem::take(&mut world.resource_mut::<Heard>().0)
+        };
+        let over = || GizmoPointer {
+            hovered: Some((gizmo, GizmoHandle::Arrow(0))),
+            ..default()
+        };
+        assert_eq!(
+            press(&mut world, PointerButton::Secondary, over()),
+            vec![(gizmo, GizmoHandle::Arrow(0), PointerButton::Secondary)]
+        );
+        assert!(press(&mut world, PointerButton::Primary, over()).is_empty());
+        let held = GizmoPointer {
+            dragging: Some((gizmo, GizmoHandle::Arrow(0))),
+            ..over()
+        };
+        assert!(press(&mut world, PointerButton::Secondary, held).is_empty());
+    }
+
+    /// A highlighted handle looks hot without the pointer; the others, and
+    /// another gizmo's, look as the pointer leaves them.
+    #[test]
+    fn a_highlighted_handle_looks_hot() {
+        let [one, other] = [1, 2].map(|i| Entity::from_raw_u32(i).unwrap());
+        let mut gizmo = TransformGizmo::new(one, one);
+        assert!(!looks_hot(None, one, &gizmo, GizmoHandle::Ring(1)));
+        gizmo.highlight = vec![GizmoHandle::Ring(1)];
+        assert!(looks_hot(None, one, &gizmo, GizmoHandle::Ring(1)));
+        assert!(!looks_hot(None, one, &gizmo, GizmoHandle::Arrow(1)));
+        assert!(looks_hot(
+            Some((one, GizmoHandle::Arrow(1))),
+            one,
+            &gizmo,
+            GizmoHandle::Arrow(1)
+        ));
+        assert!(!looks_hot(
+            Some((other, GizmoHandle::Arrow(1))),
+            one,
+            &TransformGizmo::new(one, one),
+            GizmoHandle::Arrow(1)
+        ));
     }
 
     /// A handle reads back from the JSON it is written as, so a host can name

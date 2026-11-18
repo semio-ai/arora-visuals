@@ -393,10 +393,20 @@ impl RawFeature {
     }
 }
 
+/// A string, or empty for anything else a writer put there.
+fn label<'de, D: serde::Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+    Ok(match serde_json::Value::deserialize(de)? {
+        serde_json::Value::String(name) => name,
+        _ => String::new(),
+    })
+}
+
 #[derive(Deserialize)]
 struct RawRobotData {
     id: String,
-    #[serde(default)]
+    /// A label only, so one that is not a string reads as no name rather
+    /// than failing the asset.
+    #[serde(default, deserialize_with = "label")]
     name: String,
     material: Option<String>,
     #[serde(rename = "type", default)]
@@ -760,6 +770,8 @@ mod tests {
             "nodes": [
                 { "extensions": { "RobotData": { "id": "a1", "name": "base_link", "type": "group" } } },
                 { "name": "Plate", "extensions": { "RobotData": { "id": "b2", "type": "shape" } } },
+                { "extensions": { "RobotData": { "id": "c3", "name": null, "type": "group" } } },
+                { "extensions": { "RobotData": { "id": "d4", "name": 7, "type": "group" } } },
             ]
         });
         let meta = AssetMeta::from_gltf_json(&gltf).expect("parses");
@@ -768,7 +780,11 @@ mod tests {
             .iter()
             .map(|e| (e.id.as_str(), e.name.as_str()))
             .collect();
-        assert_eq!(names, [("a1", "base_link"), ("b2", "")]);
+        assert_eq!(
+            names,
+            [("a1", "base_link"), ("b2", ""), ("c3", ""), ("d4", "")],
+            "a name that is no string reads as none"
+        );
     }
 
     /// An animatable several elements share binds every one of them, in the
