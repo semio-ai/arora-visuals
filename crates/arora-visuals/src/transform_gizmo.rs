@@ -181,6 +181,17 @@ pub struct TransformGizmo {
     /// for it in a list beside the view. It takes nothing from the pointer,
     /// so hovering and dragging work as ever.
     pub highlight: Vec<GizmoHandle>,
+    /// How opaque the whole gizmo draws, from 0 to 1, over each handle's own
+    /// look and its colour's alpha, its drag guides included. A host fades a
+    /// control with it. It is how the gizmo looks only: a faded gizmo, even
+    /// an invisible one, still takes the pointer until it is not
+    /// [`interactive`](Self::interactive).
+    pub opacity: f32,
+    /// Whether the pointer can hover, take or press its handles. Without it
+    /// the pointer finds nothing here and reaches what lies beyond, the view
+    /// and the scene; a drag in hand when it goes off ends. A host's
+    /// [`highlight`](Self::highlight) still shows.
+    pub interactive: bool,
 }
 
 impl TransformGizmo {
@@ -204,6 +215,8 @@ impl TransformGizmo {
             guides: true,
             key: String::new(),
             highlight: Vec::new(),
+            opacity: 1.0,
+            interactive: true,
         }
     }
 
@@ -508,6 +521,11 @@ struct Part {
     stem: bool,
     meshes: [Handle<Mesh>; 2],
     materials: [Handle<HandleMaterial>; 2],
+    /// Each look's alpha before the gizmo's opacity: its handle's own, times
+    /// its colour's.
+    alphas: [f32; 2],
+    /// The gizmo opacity its materials were last given.
+    faded: f32,
     /// Which look it shows now.
     hot: bool,
 }
@@ -688,13 +706,15 @@ fn report_other_press(
 
 /// A part to spawn: its handle, where it sits, its rest and in-hand meshes
 /// and materials, and whether it is a scale ball's stem.
-type Piece = (
-    GizmoHandle,
-    Vec3,
-    [Handle<Mesh>; 2],
-    [Handle<HandleMaterial>; 2],
-    bool,
-);
+type Piece = (GizmoHandle, Vec3, [Handle<Mesh>; 2], Look, bool);
+
+/// A piece's two looks: its materials, and the alpha each has before the
+/// gizmo's opacity.
+#[derive(Clone)]
+struct Look {
+    materials: [Handle<HandleMaterial>; 2],
+    alphas: [f32; 2],
+}
 
 /// Builds the parts of each gizmo that is new or whose look has changed.
 fn build_parts(
@@ -720,18 +740,23 @@ fn build_parts(
         commands.entity(entity).insert((wanted, Facing(Vec3::ONE)));
 
         let mut material = |colour: Color, opacity: [f32; 2]| {
-            [0, 1].map(|hot| {
-                let base = if hot == 1 {
-                    colour.mix(&Color::WHITE, LIGHTEN)
-                } else {
-                    colour
-                };
-                materials.add(HandleMaterial {
-                    handle: HandleUniform {
-                        colour: LinearRgba::from(base.with_alpha(opacity[hot])).to_vec4(),
-                    },
-                })
-            })
+            let alphas = opacity.map(|alpha| alpha * colour.alpha());
+            Look {
+                materials: [0, 1].map(|hot| {
+                    let base = if hot == 1 {
+                        colour.mix(&Color::WHITE, LIGHTEN)
+                    } else {
+                        colour
+                    };
+                    materials.add(HandleMaterial {
+                        handle: HandleUniform {
+                            colour: LinearRgba::from(base.with_alpha(alphas[hot] * gizmo.opacity))
+                                .to_vec4(),
+                        },
+                    })
+                }),
+                alphas,
+            }
         };
         let mut pieces: Vec<Piece> = Vec::new();
         for handle in GizmoHandle::ALL {
@@ -820,8 +845,10 @@ fn build_parts(
                 }
             }
         }
+        let gizmo_opacity = gizmo.opacity;
         commands.entity(entity).with_children(|gizmo| {
-            for (handle, offset, meshes, materials, stem) in pieces {
+            for (handle, offset, meshes, look, stem) in pieces {
+                let materials = look.materials;
                 gizmo.spawn((
                     Part {
                         handle,
@@ -829,6 +856,8 @@ fn build_parts(
                         stem,
                         meshes: meshes.clone(),
                         materials: materials.clone(),
+                        alphas: look.alphas,
+                        faded: gizmo_opacity,
                         hot: false,
                     },
                     GizmoPart,
@@ -1123,7 +1152,8 @@ impl Candidate {
     }
 }
 
-/// The handle nearest `cursor` within reach, of any visible gizmo, through
+/// The handle nearest `cursor` within reach, of any visible gizmo that takes
+/// the pointer, through
 /// each gizmo's own camera: what the pointer is over. Hover, a take and a
 /// press with another button all ask this one search, so they cannot
 /// disagree about what a pointer is on.
@@ -1156,7 +1186,7 @@ fn nearest_handle<'a>(
         }
     };
     for (entity, gizmo, visible, facing) in gizmos {
-        if !visible.get() {
+        if !visible.get() || !gizmo.interactive {
             continue;
         }
         // Facing comes with the parts; until they are built, nothing shows.
@@ -1183,7 +1213,7 @@ fn nearest_handle<'a>(
         }
     }
     for (entity, gizmo, rest, visible) in joints {
-        if !visible.get() {
+        if !visible.get() || !gizmo.interactive {
             continue;
         }
         let Ok(camera) = cameras.get(gizmo.camera) else {
@@ -1316,7 +1346,12 @@ fn drive(
             .copied()
             .unwrap_or(GlobalTransform::IDENTITY)
     };
-    let released = !buttons.pressed(MouseButton::Left);
+    let button_up = !buttons.pressed(MouseButton::Left);
+    // A drag a gizmo's going inert ended stays in `dragging` until the button
+    // comes up, so its release is not taken for a click on what lies beneath.
+    if held.is_none() && button_up {
+        pointer.dragging = None;
+    }
 
     match *held {
         Some(Held::Transform(drag)) => {
@@ -1325,6 +1360,9 @@ fn drive(
                 pointer.dragging = None;
                 return;
             };
+            // Going inert ends a drag at once; only the button coming up
+            // ends what the pointer is doing (see `button_up`).
+            let released = button_up || !gizmo.interactive;
             let moved = ray_through(gizmo.camera).and_then(|ray| dragged_to(&drag, ray));
             if let Some(moved) = moved {
                 pointer.readings = readings(&drag, &moved);
@@ -1373,8 +1411,10 @@ fn drive(
             }
             if released {
                 *held = None;
-                pointer.dragging = None;
                 pointer.readings.clear();
+                if button_up {
+                    pointer.dragging = None;
+                }
             }
             return;
         }
@@ -1384,6 +1424,9 @@ fn drive(
                 pointer.dragging = None;
                 return;
             };
+            // Going inert ends a drag at once; only the button coming up
+            // ends what the pointer is doing (see `button_up`).
+            let released = button_up || !gizmo.interactive;
             let value = ray_through(gizmo.camera).and_then(|ray| dragged(&gizmo, &grip, ray));
             if let Some(value) = value {
                 if gizmo.value != value {
@@ -1402,7 +1445,9 @@ fn drive(
             });
             if released {
                 *held = None;
-                pointer.dragging = None;
+                if button_up {
+                    pointer.dragging = None;
+                }
             }
             return;
         }
@@ -1630,6 +1675,7 @@ fn place_parts(
         ),
         Without<TransformGizmo>,
     >,
+    mut handle_materials: ResMut<Assets<HandleMaterial>>,
 ) {
     let hot = pointer.dragging.or(pointer.hovered);
     for (entity, gizmo, mut transform, mut global, children, facing) in &mut gizmos {
@@ -1689,6 +1735,14 @@ fn place_parts(
             } else {
                 Visibility::Hidden
             });
+            if part.faded != gizmo.opacity {
+                part.faded = gizmo.opacity;
+                for (material, alpha) in part.materials.iter().zip(part.alphas) {
+                    if let Some(mut material) = handle_materials.get_mut(material) {
+                        material.handle.colour.w = alpha * gizmo.opacity;
+                    }
+                }
+            }
             let is_hot = looks_hot(hot, entity, gizmo, part.handle);
             if part.hot != is_hot {
                 part.hot = is_hot;
@@ -1708,7 +1762,7 @@ fn place_parts(
             both_ways: true,
             size: gizmo.size,
             camera: Some(gizmo.camera),
-            colour: gizmo.colours[axis],
+            colour: gizmo.colours[axis].with_alpha(gizmo.colours[axis].alpha() * gizmo.opacity),
         };
         let mut present = Vec::new();
         for (guide, axis, parent, mut shown, mut guide_global) in &mut guides {
@@ -1741,6 +1795,182 @@ fn place_parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The phases of every drag event, of either kind of gizmo, in order.
+    #[derive(Resource, Default)]
+    struct Phases(Vec<DragPhase>);
+
+    /// A world that runs only [`drive`]: a target at the origin seen square
+    /// on by a camera drawing 400 pixels a side, a window to carry the
+    /// cursor, and the gizmo `spawn` makes for the target and camera. The
+    /// left button is pressed and let go by hand, with nothing clearing it
+    /// between frames but the test.
+    fn driving(spawn: impl FnOnce(&mut World, Entity, Entity) -> Entity) -> (App, Entity, Entity) {
+        use bevy::camera::{CameraProjection, ComputedCameraValues, RenderTargetInfo};
+
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<GizmoPointer>()
+            .init_resource::<PressedScene>()
+            .init_resource::<Phases>()
+            .add_observer(|drag: On<GizmoDrag>, mut phases: ResMut<Phases>| {
+                phases.0.push(drag.phase)
+            })
+            .add_observer(|drag: On<JointDrag>, mut phases: ResMut<Phases>| {
+                phases.0.push(drag.phase)
+            })
+            .add_systems(Update, drive);
+        let world = app.world_mut();
+        let window = world.spawn(Window::default()).id();
+        let camera = world
+            .spawn((
+                Camera {
+                    computed: ComputedCameraValues {
+                        clip_from_view: PerspectiveProjection {
+                            aspect_ratio: 1.0,
+                            ..default()
+                        }
+                        .get_clip_from_view(),
+                        target_info: Some(RenderTargetInfo {
+                            physical_size: UVec2::splat(400),
+                            scale_factor: 1.0,
+                        }),
+                        ..default()
+                    },
+                    ..default()
+                },
+                GlobalTransform::from(
+                    Transform::from_xyz(0.0, -1.5, 0.4).looking_at(Vec3::ZERO, Vec3::Z),
+                ),
+            ))
+            .id();
+        let target = world
+            .spawn((Transform::IDENTITY, GlobalTransform::IDENTITY))
+            .id();
+        let gizmo = spawn(world, target, camera);
+        world.entity_mut(gizmo).insert(InheritedVisibility::VISIBLE);
+        (app, window, gizmo)
+    }
+
+    /// A gizmo made inert part way through a drag ends that drag at once,
+    /// with one `End` and nothing after it while the button stays down. The
+    /// pointer keeps the drag until the button comes up, which is what keeps
+    /// a pick on the release from taking it for a click on the scene. Made
+    /// interactive again, the gizmo takes a fresh press.
+    fn inert_mid_drag(
+        spawn: impl FnOnce(&mut World, Entity, Entity) -> Entity,
+        set_interactive: fn(&mut World, Entity, bool),
+    ) {
+        let (mut app, window, gizmo) = driving(spawn);
+        let point_at = |app: &mut App, at: Vec2| {
+            let mut window = app.world_mut().get_mut::<Window>(window).unwrap();
+            window.set_cursor_position(Some(at));
+            app.update();
+        };
+        fn buttons(app: &mut App) -> Mut<'_, ButtonInput<MouseButton>> {
+            app.world_mut().resource_mut::<ButtonInput<MouseButton>>()
+        }
+        let pointer = |app: &App| {
+            let pointer = app.world().resource::<GizmoPointer>();
+            (pointer.hovered, pointer.dragging)
+        };
+        let phases = |app: &App| app.world().resource::<Phases>().0.clone();
+        let press = |app: &mut App| {
+            app.world_mut().resource_mut::<PressedScene>().0 = true;
+            buttons(app).press(MouseButton::Left);
+            app.update();
+            // Still down, no longer just pressed.
+            buttons(app).clear();
+        };
+
+        // Along the row through the target until a handle is under the
+        // cursor; not a ring, which is seen edge on there and so cannot be
+        // taken.
+        let spot = (0..200)
+            .map(|x| Vec2::new(200.0 + x as f32, 200.0))
+            .find(|&at| {
+                point_at(&mut app, at);
+                pointer(&app).0.is_some_and(|(entity, handle)| {
+                    entity == gizmo && !matches!(handle, GizmoHandle::Ring(_))
+                })
+            })
+            .expect("a handle on the row through the target");
+
+        press(&mut app);
+        assert_eq!(phases(&app), [DragPhase::Start]);
+        assert!(pointer(&app).1.is_some(), "the drag is the pointer's");
+        point_at(&mut app, spot + Vec2::new(4.0, -3.0));
+
+        set_interactive(app.world_mut(), gizmo, false);
+        app.update();
+        let ended = phases(&app);
+        assert_eq!(ended.last(), Some(&DragPhase::End), "{ended:?}");
+        assert_eq!(
+            ended
+                .iter()
+                .filter(|&&phase| phase == DragPhase::End)
+                .count(),
+            1
+        );
+        for at in [Vec2::new(8.0, -6.0), Vec2::ZERO, Vec2::new(-5.0, 2.0)] {
+            point_at(&mut app, spot + at);
+            assert_eq!(phases(&app), ended, "nothing more while the button is down");
+            assert!(
+                pointer(&app).1.is_some(),
+                "the pointer keeps the drag until the button comes up"
+            );
+        }
+
+        buttons(&mut app).release(MouseButton::Left);
+        app.update();
+        buttons(&mut app).clear();
+        assert_eq!(phases(&app), ended, "the release ends nothing more");
+        assert_eq!(pointer(&app), (None, None), "inert, and let go");
+
+        set_interactive(app.world_mut(), gizmo, true);
+        point_at(&mut app, spot);
+        assert!(pointer(&app).0.is_some(), "live again under the cursor");
+        press(&mut app);
+        let again = phases(&app);
+        assert_eq!(again.len(), ended.len() + 1);
+        assert_eq!(again.last(), Some(&DragPhase::Start), "a fresh drag");
+    }
+
+    #[test]
+    fn a_transform_gizmo_made_inert_mid_drag_ends_it_and_keeps_the_release() {
+        inert_mid_drag(
+            |world, target, camera| {
+                world
+                    .spawn(TransformGizmo::new(target, camera))
+                    .insert(Facing(Vec3::ONE))
+                    .id()
+            },
+            |world, gizmo, on| world.get_mut::<TransformGizmo>(gizmo).unwrap().interactive = on,
+        );
+    }
+
+    #[test]
+    fn a_joint_gizmo_made_inert_mid_drag_ends_it_and_keeps_the_release() {
+        inert_mid_drag(
+            |world, target, camera| {
+                world
+                    .spawn(JointGizmo::new(
+                        target,
+                        camera,
+                        crate::joint_gizmo::JointMotion::Turn,
+                        Dir3::Z,
+                        -3.0,
+                        3.0,
+                        0.0,
+                        Color::WHITE,
+                    ))
+                    .insert(crate::joint_gizmo::Rest(Transform::IDENTITY, target))
+                    .id()
+            },
+            |world, gizmo, on| world.get_mut::<JointGizmo>(gizmo).unwrap().interactive = on,
+        );
+    }
 
     /// A press with a button other than the primary on a handle is the
     /// host's, by the handle under the press, whatever the last frame left
@@ -1959,6 +2189,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .init_resource::<GizmoPointer>()
+            .init_resource::<Assets<HandleMaterial>>()
             .add_systems(PostUpdate, place_parts);
         app.update();
     }

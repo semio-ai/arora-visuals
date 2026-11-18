@@ -32,8 +32,9 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let along = in.uv.y;
     let reached = (bar.current - bar.min) / travel;
 
+    // The colour's alpha carries the gizmo's opacity and its own alpha.
     if along <= reached {
-        return vec4<f32>(bar.color.rgb, 1.0);
+        return vec4<f32>(bar.color.rgb, bar.color.a);
     }
-    return vec4<f32>(mix(bar.background.rgb, bar.color.rgb, 0.6), 0.5);
+    return vec4<f32>(mix(bar.background.rgb, bar.color.rgb, 0.6), 0.5 * bar.color.a);
 }
