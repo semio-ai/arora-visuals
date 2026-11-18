@@ -1423,7 +1423,7 @@ fn drive(
             if released {
                 *held = None;
                 pointer.readings.clear();
-                let_go(&mut pointer, button_up);
+                let_go(&mut pointer, button_up, gizmo.interactive);
             }
             return;
         }
@@ -1454,7 +1454,7 @@ fn drive(
             });
             if released {
                 *held = None;
-                let_go(&mut pointer, button_up);
+                let_go(&mut pointer, button_up, gizmo.interactive);
             }
             return;
         }
@@ -1547,10 +1547,18 @@ fn drive(
 /// Ends the drag in hand. One its gizmo ended by going inert, with the
 /// button still down, stays the pointer's as `ended` until the button comes
 /// up, so its release is not taken for a click on what lies beneath.
-fn let_go(pointer: &mut GizmoPointer, button_up: bool) {
+///
+/// A gizmo gone inert is under the pointer no more either: the handle held
+/// stays `hovered` through a drag wherever the pointer goes, and left there
+/// it would read as hovered, inert and perhaps far from the pointer, until
+/// the next frame looks again.
+fn let_go(pointer: &mut GizmoPointer, button_up: bool, interactive: bool) {
     let dragging = pointer.dragging.take();
     if !button_up {
         pointer.ended = dragging;
+    }
+    if !interactive {
+        pointer.hovered = None;
     }
 }
 
@@ -1922,6 +1930,11 @@ mod tests {
 
         set_interactive(app.world_mut(), gizmo, false);
         app.update();
+        assert_eq!(
+            pointer(&app),
+            (None, None, true),
+            "in the frame it ends: neither hovered nor held, the button still the gizmo's"
+        );
         let ended = phases(&app);
         assert_eq!(ended.last(), Some(&DragPhase::End), "{ended:?}");
         assert_eq!(
