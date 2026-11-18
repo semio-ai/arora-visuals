@@ -99,6 +99,14 @@ pub struct JointGizmo {
     /// the view. It takes nothing from the pointer, so the view and every
     /// other control work as ever.
     pub show_in_hand: bool,
+    /// How opaque the gizmo draws, from 0 to 1, over its own look and its
+    /// colour's alpha. A host fades a control with it.
+    pub opacity: f32,
+    /// Whether the pointer can hover, take or press it. Without it the
+    /// pointer finds nothing here and reaches what lies beyond; a drag in
+    /// hand when it goes off ends. [`show_in_hand`](Self::show_in_hand)
+    /// still shows.
+    pub interactive: bool,
     /// What the host calls this gizmo: the name it goes by in the
     /// [overlay](crate::overlay), where an entity id would mean nothing. Any
     /// string the host chooses — the blackboard key its value is written to,
@@ -135,6 +143,8 @@ impl JointGizmo {
             offset: Self::default_offset(motion, axis),
             apply: true,
             show_in_hand: false,
+            opacity: 1.0,
+            interactive: true,
             key: String::new(),
         }
     }
@@ -607,7 +617,7 @@ fn build_parts(
 
         let resting = plain.add(HandleMaterial {
             handle: HandleUniform {
-                colour: LinearRgba::from(gizmo.colour.with_alpha(REST_OPACITY)).to_vec4(),
+                colour: LinearRgba::from(gizmo.colour.with_alpha(resting_alpha(gizmo))).to_vec4(),
             },
         });
         let range = gizmo.shown_range();
@@ -619,7 +629,7 @@ fn build_parts(
             min: 0.0,
             max,
             current,
-            colour: LinearRgba::from(gizmo.colour).to_vec4(),
+            colour: LinearRgba::from(gizmo.colour.with_alpha(range_alpha(gizmo))).to_vec4(),
             background: LinearRgba::from(BACKGROUND).to_vec4(),
             ..default()
         };
@@ -702,11 +712,13 @@ fn place_parts(
             &mut GlobalTransform,
             &mut Visibility,
             Option<&RangeLook>,
+            Option<&MeshMaterial3d<HandleMaterial>>,
         ),
         Without<JointGizmo>,
     >,
     mut rings: ResMut<Assets<RingRangeMaterial>>,
     mut bars: ResMut<Assets<BarRangeMaterial>>,
+    mut plain: ResMut<Assets<HandleMaterial>>,
 ) {
     let hot = pointer
         .dragging
@@ -742,10 +754,24 @@ fn place_parts(
         };
         let in_hand = hot == Some(entity) || gizmo.show_in_hand;
         for child in children.iter() {
-            let Ok((part, mut at, mut part_global, mut visibility, look)) = parts.get_mut(child)
+            let Ok((part, mut at, mut part_global, mut visibility, look, resting)) =
+                parts.get_mut(child)
             else {
                 continue;
             };
+            // Read before writing, as the range is below: the resting look
+            // takes the gizmo's opacity only when it changes.
+            let alpha = resting_alpha(gizmo);
+            if let Some(resting) = resting {
+                if plain
+                    .get(&resting.0)
+                    .is_some_and(|m| m.handle.colour.w != alpha)
+                {
+                    if let Some(mut material) = plain.get_mut(&resting.0) {
+                        material.handle.colour.w = alpha;
+                    }
+                }
+            }
             at.set_if_neq(placed);
             part_global.set_if_neq(GlobalTransform::from(placed));
             let shown = part.hot == in_hand;
@@ -763,29 +789,41 @@ fn place_parts(
             };
             // Read before writing: taking an asset mutably marks it changed,
             // which re-uploads it every frame whether or not anything moved.
+            let alpha = range_alpha(gizmo);
+            let stale = |range: &RangeUniform| range.current != current || range.colour.w != alpha;
             match look {
                 Some(RangeLook::Ring(material))
-                    if rings
-                        .get(material)
-                        .is_some_and(|m| m.range.current != current) =>
+                    if rings.get(material).is_some_and(|m| stale(&m.range)) =>
                 {
                     if let Some(mut material) = rings.get_mut(material) {
                         material.range.current = current;
+                        material.range.colour.w = alpha;
                     }
                 }
                 Some(RangeLook::Bar(material))
-                    if bars
-                        .get(material)
-                        .is_some_and(|m| m.range.current != current) =>
+                    if bars.get(material).is_some_and(|m| stale(&m.range)) =>
                 {
                     if let Some(mut material) = bars.get_mut(material) {
                         material.range.current = current;
+                        material.range.colour.w = alpha;
                     }
                 }
                 _ => {}
             }
         }
     }
+}
+
+/// The resting ring or bar's alpha: its own look, its colour's alpha and the
+/// gizmo's opacity.
+fn resting_alpha(gizmo: &JointGizmo) -> f32 {
+    REST_OPACITY * gizmo.colour.alpha() * gizmo.opacity
+}
+
+/// What the in-hand look's alpha is scaled by: its colour's alpha and the
+/// gizmo's opacity. The range shaders multiply it into their own bands'.
+fn range_alpha(gizmo: &JointGizmo) -> f32 {
+    gizmo.colour.alpha() * gizmo.opacity
 }
 
 /// The world transform of `target`'s parent, or the world's origin for a

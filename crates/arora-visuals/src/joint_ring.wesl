@@ -58,5 +58,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    return vec4<f32>(mix(ring.background.rgb, ring.color.rgb, mix_factor), opacity);
+    // The colour's alpha carries the gizmo's opacity and its own alpha.
+    return vec4<f32>(mix(ring.background.rgb, ring.color.rgb, mix_factor), opacity * ring.color.a);
 }

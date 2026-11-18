@@ -181,6 +181,14 @@ pub struct TransformGizmo {
     /// for it in a list beside the view. It takes nothing from the pointer,
     /// so hovering and dragging work as ever.
     pub highlight: Vec<GizmoHandle>,
+    /// How opaque the whole gizmo draws, from 0 to 1, over each handle's own
+    /// look and its colour's alpha. A host fades a control with it.
+    pub opacity: f32,
+    /// Whether the pointer can hover, take or press its handles. Without it
+    /// the pointer finds nothing here and reaches what lies beyond, the view
+    /// and the scene; a drag in hand when it goes off ends. A host's
+    /// [`highlight`](Self::highlight) still shows.
+    pub interactive: bool,
 }
 
 impl TransformGizmo {
@@ -204,6 +212,8 @@ impl TransformGizmo {
             guides: true,
             key: String::new(),
             highlight: Vec::new(),
+            opacity: 1.0,
+            interactive: true,
         }
     }
 
@@ -508,6 +518,11 @@ struct Part {
     stem: bool,
     meshes: [Handle<Mesh>; 2],
     materials: [Handle<HandleMaterial>; 2],
+    /// Each look's alpha before the gizmo's opacity: its handle's own, times
+    /// its colour's.
+    alphas: [f32; 2],
+    /// The gizmo opacity its materials were last given.
+    faded: f32,
     /// Which look it shows now.
     hot: bool,
 }
@@ -688,13 +703,15 @@ fn report_other_press(
 
 /// A part to spawn: its handle, where it sits, its rest and in-hand meshes
 /// and materials, and whether it is a scale ball's stem.
-type Piece = (
-    GizmoHandle,
-    Vec3,
-    [Handle<Mesh>; 2],
-    [Handle<HandleMaterial>; 2],
-    bool,
-);
+type Piece = (GizmoHandle, Vec3, [Handle<Mesh>; 2], Look, bool);
+
+/// A piece's two looks: its materials, and the alpha each has before the
+/// gizmo's opacity.
+#[derive(Clone)]
+struct Look {
+    materials: [Handle<HandleMaterial>; 2],
+    alphas: [f32; 2],
+}
 
 /// Builds the parts of each gizmo that is new or whose look has changed.
 fn build_parts(
@@ -720,18 +737,23 @@ fn build_parts(
         commands.entity(entity).insert((wanted, Facing(Vec3::ONE)));
 
         let mut material = |colour: Color, opacity: [f32; 2]| {
-            [0, 1].map(|hot| {
-                let base = if hot == 1 {
-                    colour.mix(&Color::WHITE, LIGHTEN)
-                } else {
-                    colour
-                };
-                materials.add(HandleMaterial {
-                    handle: HandleUniform {
-                        colour: LinearRgba::from(base.with_alpha(opacity[hot])).to_vec4(),
-                    },
-                })
-            })
+            let alphas = opacity.map(|alpha| alpha * colour.alpha());
+            Look {
+                materials: [0, 1].map(|hot| {
+                    let base = if hot == 1 {
+                        colour.mix(&Color::WHITE, LIGHTEN)
+                    } else {
+                        colour
+                    };
+                    materials.add(HandleMaterial {
+                        handle: HandleUniform {
+                            colour: LinearRgba::from(base.with_alpha(alphas[hot] * gizmo.opacity))
+                                .to_vec4(),
+                        },
+                    })
+                }),
+                alphas,
+            }
         };
         let mut pieces: Vec<Piece> = Vec::new();
         for handle in GizmoHandle::ALL {
@@ -820,8 +842,10 @@ fn build_parts(
                 }
             }
         }
+        let gizmo_opacity = gizmo.opacity;
         commands.entity(entity).with_children(|gizmo| {
-            for (handle, offset, meshes, materials, stem) in pieces {
+            for (handle, offset, meshes, look, stem) in pieces {
+                let materials = look.materials;
                 gizmo.spawn((
                     Part {
                         handle,
@@ -829,6 +853,8 @@ fn build_parts(
                         stem,
                         meshes: meshes.clone(),
                         materials: materials.clone(),
+                        alphas: look.alphas,
+                        faded: gizmo_opacity,
                         hot: false,
                     },
                     GizmoPart,
@@ -1123,7 +1149,8 @@ impl Candidate {
     }
 }
 
-/// The handle nearest `cursor` within reach, of any visible gizmo, through
+/// The handle nearest `cursor` within reach, of any visible gizmo that takes
+/// the pointer, through
 /// each gizmo's own camera: what the pointer is over. Hover, a take and a
 /// press with another button all ask this one search, so they cannot
 /// disagree about what a pointer is on.
@@ -1156,7 +1183,7 @@ fn nearest_handle<'a>(
         }
     };
     for (entity, gizmo, visible, facing) in gizmos {
-        if !visible.get() {
+        if !visible.get() || !gizmo.interactive {
             continue;
         }
         // Facing comes with the parts; until they are built, nothing shows.
@@ -1183,7 +1210,7 @@ fn nearest_handle<'a>(
         }
     }
     for (entity, gizmo, rest, visible) in joints {
-        if !visible.get() {
+        if !visible.get() || !gizmo.interactive {
             continue;
         }
         let Ok(camera) = cameras.get(gizmo.camera) else {
@@ -1325,6 +1352,7 @@ fn drive(
                 pointer.dragging = None;
                 return;
             };
+            let released = released || !gizmo.interactive;
             let moved = ray_through(gizmo.camera).and_then(|ray| dragged_to(&drag, ray));
             if let Some(moved) = moved {
                 pointer.readings = readings(&drag, &moved);
@@ -1384,6 +1412,7 @@ fn drive(
                 pointer.dragging = None;
                 return;
             };
+            let released = released || !gizmo.interactive;
             let value = ray_through(gizmo.camera).and_then(|ray| dragged(&gizmo, &grip, ray));
             if let Some(value) = value {
                 if gizmo.value != value {
@@ -1630,6 +1659,7 @@ fn place_parts(
         ),
         Without<TransformGizmo>,
     >,
+    mut handle_materials: ResMut<Assets<HandleMaterial>>,
 ) {
     let hot = pointer.dragging.or(pointer.hovered);
     for (entity, gizmo, mut transform, mut global, children, facing) in &mut gizmos {
@@ -1689,6 +1719,14 @@ fn place_parts(
             } else {
                 Visibility::Hidden
             });
+            if part.faded != gizmo.opacity {
+                part.faded = gizmo.opacity;
+                for (material, alpha) in part.materials.iter().zip(part.alphas) {
+                    if let Some(mut material) = handle_materials.get_mut(material) {
+                        material.handle.colour.w = alpha * gizmo.opacity;
+                    }
+                }
+            }
             let is_hot = looks_hot(hot, entity, gizmo, part.handle);
             if part.hot != is_hot {
                 part.hot = is_hot;
@@ -1959,6 +1997,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .init_resource::<GizmoPointer>()
+            .init_resource::<Assets<HandleMaterial>>()
             .add_systems(PostUpdate, place_parts);
         app.update();
     }
