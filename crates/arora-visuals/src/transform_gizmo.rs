@@ -264,7 +264,9 @@ impl GizmoHandle {
         }
     }
 
-    const ALL: [GizmoHandle; 12] = [
+    /// Every handle a transform gizmo has, which a host highlights to
+    /// highlight the whole gizmo.
+    pub const ALL: [GizmoHandle; 12] = [
         GizmoHandle::Arrow(0),
         GizmoHandle::Arrow(1),
         GizmoHandle::Arrow(2),
