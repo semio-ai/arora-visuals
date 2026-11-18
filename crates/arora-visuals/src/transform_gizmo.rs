@@ -182,7 +182,10 @@ pub struct TransformGizmo {
     /// so hovering and dragging work as ever.
     pub highlight: Vec<GizmoHandle>,
     /// How opaque the whole gizmo draws, from 0 to 1, over each handle's own
-    /// look and its colour's alpha. A host fades a control with it.
+    /// look and its colour's alpha, its drag guides included. A host fades a
+    /// control with it. It is how the gizmo looks only: a faded gizmo, even
+    /// an invisible one, still takes the pointer until it is not
+    /// [`interactive`](Self::interactive).
     pub opacity: f32,
     /// Whether the pointer can hover, take or press its handles. Without it
     /// the pointer finds nothing here and reaches what lies beyond, the view
@@ -1343,7 +1346,12 @@ fn drive(
             .copied()
             .unwrap_or(GlobalTransform::IDENTITY)
     };
-    let released = !buttons.pressed(MouseButton::Left);
+    let button_up = !buttons.pressed(MouseButton::Left);
+    // A drag a gizmo's going inert ended stays in `dragging` until the button
+    // comes up, so its release is not taken for a click on what lies beneath.
+    if held.is_none() && button_up {
+        pointer.dragging = None;
+    }
 
     match *held {
         Some(Held::Transform(drag)) => {
@@ -1352,7 +1360,9 @@ fn drive(
                 pointer.dragging = None;
                 return;
             };
-            let released = released || !gizmo.interactive;
+            // Going inert ends a drag at once; only the button coming up
+            // ends what the pointer is doing (see `button_up`).
+            let released = button_up || !gizmo.interactive;
             let moved = ray_through(gizmo.camera).and_then(|ray| dragged_to(&drag, ray));
             if let Some(moved) = moved {
                 pointer.readings = readings(&drag, &moved);
@@ -1401,8 +1411,10 @@ fn drive(
             }
             if released {
                 *held = None;
-                pointer.dragging = None;
                 pointer.readings.clear();
+                if button_up {
+                    pointer.dragging = None;
+                }
             }
             return;
         }
@@ -1412,7 +1424,9 @@ fn drive(
                 pointer.dragging = None;
                 return;
             };
-            let released = released || !gizmo.interactive;
+            // Going inert ends a drag at once; only the button coming up
+            // ends what the pointer is doing (see `button_up`).
+            let released = button_up || !gizmo.interactive;
             let value = ray_through(gizmo.camera).and_then(|ray| dragged(&gizmo, &grip, ray));
             if let Some(value) = value {
                 if gizmo.value != value {
@@ -1431,7 +1445,9 @@ fn drive(
             });
             if released {
                 *held = None;
-                pointer.dragging = None;
+                if button_up {
+                    pointer.dragging = None;
+                }
             }
             return;
         }
@@ -1746,7 +1762,7 @@ fn place_parts(
             both_ways: true,
             size: gizmo.size,
             camera: Some(gizmo.camera),
-            colour: gizmo.colours[axis],
+            colour: gizmo.colours[axis].with_alpha(gizmo.colours[axis].alpha() * gizmo.opacity),
         };
         let mut present = Vec::new();
         for (guide, axis, parent, mut shown, mut guide_global) in &mut guides {

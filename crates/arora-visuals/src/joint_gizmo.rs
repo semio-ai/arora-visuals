@@ -100,7 +100,9 @@ pub struct JointGizmo {
     /// other control work as ever.
     pub show_in_hand: bool,
     /// How opaque the gizmo draws, from 0 to 1, over its own look and its
-    /// colour's alpha. A host fades a control with it.
+    /// colour's alpha. A host fades a control with it. It is how the gizmo
+    /// looks only: a faded gizmo still takes the pointer until it is not
+    /// [`interactive`](Self::interactive).
     pub opacity: f32,
     /// Whether the pointer can hover, take or press it. Without it the
     /// pointer finds nothing here and reaches what lies beyond; a drag in
