@@ -1990,41 +1990,50 @@ mod tests {
         assert!(!pointer(&app).2, "the button is free once it is up");
     }
 
-    /// A gizmo taken away mid-drag lets go of the drag, but the button stays
-    /// its until it comes up, so the release is no click on the scene.
-    #[test]
-    fn a_gizmo_taken_away_mid_drag_keeps_the_release() {
-        let (mut app, window, gizmo) = driving(|world, target, camera| {
-            world
-                .spawn(TransformGizmo::new(target, camera))
-                .insert(Facing(Vec3::ONE))
-                .id()
-        });
+    /// A gizmo taken away mid-drag lets go of the drag and of what it read,
+    /// but the button stays its until it comes up, so the release is no
+    /// click on the scene. `reads` is whether the drag shows readings, as a
+    /// transform gizmo's does.
+    fn taken_away_mid_drag(spawn: impl FnOnce(&mut World, Entity, Entity) -> Entity, reads: bool) {
+        let (mut app, window, gizmo) = driving(spawn);
+        let point_at = |app: &mut App, at: Vec2| {
+            let mut cursor = app.world_mut().get_mut::<Window>(window).unwrap();
+            cursor.set_cursor_position(Some(at));
+            app.update();
+        };
         let spot = (0..200)
             .map(|x| Vec2::new(200.0 + x as f32, 200.0))
             .find(|&at| {
-                let mut cursor = app.world_mut().get_mut::<Window>(window).unwrap();
-                cursor.set_cursor_position(Some(at));
-                app.update();
+                point_at(&mut app, at);
                 app.world()
                     .resource::<GizmoPointer>()
                     .hovered
                     .is_some_and(|(_, handle)| !matches!(handle, GizmoHandle::Ring(_)))
-            });
-        assert!(spot.is_some(), "a handle on the row through the target");
+            })
+            .expect("a handle on the row through the target");
         app.world_mut().resource_mut::<PressedScene>().0 = true;
-        let mut buttons = app.world_mut().resource_mut::<ButtonInput<MouseButton>>();
-        buttons.press(MouseButton::Left);
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
         app.update();
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .clear();
-        assert!(app.world().resource::<GizmoPointer>().dragging.is_some());
+        point_at(&mut app, spot + Vec2::new(6.0, -4.0));
+        let pointer = app.world().resource::<GizmoPointer>();
+        assert!(pointer.dragging.is_some());
+        assert_eq!(
+            !pointer.readings.is_empty(),
+            reads,
+            "{:?}",
+            pointer.readings
+        );
 
         app.world_mut().despawn(gizmo);
         app.update();
         let pointer = app.world().resource::<GizmoPointer>();
         assert_eq!((pointer.hovered, pointer.dragging), (None, None));
+        assert!(pointer.readings.is_empty(), "nothing left to read");
         assert!(pointer.owns_button(), "the button is still the gizmo's");
 
         app.world_mut()
@@ -2032,6 +2041,41 @@ mod tests {
             .release(MouseButton::Left);
         app.update();
         assert!(!app.world().resource::<GizmoPointer>().owns_button());
+    }
+
+    #[test]
+    fn a_transform_gizmo_taken_away_mid_drag_keeps_the_release() {
+        taken_away_mid_drag(
+            |world, target, camera| {
+                world
+                    .spawn(TransformGizmo::new(target, camera))
+                    .insert(Facing(Vec3::ONE))
+                    .id()
+            },
+            true,
+        );
+    }
+
+    #[test]
+    fn a_joint_gizmo_taken_away_mid_drag_keeps_the_release() {
+        taken_away_mid_drag(
+            |world, target, camera| {
+                world
+                    .spawn(JointGizmo::new(
+                        target,
+                        camera,
+                        crate::joint_gizmo::JointMotion::Turn,
+                        Dir3::Z,
+                        -3.0,
+                        3.0,
+                        0.0,
+                        Color::WHITE,
+                    ))
+                    .insert(crate::joint_gizmo::Rest(Transform::IDENTITY, target))
+                    .id()
+            },
+            false,
+        );
     }
 
     #[test]
