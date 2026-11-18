@@ -336,6 +336,11 @@ pub struct GizmoPointer {
     pub hovered: Option<(Entity, GizmoHandle)>,
     /// The handle being dragged, and its gizmo.
     pub dragging: Option<(Entity, GizmoHandle)>,
+    /// A drag its gizmo ended by going inert, while the button that took it
+    /// is still down. Nothing is held, but the press is still the gizmo's:
+    /// its release is no click, and the view does not take it up. See
+    /// [`GizmoPointer::owns_button`].
+    pub ended: Option<(Entity, GizmoHandle)>,
     /// How far the transform gizmo's drag in hand has gone, in its handle's
     /// own measure ([`Reading`]); empty when no transform handle is held.
     pub readings: Vec<Reading>,
@@ -419,7 +424,15 @@ impl GizmoPointer {
     /// Whether the pointer belongs to a gizmo: a press now would grab a
     /// handle, or one is held.
     pub fn engaged(&self) -> bool {
-        self.hovered.is_some() || self.dragging.is_some()
+        self.hovered.is_some() || self.owns_button()
+    }
+
+    /// Whether the left button now down is a gizmo's: it took a handle, and
+    /// the drag is in hand or was ended by its gizmo going inert. Until it
+    /// comes up, its release is not a click and no gesture of the view's
+    /// starts from it.
+    pub fn owns_button(&self) -> bool {
+        self.dragging.is_some() || self.ended.is_some()
     }
 }
 
@@ -663,7 +676,7 @@ pub(crate) fn hosts_press(
     pointer: &GizmoPointer,
     under: impl FnOnce() -> Option<(Entity, GizmoHandle)>,
 ) -> Option<(Entity, GizmoHandle)> {
-    if button == PointerButton::Primary || pointer.dragging.is_some() {
+    if button == PointerButton::Primary || pointer.owns_button() {
         return None;
     }
     under()
@@ -1347,10 +1360,8 @@ fn drive(
             .unwrap_or(GlobalTransform::IDENTITY)
     };
     let button_up = !buttons.pressed(MouseButton::Left);
-    // A drag a gizmo's going inert ended stays in `dragging` until the button
-    // comes up, so its release is not taken for a click on what lies beneath.
-    if held.is_none() && button_up {
-        pointer.dragging = None;
+    if button_up {
+        pointer.ended = None;
     }
 
     match *held {
@@ -1412,9 +1423,7 @@ fn drive(
             if released {
                 *held = None;
                 pointer.readings.clear();
-                if button_up {
-                    pointer.dragging = None;
-                }
+                let_go(&mut pointer, button_up);
             }
             return;
         }
@@ -1445,9 +1454,7 @@ fn drive(
             });
             if released {
                 *held = None;
-                if button_up {
-                    pointer.dragging = None;
-                }
+                let_go(&mut pointer, button_up);
             }
             return;
         }
@@ -1535,6 +1542,16 @@ fn drive(
         }
     }
     pointer.dragging = Some(hovered);
+}
+
+/// Ends the drag in hand. One its gizmo ended by going inert, with the
+/// button still down, stays the pointer's as `ended` until the button comes
+/// up, so its release is not taken for a click on what lies beneath.
+fn let_go(pointer: &mut GizmoPointer, button_up: bool) {
+    let dragging = pointer.dragging.take();
+    if !button_up {
+        pointer.ended = dragging;
+    }
 }
 
 /// What a drag does to its target.
@@ -1854,9 +1871,10 @@ mod tests {
     }
 
     /// A gizmo made inert part way through a drag ends that drag at once,
-    /// with one `End` and nothing after it while the button stays down. The
-    /// pointer keeps the drag until the button comes up, which is what keeps
-    /// a pick on the release from taking it for a click on the scene. Made
+    /// with one `End` and nothing after it while the button stays down.
+    /// Nothing is held after it, so the overlay and the guides let go, but
+    /// the button stays the gizmo's until it comes up, which is what keeps a
+    /// pick on the release from taking it for a click on the scene. Made
     /// interactive again, the gizmo takes a fresh press.
     fn inert_mid_drag(
         spawn: impl FnOnce(&mut World, Entity, Entity) -> Entity,
@@ -1873,7 +1891,7 @@ mod tests {
         }
         let pointer = |app: &App| {
             let pointer = app.world().resource::<GizmoPointer>();
-            (pointer.hovered, pointer.dragging)
+            (pointer.hovered, pointer.dragging, pointer.owns_button())
         };
         let phases = |app: &App| app.world().resource::<Phases>().0.clone();
         let press = |app: &mut App| {
@@ -1916,17 +1934,16 @@ mod tests {
         for at in [Vec2::new(8.0, -6.0), Vec2::ZERO, Vec2::new(-5.0, 2.0)] {
             point_at(&mut app, spot + at);
             assert_eq!(phases(&app), ended, "nothing more while the button is down");
-            assert!(
-                pointer(&app).1.is_some(),
-                "the pointer keeps the drag until the button comes up"
-            );
+            let (_, dragging, owned) = pointer(&app);
+            assert_eq!(dragging, None, "nothing is held once the drag has ended");
+            assert!(owned, "the button stays the gizmo's until it comes up");
         }
 
         buttons(&mut app).release(MouseButton::Left);
         app.update();
         buttons(&mut app).clear();
         assert_eq!(phases(&app), ended, "the release ends nothing more");
-        assert_eq!(pointer(&app), (None, None), "inert, and let go");
+        assert_eq!(pointer(&app), (None, None, false), "inert, and let go");
 
         set_interactive(app.world_mut(), gizmo, true);
         point_at(&mut app, spot);

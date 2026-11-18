@@ -219,9 +219,10 @@ fn on_release(
         return;
     };
     // A press that took a gizmo's handle is the gizmo's, and so is its
-    // release: the drag it began is still in hand as the release arrives,
-    // since the gizmo lets go only in `Update`, after this.
-    if gizmos.is_some_and(|gizmos| gizmos.dragging.is_some()) {
+    // release: the button is still the gizmo's as the release arrives, since
+    // the gizmo lets go of it only in `Update`, after this — whether its drag
+    // is in hand or was ended by the gizmo going inert.
+    if gizmos.is_some_and(|gizmos| gizmos.owns_button()) {
         return;
     }
     let position = release.pointer.position;
