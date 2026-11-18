@@ -274,10 +274,13 @@ fn start_gesture(
     // (`GizmoPress`). A primary press on a handle the pointer is merely over
     // may never take it, and when it does, the gesture gives way to it at
     // once (`drag`).
-    let position = press.pointer.position;
+    let pointer = &press.pointer;
     if gizmos.as_ref().is_some_and(|gizmos| {
         gizmos.dragging.is_some()
-            || hosts_press(press.button, gizmos, || finder.at(position)).is_some()
+            || hosts_press(press.button, gizmos, || {
+                finder.at(pointer.position, &pointer.target)
+            })
+            .is_some()
     }) || gesture.0.is_some()
     {
         return;

@@ -673,8 +673,10 @@ fn report_other_press(
     if !on_the_scene(press.entity, press.original_event_target(), &windows) {
         return;
     }
-    let position = press.pointer.position;
-    if let Some((entity, handle)) = hosts_press(press.button, &pointer, || finder.at(position)) {
+    let pointer_at = &press.pointer;
+    if let Some((entity, handle)) = hosts_press(press.button, &pointer, || {
+        finder.at(pointer_at.position, &pointer_at.target)
+    }) {
         commands.trigger(GizmoPress {
             entity,
             handle,
@@ -1226,11 +1228,31 @@ pub(crate) struct HandleFinder<'w, 's> {
     cameras: Query<'w, 's, (&'static Camera, &'static GlobalTransform)>,
     globals: Query<'w, 's, &'static GlobalTransform>,
     parents: Query<'w, 's, &'static ChildOf>,
+    targets: Query<'w, 's, &'static bevy::camera::RenderTarget>,
+    primary: Query<'w, 's, Entity, With<bevy::window::PrimaryWindow>>,
+}
+
+/// Whether a camera drawing to `drawn` draws to `wanted`, where "the primary
+/// window" means `primary`. A pointer's position means something only in the
+/// window it is in, so only the gizmos seen there can be under it.
+fn draws_to(
+    drawn: Option<&bevy::camera::RenderTarget>,
+    primary: Option<Entity>,
+    wanted: &bevy::camera::NormalizedRenderTarget,
+) -> bool {
+    drawn.and_then(|drawn| drawn.normalize(primary)).as_ref() == Some(wanted)
 }
 
 impl HandleFinder<'_, '_> {
-    /// The gizmo and handle under `position`, in the window's logical pixels.
-    pub(crate) fn at(&self, position: Vec2) -> Option<(Entity, GizmoHandle)> {
+    /// The gizmo and handle under `position`, in the logical pixels of the
+    /// window `target` names, among the gizmos seen in that window.
+    pub(crate) fn at(
+        &self,
+        position: Vec2,
+        target: &bevy::camera::NormalizedRenderTarget,
+    ) -> Option<(Entity, GizmoHandle)> {
+        let primary = self.primary.iter().next();
+        let seen = |camera: Entity| draws_to(self.targets.get(camera).ok(), primary, target);
         let parent_of = |target: Entity| {
             self.parents
                 .get(target)
@@ -1241,8 +1263,12 @@ impl HandleFinder<'_, '_> {
         };
         nearest_handle(
             position,
-            self.gizmos.iter(),
-            self.joints.iter(),
+            self.gizmos
+                .iter()
+                .filter(|(_, gizmo, ..)| seen(gizmo.camera)),
+            self.joints
+                .iter()
+                .filter(|(_, gizmo, ..)| seen(gizmo.camera)),
             &self.cameras,
             &self.globals,
             parent_of,
@@ -1803,6 +1829,29 @@ mod tests {
         });
         world.flush();
         assert_eq!(world.resource::<Heard>().0, 0);
+    }
+
+    /// A gizmo is under a pointer only through a camera drawing to the
+    /// pointer's window: the primary window for a camera that names it, the
+    /// window itself for one that names it by entity, and never an image.
+    #[test]
+    fn a_gizmo_is_seen_only_in_its_camera_s_window() {
+        use bevy::camera::{ImageRenderTarget, NormalizedRenderTarget, RenderTarget};
+        use bevy::window::WindowRef;
+
+        let [primary, other] = [1, 2].map(|i| Entity::from_raw_u32(i).unwrap());
+        let window = |entity| {
+            NormalizedRenderTarget::Window(WindowRef::Entity(entity).normalize(None).unwrap())
+        };
+        let to_primary = RenderTarget::Window(WindowRef::Primary);
+        let to_other = RenderTarget::Window(WindowRef::Entity(other));
+        assert!(draws_to(Some(&to_primary), Some(primary), &window(primary)));
+        assert!(!draws_to(Some(&to_primary), Some(primary), &window(other)));
+        assert!(draws_to(Some(&to_other), Some(primary), &window(other)));
+        assert!(!draws_to(Some(&to_other), Some(primary), &window(primary)));
+        assert!(!draws_to(None, Some(primary), &window(primary)));
+        let image = RenderTarget::Image(ImageRenderTarget::from(Handle::<Image>::default()));
+        assert!(!draws_to(Some(&image), Some(primary), &window(primary)));
     }
 
     /// A highlighted handle looks hot without the pointer; the others, and
