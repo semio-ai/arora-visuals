@@ -72,7 +72,7 @@ use bevy::prelude::*;
 use bevy::window::{CursorMoved, PrimaryWindow};
 
 use crate::pick::on_the_scene;
-use crate::transform_gizmo::{hosts_press, GizmoPointer, HandleFinder, TransformGizmoSystems};
+use crate::transform_gizmo::{keeps_press, GizmoPointer, HandleFinder, TransformGizmoSystems};
 
 /// Which inputs move a camera ([module docs](self)).
 #[derive(Component, Clone, Copy, Debug)]
@@ -269,18 +269,17 @@ fn start_gesture(
     if !on_the_scene(press.entity, press.original_event_target(), &windows) {
         return;
     }
-    // A drag already in hand keeps the gesture from starting, and so does a
-    // press with any button but the primary on a handle, which is the host's
-    // (`GizmoPress`). A primary press on a handle the pointer is merely over
-    // may never take it, and when it does, the gesture gives way to it at
-    // once (`drag`).
+    // A button a gizmo already owns keeps the gesture from starting — a drag
+    // in hand, or one ended by its gizmo going inert or being taken away —
+    // and so does a press with any button but the primary on a handle, which
+    // is the host's (`GizmoPress`). A primary press on a handle the pointer
+    // is merely over may never take it, and when it does, the gesture gives
+    // way to it at once (`drag`).
     let pointer = &press.pointer;
     if gizmos.as_ref().is_some_and(|gizmos| {
-        gizmos.dragging.is_some()
-            || hosts_press(press.button, gizmos, || {
-                finder.at(pointer.position, &pointer.target)
-            })
-            .is_some()
+        keeps_press(press.button, gizmos, || {
+            finder.at(pointer.position, &pointer.target)
+        })
     }) || gesture.0.is_some()
     {
         return;
