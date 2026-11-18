@@ -72,7 +72,7 @@ use bevy::prelude::*;
 use bevy::window::{CursorMoved, PrimaryWindow};
 
 use crate::pick::on_the_scene;
-use crate::transform_gizmo::{hosts_press, GizmoPointer, HandleFinder, TransformGizmoSystems};
+use crate::transform_gizmo::{keeps_press, GizmoPointer, HandleFinder, TransformGizmoSystems};
 
 /// Which inputs move a camera ([module docs](self)).
 #[derive(Component, Clone, Copy, Debug)]
@@ -277,11 +277,9 @@ fn start_gesture(
     // once (`drag`).
     let pointer = &press.pointer;
     if gizmos.as_ref().is_some_and(|gizmos| {
-        gizmos.owns_button()
-            || hosts_press(press.button, gizmos, || {
-                finder.at(pointer.position, &pointer.target)
-            })
-            .is_some()
+        keeps_press(press.button, gizmos, || {
+            finder.at(pointer.position, &pointer.target)
+        })
     }) || gesture.0.is_some()
     {
         return;

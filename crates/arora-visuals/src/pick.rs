@@ -630,6 +630,95 @@ mod tests {
         assert!(!ray_meets_box(away, &world, &aabb));
     }
 
+    /// A release whose button a gizmo still owns picks nothing — a drag in
+    /// hand, or one its gizmo ended by going inert — and the same release
+    /// with the button free is a click.
+    #[test]
+    fn a_release_a_gizmo_owns_picks_nothing() {
+        use crate::transform_gizmo::GizmoHandle;
+        use bevy::camera::{ComputedCameraValues, NormalizedRenderTarget, RenderTargetInfo};
+        use bevy::picking::backend::HitData;
+        use bevy::picking::events::Pointer;
+        use bevy::picking::pointer::Location;
+        use bevy::window::WindowRef;
+
+        let picks_for = |gizmos: GizmoPointer| {
+            let mut world = World::new();
+            world.init_resource::<Assets<Mesh>>();
+            world.init_resource::<Pressed>();
+            world.init_resource::<ReleasedElsewhere>();
+            world.init_resource::<Picks>();
+            world.insert_resource(gizmos);
+            world.add_observer(on_release);
+            let window = world.spawn(Window::default()).id();
+            // A robot with no elements, seen through a camera the release is
+            // over: a click there is on the robot and on nothing in it.
+            let camera = world
+                .spawn((
+                    Camera {
+                        computed: ComputedCameraValues {
+                            target_info: Some(RenderTargetInfo {
+                                physical_size: UVec2::splat(400),
+                                scale_factor: 1.0,
+                            }),
+                            ..default()
+                        },
+                        ..default()
+                    },
+                    GlobalTransform::IDENTITY,
+                ))
+                .id();
+            world.spawn(EntityInstance {
+                id: "robot".to_string(),
+                asset_path: String::new(),
+                meta: Default::default(),
+                bindings: Default::default(),
+                camera,
+                draw_order: 0,
+                ready: true,
+            });
+            world.resource_mut::<Pressed>().0.insert(
+                PointerId::Mouse,
+                Press {
+                    position: Vec2::splat(200.0),
+                    under: HashSet::new(),
+                },
+            );
+            let target =
+                NormalizedRenderTarget::Window(WindowRef::Entity(window).normalize(None).unwrap());
+            world.trigger(PointerRelease {
+                entity: window,
+                pointer: Pointer::new(
+                    PointerId::Mouse,
+                    Location {
+                        target,
+                        position: Vec2::splat(200.0),
+                    },
+                ),
+                button: PointerButton::Primary,
+                hit: HitData::new(window, 0.0, None, None),
+            });
+            world.flush();
+            world.resource::<Picks>().0.len()
+        };
+        let grip = (Entity::from_raw_u32(9).unwrap(), GizmoHandle::Arrow(0));
+        assert_eq!(picks_for(GizmoPointer::default()), 1, "a click on nothing");
+        let held = GizmoPointer {
+            dragging: Some(grip),
+            ..default()
+        };
+        assert_eq!(picks_for(held), 0, "the release of a drag in hand");
+        let ended = GizmoPointer {
+            ended: Some(grip),
+            ..default()
+        };
+        assert_eq!(
+            picks_for(ended),
+            0,
+            "the release of a drag ended by going inert"
+        );
+    }
+
     /// A press is kept while it is held — by a touch too, which sets no
     /// mouse button — and forgotten once let go somewhere other than the
     /// window.
