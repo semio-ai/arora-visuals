@@ -194,6 +194,9 @@ pub struct Element {
     /// and what a pick reports. Any string: authoring and Studio write UUIDs,
     /// and nothing here reads one as such.
     pub id: String,
+    /// What the author called it (a robot's `base_link`, say), which a host
+    /// knows an element by where it does not hold the id. Empty where unnamed.
+    pub name: String,
     pub node_name: String,
     /// `shape` (mesh-bearing) or `group` — an `ellipse` or `rectangle` reads
     /// as the `shape` it converts to ([`Element::primitive`]); unused until
@@ -393,6 +396,8 @@ impl RawFeature {
 #[derive(Deserialize)]
 struct RawRobotData {
     id: String,
+    #[serde(default)]
+    name: String,
     material: Option<String>,
     #[serde(rename = "type", default)]
     kind: String,
@@ -562,6 +567,7 @@ impl AssetMeta {
             });
             elements.push(Element {
                 id: rd.id,
+                name: rd.name,
                 node_name,
                 kind: if primitive.is_some() {
                     "shape".to_string()
@@ -744,6 +750,25 @@ mod tests {
     #[test]
     fn rejects_non_glb() {
         assert!(AssetMeta::from_glb_bytes(b"not a glb at all....").is_err());
+    }
+
+    /// An element keeps the name its author gave it, which is not its glTF
+    /// node's name; one with none has an empty name.
+    #[test]
+    fn an_element_keeps_its_authored_name() {
+        let gltf = serde_json::json!({
+            "nodes": [
+                { "extensions": { "RobotData": { "id": "a1", "name": "base_link", "type": "group" } } },
+                { "name": "Plate", "extensions": { "RobotData": { "id": "b2", "type": "shape" } } },
+            ]
+        });
+        let meta = AssetMeta::from_gltf_json(&gltf).expect("parses");
+        let names: Vec<_> = meta
+            .elements
+            .iter()
+            .map(|e| (e.id.as_str(), e.name.as_str()))
+            .collect();
+        assert_eq!(names, [("a1", "base_link"), ("b2", "")]);
     }
 
     /// An animatable several elements share binds every one of them, in the
