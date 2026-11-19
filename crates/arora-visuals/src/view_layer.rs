@@ -20,18 +20,16 @@
 //! and reads them back from [`ViewLayers`] once given. A view keeps its layers
 //! while it lives; they are freed when it is despawned.
 
-use std::collections::HashMap;
-
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
 
 use bevy::camera::visibility::VisibilitySystems;
 use bevy::camera::CameraUpdateSystems;
 
-use crate::axes::{FrameAxes, FrameAxesSystems};
-use crate::axis_line::{AxisLine, AxisLineSystems};
-use crate::joint_gizmo::JointGizmo;
-use crate::transform_gizmo::{GizmoPart, TransformGizmo, TransformGizmoSystems};
+use crate::axes::{AxesOf, FrameAxes, FrameAxesSystems};
+use crate::axis_line::{AxisLine, AxisLineSystems, Half};
+use crate::joint_gizmo::{JointGizmo, JointPart};
+use crate::transform_gizmo::{GizmoPart, Part, TransformGizmo, TransformGizmoSystems};
 
 /// A set of one layer. Bevy's `RenderLayers::layer` holds only layers below
 /// 64, and views are given layers from 31 up without a ceiling.
@@ -86,7 +84,7 @@ pub struct ViewLayerSystems;
 /// Which views hold which pair of layers: slot `i` is layers
 /// `VIEW_LAYERS_FROM + 2i` and `VIEW_LAYERS_FROM + 2i + 1`.
 #[derive(Resource, Default)]
-struct Held(Vec<Option<Entity>>);
+pub(crate) struct Held(Vec<Option<Entity>>);
 
 impl Held {
     /// A free pair for `view`, reclaiming any slot whose view is gone.
@@ -183,10 +181,11 @@ fn ask_for_aid_layers(
     }
 }
 
-/// Puts each aid's parts where they belong. A part belongs to the nearest aid
-/// above it (to every aid on that entity, where there are several) — never to the geometry an aid stands on, which a frame's axes sit
-/// among, and never to an aid further up when another lies between — so the
-/// answer is the same whatever order the aids are visited in. It goes:
+/// Puts each aid's parts where they belong. A part belongs to the aid that
+/// built it, told by the mark each kind of aid puts on its parts and found
+/// above the part — never to the geometry an aid stands on, which a frame's
+/// axes sit among, and never to another aid sharing an entity with it, such
+/// as a joint's gizmo and its frame. It goes:
 ///
 /// - for an aid seen through a camera, on that camera's `aids` layer;
 /// - for one seen through a camera that is gone, on no layer at all. The
@@ -194,51 +193,31 @@ fn ask_for_aid_layers(
 ///   the orphan;
 /// - for one seen through no camera, on the default layer, drawn in every
 ///   view that draws it, as before there were views to keep aids to.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn layer_aids(
     mut commands: Commands,
     aids: Aids,
+    kinds: PartKinds,
     views: Query<&ViewLayers>,
     alive: Query<()>,
     parents: Query<&ChildOf>,
     mut parts: Query<(Entity, Option<&mut RenderLayers>), (With<Mesh3d>, With<GizmoPart>)>,
 ) {
-    // Several aids can stand on one entity — a joint's gizmo and its frame —
-    // and their parts all hang beneath it, with nothing to say whose each is.
-    // So a part beneath several takes every layer they would give it, and
-    // shows through each of their cameras.
-    let mut cameras: HashMap<Entity, Vec<Option<Entity>>> = HashMap::new();
-    for (aid, camera) in aids.all() {
-        cameras.entry(aid).or_default().push(camera);
-    }
-    'parts: for (part, held) in &mut parts {
-        let mut at = part;
-        let owners = loop {
-            if let Some(cameras) = cameras.get(&at) {
-                break Some(cameras);
-            }
-            match parents.get(at) {
-                Ok(parent) => at = parent.parent(),
-                Err(_) => break None,
-            }
-        };
-        let Some(owners) = owners else {
+    for (part, held) in &mut parts {
+        let Some(camera) = kinds.camera_of(part, &aids, &parents) else {
             continue;
         };
-        let mut wanted = RenderLayers::none();
-        for camera in owners {
-            wanted = match camera {
-                None => wanted.union(&RenderLayers::default()),
-                Some(camera) => match views.get(*camera) {
-                    Ok(given) => wanted.with(given.aids),
-                    Err(_) if !alive.contains(*camera) => wanted,
-                    // Every live camera an aid names was asked for and given
-                    // its layers earlier in this pass, so this is not reached;
-                    // a part is left as it is rather than guessed at.
-                    Err(_) => continue 'parts,
-                },
-            };
-        }
+        let wanted = match camera {
+            None => RenderLayers::default(),
+            Some(camera) => match views.get(camera) {
+                Ok(given) => only(given.aids),
+                Err(_) if !alive.contains(camera) => RenderLayers::none(),
+                // Every live camera an aid names was asked for and given its
+                // layers earlier in this pass, so this is not reached; a
+                // part is left as it is rather than guessed at.
+                Err(_) => continue,
+            },
+        };
         match held {
             Some(mut held) => {
                 if *held != wanted {
@@ -254,10 +233,51 @@ fn layer_aids(
     }
 }
 
+/// The marks each kind of aid puts on the parts it builds.
+#[derive(bevy::ecs::system::SystemParam)]
+struct PartKinds<'w, 's> {
+    handles: Query<'w, 's, (), With<Part>>,
+    joint_pieces: Query<'w, 's, (), With<JointPart>>,
+    halves: Query<'w, 's, (), With<Half>>,
+    arrows_of: Query<'w, 's, &'static AxesOf>,
+}
+
+impl PartKinds<'_, '_> {
+    /// The camera the aid that built `part` is seen through — `Some(None)`
+    /// for an aid that names none — or `None` for a part no aid above it
+    /// built.
+    fn camera_of(
+        &self,
+        part: Entity,
+        aids: &Aids,
+        parents: &Query<&ChildOf>,
+    ) -> Option<Option<Entity>> {
+        let mut at = part;
+        loop {
+            at = parents.get(at).ok()?.parent();
+            if self.handles.contains(part) {
+                if let Ok((_, gizmo)) = aids.gizmos.get(at) {
+                    return Some(Some(gizmo.camera));
+                }
+            } else if self.joint_pieces.contains(part) {
+                if let Ok((_, joint)) = aids.joints.get(at) {
+                    return Some(Some(joint.camera));
+                }
+            } else if self.halves.contains(part) {
+                if let Ok((_, line)) = aids.lines.get(at) {
+                    return Some(line.camera);
+                }
+            } else if let Ok(AxesOf(frame)) = self.arrows_of.get(at) {
+                return aids.frames.get(*frame).ok().map(|(_, frame)| frame.camera);
+            }
+        }
+    }
+}
+
 /// Gives each camera asking for them its layers. Joining them is
 /// [`keep_joined`]'s, which runs next.
 #[allow(clippy::type_complexity)]
-fn give_layers(
+pub(crate) fn give_layers(
     mut commands: Commands,
     wanting: Query<Entity, (With<WantsViewLayers>, Without<ViewLayers>)>,
     holders: Query<(), Or<(With<ViewLayers>, With<WantsViewLayers>)>>,
@@ -273,7 +293,7 @@ fn give_layers(
 
 /// Keeps each view on its `aids` layer and off its `mask` layer, whatever the
 /// host has since set the view's layers to, or taken them away.
-fn keep_joined(
+pub(crate) fn keep_joined(
     mut views: Query<(Entity, &ViewLayers, Option<&mut RenderLayers>)>,
     mut commands: Commands,
 ) {
@@ -373,6 +393,51 @@ mod tests {
         assert_eq!(after(&mut app, None), joined, "layers taken away");
     }
 
+    /// The kinds of part an aid builds, each with the mark its aid gives it.
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Handle,
+        JointPiece,
+        Half,
+        Arrow,
+    }
+
+    /// A part of `kind` built for `aid`, placed as its aid places it: under
+    /// the aid, or for a frame's arrows under the holder beneath it.
+    fn part(app: &mut App, aid: Entity, kind: Kind) -> Entity {
+        let world = app.world_mut();
+        let mesh = (Mesh3d(Handle::default()), GizmoPart);
+        match kind {
+            Kind::Handle => world.spawn((mesh, Part::stub(), ChildOf(aid))).id(),
+            Kind::JointPiece => world.spawn((mesh, JointPart::stub(), ChildOf(aid))).id(),
+            Kind::Half => world.spawn((mesh, Half::stub(), ChildOf(aid))).id(),
+            Kind::Arrow => {
+                let holder = world.spawn((AxesOf(aid), ChildOf(aid))).id();
+                world.spawn((mesh, ChildOf(holder))).id()
+            }
+        }
+    }
+
+    fn joint(target: Entity, camera: Entity) -> JointGizmo {
+        JointGizmo::new(
+            target,
+            camera,
+            crate::joint_gizmo::JointMotion::Turn,
+            Dir3::Z,
+            -1.0,
+            1.0,
+            0.0,
+            Color::WHITE,
+        )
+    }
+
+    fn frame(camera: Option<Entity>) -> FrameAxes {
+        FrameAxes {
+            camera,
+            ..default()
+        }
+    }
+
     /// A gizmo's meshes go on its camera's `aids` layer in the frame they
     /// appear, so a gizmo seen through one camera never draws in another.
     #[test]
@@ -385,26 +450,19 @@ mod tests {
             .world_mut()
             .spawn(TransformGizmo::new(target, camera))
             .id();
-        let part = app
-            .world_mut()
-            .spawn((Mesh3d(Handle::default()), GizmoPart, ChildOf(gizmo)))
-            .id();
-        let unseen = app
-            .world_mut()
-            .spawn(FrameAxes::default())
-            .with_child((Mesh3d(Handle::default()), GizmoPart))
-            .id();
+        let handle = part(&mut app, gizmo, Kind::Handle);
+        let unseen = app.world_mut().spawn(frame(None)).id();
+        let unseen_arrow = part(&mut app, unseen, Kind::Arrow);
         app.update();
         let given = *app.world().get::<ViewLayers>(camera).expect("asked for");
         assert_eq!(
-            app.world().get::<RenderLayers>(part),
-            Some(&RenderLayers::layer(given.aids)),
+            app.world().get::<RenderLayers>(handle),
+            Some(&only(given.aids))
         );
         let theirs = *app.world().get::<ViewLayers>(other).unwrap();
         assert_ne!(theirs.aids, given.aids);
-        let unseen_mesh = app.world().get::<Children>(unseen).unwrap()[0];
         assert!(
-            app.world().get::<RenderLayers>(unseen_mesh).is_none(),
+            app.world().get::<RenderLayers>(unseen_arrow).is_none(),
             "a frame seen through no camera is left in every view",
         );
     }
@@ -418,34 +476,19 @@ mod tests {
         let [near, far] = [(); 2].map(|_| app.world_mut().spawn_empty().id());
         let body = app
             .world_mut()
-            .spawn((
-                Mesh3d(Handle::default()),
-                FrameAxes {
-                    camera: Some(near),
-                    ..default()
-                },
-            ))
+            .spawn((Mesh3d(Handle::default()), frame(Some(near))))
             .id();
-        let arrow = app
-            .world_mut()
-            .spawn((Mesh3d(Handle::default()), GizmoPart, ChildOf(body)))
-            .id();
+        let arrow = part(&mut app, body, Kind::Arrow);
         let limb = app
             .world_mut()
             .spawn((
                 Mesh3d(Handle::default()),
                 RenderLayers::layer(4),
                 ChildOf(body),
-                FrameAxes {
-                    camera: Some(far),
-                    ..default()
-                },
+                frame(Some(far)),
             ))
             .id();
-        let limb_arrow = app
-            .world_mut()
-            .spawn((Mesh3d(Handle::default()), GizmoPart, ChildOf(limb)))
-            .id();
+        let limb_arrow = part(&mut app, limb, Kind::Arrow);
         app.update();
         let aids = |view| app.world().get::<ViewLayers>(view).unwrap().aids;
         let layers = |entity| app.world().get::<RenderLayers>(entity).cloned();
@@ -468,14 +511,13 @@ mod tests {
         let gizmo = app
             .world_mut()
             .spawn(TransformGizmo::new(target, last))
-            .with_child((Mesh3d(Handle::default()), GizmoPart))
             .id();
+        let handle = part(&mut app, gizmo, Kind::Handle);
         app.update();
         let given = *app.world().get::<ViewLayers>(last).unwrap();
         assert!(given.mask > 64, "{given:?}");
-        let part = app.world().get::<Children>(gizmo).unwrap()[0];
         assert_eq!(
-            app.world().get::<RenderLayers>(part),
+            app.world().get::<RenderLayers>(handle),
             Some(&only(given.aids))
         );
         assert!(app
@@ -489,26 +531,13 @@ mod tests {
     /// gizmos and frames are.
     #[test]
     fn joint_gizmos_and_axis_lines_are_kept_to_their_camera() {
-        use crate::joint_gizmo::JointMotion;
         use crate::transform_gizmo::GizmoSize;
 
         let mut app = app();
         let camera = app.world_mut().spawn_empty().id();
         let target = app.world_mut().spawn_empty().id();
-        let joint = app
-            .world_mut()
-            .spawn(JointGizmo::new(
-                target,
-                camera,
-                JointMotion::Turn,
-                Dir3::Z,
-                -1.0,
-                1.0,
-                0.0,
-                Color::WHITE,
-            ))
-            .with_child((Mesh3d(Handle::default()), GizmoPart))
-            .id();
+        let joint_gizmo = app.world_mut().spawn(joint(target, camera)).id();
+        let piece = part(&mut app, joint_gizmo, Kind::JointPiece);
         let line = app
             .world_mut()
             .spawn(AxisLine {
@@ -519,12 +548,11 @@ mod tests {
                 camera: Some(camera),
                 colour: Color::WHITE,
             })
-            .with_child((Mesh3d(Handle::default()), GizmoPart))
             .id();
+        let half = part(&mut app, line, Kind::Half);
         app.update();
         let wanted = Some(only(app.world().get::<ViewLayers>(camera).unwrap().aids));
-        for aid in [joint, line] {
-            let part = app.world().get::<Children>(aid).unwrap()[0];
+        for part in [piece, half] {
             assert_eq!(app.world().get::<RenderLayers>(part).cloned(), wanted);
         }
     }
@@ -540,74 +568,58 @@ mod tests {
         let gizmo = app
             .world_mut()
             .spawn(TransformGizmo::new(target, camera))
-            .with_child((Mesh3d(Handle::default()), GizmoPart))
             .id();
-        let frame = app
-            .world_mut()
-            .spawn(FrameAxes {
-                camera: Some(camera),
-                ..default()
-            })
-            .with_child((Mesh3d(Handle::default()), GizmoPart))
-            .id();
+        let handle = part(&mut app, gizmo, Kind::Handle);
+        let shown = app.world_mut().spawn(frame(Some(camera))).id();
+        let arrow = part(&mut app, shown, Kind::Arrow);
         app.update();
         let had = *app.world().get::<ViewLayers>(camera).unwrap();
         app.world_mut().despawn(camera);
         let next = app.world_mut().spawn(WantsViewLayers).id();
-        app.world_mut().get_mut::<FrameAxes>(frame).unwrap().camera = None;
+        app.world_mut().get_mut::<FrameAxes>(shown).unwrap().camera = None;
         app.update();
         assert_eq!(
             app.world().get::<ViewLayers>(next),
             Some(&had),
             "the layers moved on"
         );
-        let part = |aid| app.world().get::<Children>(aid).unwrap()[0];
         assert_eq!(
-            app.world().get::<RenderLayers>(part(gizmo)),
+            app.world().get::<RenderLayers>(handle),
             Some(&RenderLayers::none()),
         );
         assert_eq!(
-            app.world().get::<RenderLayers>(part(frame)),
+            app.world().get::<RenderLayers>(arrow),
             Some(&RenderLayers::default()),
         );
     }
 
-    /// Two aids on one entity, seen through different cameras, put their
-    /// parts — which cannot be told apart — in both cameras' views.
+    /// Aids standing on one entity keep their parts to their own cameras:
+    /// a joint's gizmo seen through one, its frame through another, and a
+    /// transform gizmo and a frame naming none beside them.
     #[test]
-    fn aids_sharing_an_entity_show_their_parts_to_each_camera() {
-        use crate::joint_gizmo::JointMotion;
-
+    fn aids_sharing_an_entity_keep_to_their_own_cameras() {
         let mut app = app();
         let [one, two] = [(); 2].map(|_| app.world_mut().spawn_empty().id());
         let target = app.world_mut().spawn_empty().id();
         let both = app
             .world_mut()
-            .spawn((
-                JointGizmo::new(
-                    target,
-                    one,
-                    JointMotion::Turn,
-                    Dir3::Z,
-                    -1.0,
-                    1.0,
-                    0.0,
-                    Color::WHITE,
-                ),
-                FrameAxes {
-                    camera: Some(two),
-                    ..default()
-                },
-            ))
-            .with_child((Mesh3d(Handle::default()), GizmoPart))
+            .spawn((joint(target, one), frame(Some(two))))
             .id();
+        let piece = part(&mut app, both, Kind::JointPiece);
+        let arrow = part(&mut app, both, Kind::Arrow);
+        let pair = app
+            .world_mut()
+            .spawn((TransformGizmo::new(target, one), frame(None)))
+            .id();
+        let handle = part(&mut app, pair, Kind::Handle);
+        let unseen_arrow = part(&mut app, pair, Kind::Arrow);
         app.update();
         let aids = |view| app.world().get::<ViewLayers>(view).unwrap().aids;
-        let part = app.world().get::<Children>(both).unwrap()[0];
-        assert_eq!(
-            app.world().get::<RenderLayers>(part),
-            Some(&only(aids(one)).with(aids(two))),
-        );
+        let layers = |entity| app.world().get::<RenderLayers>(entity).cloned();
+        assert_eq!(layers(piece), Some(only(aids(one))));
+        assert_eq!(layers(arrow), Some(only(aids(two))));
+        assert_eq!(layers(handle), Some(only(aids(one))), "not in every view");
+        assert_eq!(layers(unseen_arrow), None);
     }
 
     /// Added twice, the plugin still gives each view one pair of layers:

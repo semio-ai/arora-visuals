@@ -92,7 +92,7 @@ const ARROW_OPACITY: f32 = 0.4;
 
 /// The arrows showing an entity's axes, held under it; `0` is the entity.
 #[derive(Component)]
-struct AxesOf(Entity);
+pub(crate) struct AxesOf(pub(crate) Entity);
 
 /// One of the lines showing an entity's axes, under it; `0` is the entity.
 #[derive(Component)]

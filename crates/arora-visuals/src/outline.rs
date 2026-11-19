@@ -48,7 +48,9 @@ use bevy::shader::ShaderRef;
 use crate::active_area::FramingSystems;
 use crate::instance::{EntityInstance, Superseded};
 use crate::select::{covered, highlight_of, Highlight, Selection, Selections};
-use crate::view_layer::{only, without_masks, ViewLayerPlugin, ViewLayers, WantsViewLayers};
+use crate::view_layer::{
+    give_layers, keep_joined, only, without_masks, ViewLayerPlugin, ViewLayers, WantsViewLayers,
+};
 
 /// Outline this camera's view of the selection.
 #[derive(Component, Clone, Copy, Debug)]
@@ -190,7 +192,12 @@ impl Plugin for OutlinePlugin {
         .add_systems(
             Update,
             (
+                // A view outlined this frame is given its layers here,
+                // not left for the view layers' own pass later in the
+                // frame, so it is outlined in the frame it asked.
                 ask_for_layers,
+                give_layers,
+                keep_joined,
                 detach_outline,
                 attach_outline,
                 mark_selection,
@@ -575,7 +582,14 @@ mod tests {
             .init_asset::<OutlineMaterial>()
             .add_systems(
                 Update,
-                (ask_for_layers, detach_outline, attach_outline).chain(),
+                (
+                    ask_for_layers,
+                    give_layers,
+                    keep_joined,
+                    detach_outline,
+                    attach_outline,
+                )
+                    .chain(),
             );
         app
     }
@@ -589,8 +603,7 @@ mod tests {
             .world_mut()
             .spawn((Camera::default(), OutlineView::default()))
             .id();
-        // Layers are given in one frame and the outline attached in the next.
-        app.update();
+        // Outlined in the frame it asks.
         app.update();
         let given = *app.world().get::<ViewLayers>(view).expect("layers");
         let parts = app.world().get::<OutlineParts>(view).expect("outlined");

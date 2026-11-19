@@ -113,7 +113,15 @@ pub struct AxisLineSystems;
 
 /// One drawn half of a line: `1.0` out along its direction, `-1.0` back.
 #[derive(Component)]
-struct Half(f32);
+pub(crate) struct Half(f32);
+
+#[cfg(test)]
+impl Half {
+    /// The outward half, for a test that only needs its mark.
+    pub(crate) fn stub() -> Self {
+        Self(1.0)
+    }
+}
 
 /// What a line's halves were built for, so a change rebuilds them.
 #[derive(Component, PartialEq)]

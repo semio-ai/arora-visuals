@@ -522,9 +522,26 @@ impl Material for HandleMaterial {
     }
 }
 
+#[cfg(test)]
+impl Part {
+    /// A part with nothing to draw, for a test that only needs its mark.
+    pub(crate) fn stub() -> Self {
+        Self {
+            handle: GizmoHandle::Arrow(0),
+            offset: Vec3::ZERO,
+            stem: false,
+            meshes: Default::default(),
+            materials: Default::default(),
+            alphas: [1.0; 2],
+            faded: 1.0,
+            hot: false,
+        }
+    }
+}
+
 /// A drawn piece of a handle, with its rest and in-hand looks.
 #[derive(Component)]
-struct Part {
+pub(crate) struct Part {
     handle: GizmoHandle,
     /// Where the piece sits, in gizmo units, laid out about +X before its
     /// handle's axis and facing are applied. Every piece's mesh is built

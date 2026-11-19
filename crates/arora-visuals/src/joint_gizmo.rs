@@ -316,8 +316,16 @@ range_material!(BarRangeMaterial, "joint_bar.wesl");
 
 /// A joint gizmo's two looks: thin at rest, thick and shaded in hand.
 #[derive(Component)]
-struct JointPart {
+pub(crate) struct JointPart {
     hot: bool,
+}
+
+#[cfg(test)]
+impl JointPart {
+    /// A piece at rest, for a test that only needs its mark.
+    pub(crate) fn stub() -> Self {
+        Self { hot: false }
+    }
 }
 
 /// The ring or bar's materials, so its range can be kept current.
