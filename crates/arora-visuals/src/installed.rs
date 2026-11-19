@@ -32,7 +32,6 @@ mod tests {
     use crate::axes::FrameAxesPlugin;
     use crate::drawn::DrawnPlugin;
     use crate::ghost::GhostPlugin;
-    use crate::glow::GlowPlugin;
     use crate::joint_gizmo::JointGizmoPlugin;
     use crate::outline::OutlinePlugin;
     use crate::overlay::OverlayPlugin;
@@ -50,7 +49,6 @@ mod tests {
                 FrameAxesPlugin,
                 DrawnPlugin,
                 GhostPlugin,
-                GlowPlugin,
                 JointGizmoPlugin,
                 OutlinePlugin,
                 OverlayPlugin,

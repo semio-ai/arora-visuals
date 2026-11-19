@@ -1,8 +1,7 @@
 //! What is selected, and which element meshes a selection covers.
 //!
-//! Every way of showing a selection reads both from here, so the outline and
-//! the feature-edge marking can never disagree about what a selected group
-//! includes.
+//! Every way of showing a selection reads both from here, so no two of them
+//! can disagree about what a selected group includes.
 
 use std::collections::HashMap;
 

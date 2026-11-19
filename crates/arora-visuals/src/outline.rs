@@ -28,9 +28,6 @@
 //! A view's outline takes its colour, width and fill from the selection it
 //! shows: a highlight one of those selected elements brings applies to that
 //! view alone.
-//!
-//! [`glow`](crate::glow) marks a selection differently — with its feature
-//! edges — and the two read the same selections.
 
 use bevy::asset::{embedded_asset, embedded_path, AssetPath};
 use bevy::camera::visibility::RenderLayers;
