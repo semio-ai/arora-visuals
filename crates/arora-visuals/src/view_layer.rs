@@ -184,7 +184,7 @@ fn ask_for_aid_layers(
 }
 
 /// Puts each aid's parts where they belong. A part belongs to the nearest aid
-/// above it — never to the geometry an aid stands on, which a frame's axes sit
+/// above it (to every aid on that entity, where there are several) — never to the geometry an aid stands on, which a frame's axes sit
 /// among, and never to an aid further up when another lies between — so the
 /// answer is the same whatever order the aids are visited in. It goes:
 ///
@@ -203,32 +203,42 @@ fn layer_aids(
     parents: Query<&ChildOf>,
     mut parts: Query<(Entity, Option<&mut RenderLayers>), (With<Mesh3d>, With<GizmoPart>)>,
 ) {
-    let cameras: HashMap<Entity, Option<Entity>> = aids.all().collect();
-    for (part, held) in &mut parts {
+    // Several aids can stand on one entity — a joint's gizmo and its frame —
+    // and their parts all hang beneath it, with nothing to say whose each is.
+    // So a part beneath several takes every layer they would give it, and
+    // shows through each of their cameras.
+    let mut cameras: HashMap<Entity, Vec<Option<Entity>>> = HashMap::new();
+    for (aid, camera) in aids.all() {
+        cameras.entry(aid).or_default().push(camera);
+    }
+    'parts: for (part, held) in &mut parts {
         let mut at = part;
-        let owner = loop {
-            if let Some(camera) = cameras.get(&at) {
-                break Some(*camera);
+        let owners = loop {
+            if let Some(cameras) = cameras.get(&at) {
+                break Some(cameras);
             }
             match parents.get(at) {
                 Ok(parent) => at = parent.parent(),
                 Err(_) => break None,
             }
         };
-        let Some(camera) = owner else {
+        let Some(owners) = owners else {
             continue;
         };
-        let wanted = match camera {
-            None => RenderLayers::default(),
-            Some(camera) => match views.get(camera) {
-                Ok(given) => only(given.aids),
-                Err(_) if !alive.contains(camera) => RenderLayers::none(),
-                // Every live camera an aid names was asked for and given its
-                // layers earlier in this pass, so this is not reached; a
-                // part is left as it is rather than guessed at.
-                Err(_) => continue,
-            },
-        };
+        let mut wanted = RenderLayers::none();
+        for camera in owners {
+            wanted = match camera {
+                None => wanted.union(&RenderLayers::default()),
+                Some(camera) => match views.get(*camera) {
+                    Ok(given) => wanted.with(given.aids),
+                    Err(_) if !alive.contains(*camera) => wanted,
+                    // Every live camera an aid names was asked for and given
+                    // its layers earlier in this pass, so this is not reached;
+                    // a part is left as it is rather than guessed at.
+                    Err(_) => continue 'parts,
+                },
+            };
+        }
         match held {
             Some(mut held) => {
                 if *held != wanted {
@@ -559,6 +569,44 @@ mod tests {
         assert_eq!(
             app.world().get::<RenderLayers>(part(frame)),
             Some(&RenderLayers::default()),
+        );
+    }
+
+    /// Two aids on one entity, seen through different cameras, put their
+    /// parts — which cannot be told apart — in both cameras' views.
+    #[test]
+    fn aids_sharing_an_entity_show_their_parts_to_each_camera() {
+        use crate::joint_gizmo::JointMotion;
+
+        let mut app = app();
+        let [one, two] = [(); 2].map(|_| app.world_mut().spawn_empty().id());
+        let target = app.world_mut().spawn_empty().id();
+        let both = app
+            .world_mut()
+            .spawn((
+                JointGizmo::new(
+                    target,
+                    one,
+                    JointMotion::Turn,
+                    Dir3::Z,
+                    -1.0,
+                    1.0,
+                    0.0,
+                    Color::WHITE,
+                ),
+                FrameAxes {
+                    camera: Some(two),
+                    ..default()
+                },
+            ))
+            .with_child((Mesh3d(Handle::default()), GizmoPart))
+            .id();
+        app.update();
+        let aids = |view| app.world().get::<ViewLayers>(view).unwrap().aids;
+        let part = app.world().get::<Children>(both).unwrap()[0];
+        assert_eq!(
+            app.world().get::<RenderLayers>(part),
+            Some(&only(aids(one)).with(aids(two))),
         );
     }
 
