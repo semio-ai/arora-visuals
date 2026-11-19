@@ -11,8 +11,12 @@
 //!
 //! **The rectangle eases rather than jumps**, settling in about a tenth of a
 //! second as Studio's spring does, so a panel sliding in carries the subject
-//! along with it. [`ActiveAreaShown`] is where the eased rectangle stands this
-//! frame, for anything placed relative to it — the view gizmo's corner, say.
+//! along with it. Each ease is timed from the frame its target is first seen,
+//! not from the frame before: a host that draws only on change hands the first
+//! frame after an idle stretch the whole stretch as its delta, and counting it
+//! would land a change set after idling at once. [`ActiveAreaShown`] is where
+//! the eased rectangle stands this frame, for anything placed relative to it —
+//! the view gizmo's corner, say.
 //!
 //! **It frames; it does not decide gestures.** What happens to a press over a
 //! covered part of the canvas is the host's, as it is in Studio, where the
@@ -35,6 +39,31 @@ pub struct ActiveAreaShown(pub Rect);
 /// How quickly the shown area closes on its target, as a time constant in
 /// seconds: about a tenth of a second to settle, as Studio's spring does.
 const EASE: f32 = 0.03;
+
+/// An ease under way on a camera: the rectangle it set out from, the target
+/// it heads for, and when it set out. Kept apart from [`ActiveAreaShown`] so
+/// each frame is placed from the ease's start rather than stepped from the
+/// last frame by that frame's delta, which after an idle stretch is the whole
+/// stretch.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
+struct AreaEase {
+    from: Rect,
+    to: Rect,
+    /// In seconds since startup, as `f64` so an ease keeps its timing in a
+    /// session left open for days.
+    since: f64,
+}
+
+impl AreaEase {
+    /// Where the ease places the area at `elapsed` seconds since startup.
+    fn at(&self, elapsed: f64) -> Rect {
+        let progress = 1.0 - (-((elapsed - self.since) as f32) / EASE).exp();
+        Rect {
+            min: self.from.min.lerp(self.to.min, progress),
+            max: self.from.max.lerp(self.to.max, progress),
+        }
+    }
+}
 
 /// Closer than this, in logical pixels, the shown area is the target.
 const SETTLED: f32 = 0.01;
@@ -79,33 +108,71 @@ pub fn framing(area: Rect, viewport: Vec2) -> SubCameraView {
     }
 }
 
+/// A camera with an active area, where its area stands, and any ease under
+/// way.
+type FramedCamera<'a> = (
+    Entity,
+    &'a mut Camera,
+    &'a ActiveArea,
+    Option<&'a mut ActiveAreaShown>,
+    Option<&'a mut AreaEase>,
+);
+
 /// Eases each camera's shown area toward its target and frames the camera on
 /// it, writing only a change.
-fn ease_areas(
-    time: Res<Time>,
-    mut commands: Commands,
-    mut cameras: Query<(
-        Entity,
-        &mut Camera,
-        &ActiveArea,
-        Option<&mut ActiveAreaShown>,
-    )>,
-) {
-    let step = 1.0 - (-time.delta_secs() / EASE).exp();
-    for (entity, mut camera, area, shown) in &mut cameras {
+fn ease_areas(time: Res<Time>, mut commands: Commands, mut cameras: Query<FramedCamera>) {
+    let elapsed = time.elapsed_secs_f64();
+    for (entity, mut camera, area, shown, ease) in &mut cameras {
         let Some(viewport) = camera.logical_viewport_size() else {
             continue;
         };
         let target = area.0;
         let now = match shown {
             Some(mut shown) => {
-                let eased = Rect {
-                    min: shown.0.min.lerp(target.min, step),
-                    max: shown.0.max.lerp(target.max, step),
+                let ease = match ease {
+                    Some(ease) if ease.to == target => Some(*ease),
+                    // A new target sets out timed from this frame, so the
+                    // first frame of an ease does not move the area however
+                    // long the scene sat idle before it. It sets out from
+                    // where the area stands — or, retargeting an ease under
+                    // way, from where that ease places it now, so a target
+                    // changing every frame (a panel sliding in) still carries
+                    // the area along rather than holding it still.
+                    _ if shown.0 != target => {
+                        let fresh = AreaEase {
+                            from: ease.as_deref().map_or(shown.0, |ease| ease.at(elapsed)),
+                            to: target,
+                            since: elapsed,
+                        };
+                        match ease {
+                            Some(mut ease) => *ease = fresh,
+                            None => {
+                                commands.entity(entity).insert(fresh);
+                            }
+                        }
+                        Some(fresh)
+                    }
+                    // Back at its target before a stale ease settled.
+                    Some(_) => {
+                        commands.entity(entity).remove::<AreaEase>();
+                        None
+                    }
+                    None => None,
                 };
-                let settled = eased.min.distance(target.min) < SETTLED
-                    && eased.max.distance(target.max) < SETTLED;
-                let next = if settled { target } else { eased };
+                let next = match ease {
+                    Some(ease) => {
+                        let eased = ease.at(elapsed);
+                        let settled = eased.min.distance(target.min) < SETTLED
+                            && eased.max.distance(target.max) < SETTLED;
+                        if settled {
+                            commands.entity(entity).remove::<AreaEase>();
+                            target
+                        } else {
+                            eased
+                        }
+                    }
+                    None => target,
+                };
                 if shown.0 != next {
                     shown.0 = next;
                 }
@@ -136,7 +203,7 @@ fn release_areas(
             camera.sub_camera_view = None;
         }
         if let Ok(mut entity) = commands.get_entity(entity) {
-            entity.remove::<ActiveAreaShown>();
+            entity.remove::<(ActiveAreaShown, AreaEase)>();
         }
     }
 }
@@ -164,5 +231,108 @@ mod tests {
         let right_of = framing(Rect::new(380.0, 0.0, 1280.0, 800.0), viewport);
         assert_eq!(right_of.full_size, UVec2::new(900, 800));
         assert_eq!(right_of.offset, Vec2::new(-380.0, 0.0));
+    }
+
+    /// A camera's first area is taken at once; a new one set after the scene
+    /// sat idle — its first frame carrying the whole idle stretch as its
+    /// delta, as a host drawing only on change hands it — still sets out from
+    /// where the area stood and eases over the frames that follow.
+    #[test]
+    fn an_area_set_after_idling_eases() {
+        use bevy::camera::{ComputedCameraValues, RenderTargetInfo};
+        use bevy::ecs::system::RunSystemOnce;
+        use std::time::Duration;
+
+        let mut world = World::new();
+        world.init_resource::<Time>();
+        let camera = world
+            .spawn((
+                Camera {
+                    computed: ComputedCameraValues {
+                        target_info: Some(RenderTargetInfo {
+                            physical_size: UVec2::new(1280, 800),
+                            scale_factor: 1.0,
+                        }),
+                        ..default()
+                    },
+                    ..default()
+                },
+                ActiveArea(Rect::new(0.0, 0.0, 1280.0, 800.0)),
+            ))
+            .id();
+        let frame = |world: &mut World, delta: Duration| {
+            world.resource_mut::<Time>().advance_by(delta);
+            world.run_system_once(ease_areas).unwrap();
+            world.get::<ActiveAreaShown>(camera).unwrap().0
+        };
+        let nominal = Duration::from_secs_f32(1.0 / 60.0);
+
+        let first = frame(&mut world, nominal);
+        assert_eq!(first, Rect::new(0.0, 0.0, 1280.0, 800.0), "taken at once");
+
+        let beside = Rect::new(0.0, 0.0, 900.0, 800.0);
+        world.get_mut::<ActiveArea>(camera).unwrap().0 = beside;
+        let mut widths = vec![frame(&mut world, Duration::from_millis(250)).max.x];
+        for _ in 0..3 {
+            widths.push(frame(&mut world, nominal).max.x);
+        }
+        // The long frame leaves most of the way still to go, rather than
+        // landing within a fraction of a pixel of the target.
+        assert!(
+            widths[0] > 1090.0,
+            "{widths:?}: the frame after idling moves less than halfway"
+        );
+        assert!(
+            widths.windows(2).all(|w| w[1] < w[0]) && widths[3] > 901.0,
+            "{widths:?}: the area closes on its target over several frames"
+        );
+        for _ in 0..30 {
+            frame(&mut world, nominal);
+        }
+        assert_eq!(frame(&mut world, nominal), beside, "and settles on it");
+    }
+
+    /// A target that changes every frame — a panel sliding in, its edge a
+    /// little further each frame — carries the area along with it rather than
+    /// holding it where it stood until the target stops.
+    #[test]
+    fn an_area_retargeted_every_frame_moves() {
+        use bevy::camera::{ComputedCameraValues, RenderTargetInfo};
+        use bevy::ecs::system::RunSystemOnce;
+        use std::time::Duration;
+
+        let mut world = World::new();
+        world.init_resource::<Time>();
+        let camera = world
+            .spawn((
+                Camera {
+                    computed: ComputedCameraValues {
+                        target_info: Some(RenderTargetInfo {
+                            physical_size: UVec2::new(1280, 800),
+                            scale_factor: 1.0,
+                        }),
+                        ..default()
+                    },
+                    ..default()
+                },
+                ActiveArea(Rect::new(0.0, 0.0, 1280.0, 800.0)),
+            ))
+            .id();
+        let nominal = Duration::from_secs_f32(1.0 / 60.0);
+        let frame = |world: &mut World, width: f32| {
+            world.get_mut::<ActiveArea>(camera).unwrap().0 = Rect::new(0.0, 0.0, width, 800.0);
+            world.resource_mut::<Time>().advance_by(nominal);
+            world.run_system_once(ease_areas).unwrap();
+            world.get::<ActiveAreaShown>(camera).unwrap().0.max.x
+        };
+
+        frame(&mut world, 1280.0);
+        let widths: Vec<f32> = (1..=10)
+            .map(|i| frame(&mut world, 1280.0 - 38.0 * i as f32))
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[1] < w[0]) && widths[9] < 1000.0,
+            "{widths:?}: the area follows the sliding target"
+        );
     }
 }
