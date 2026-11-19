@@ -90,21 +90,16 @@ impl Held {
 
 pub struct ViewLayerPlugin;
 
-/// Marks the plugin installed, so the modules that need it can each add it.
-#[derive(Resource, Default)]
-struct Installed;
-
 impl Plugin for ViewLayerPlugin {
     fn is_unique(&self) -> bool {
         false
     }
 
     fn build(&self, app: &mut App) {
-        if app.world().contains_resource::<Installed>() {
+        if !crate::installed::first_install::<Self>(app) {
             return;
         }
-        app.init_resource::<Installed>()
-            .init_resource::<Held>()
+        app.init_resource::<Held>()
             .add_systems(
                 PostUpdate,
                 (give_layers, keep_joined).chain().in_set(ViewLayerSystems),

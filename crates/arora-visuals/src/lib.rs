@@ -75,6 +75,8 @@ pub mod ghost;
 #[cfg(feature = "view")]
 pub mod glow;
 pub mod hold;
+#[cfg(feature = "view")]
+mod installed;
 pub mod instance;
 #[cfg(feature = "view")]
 pub mod joint_gizmo;

@@ -65,7 +65,15 @@ pub struct GlowView;
 pub struct GlowPlugin;
 
 impl Plugin for GlowPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         app.add_plugins(ViewLayerPlugin)
             .init_resource::<Selections>()
             .init_resource::<FeatureEdges>()

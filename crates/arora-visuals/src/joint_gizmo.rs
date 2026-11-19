@@ -348,7 +348,15 @@ pub const JOINT_GIZMO_SIZE: GizmoSize = GizmoSize::World(0.2);
 pub struct JointGizmoPlugin;
 
 impl Plugin for JointGizmoPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         // The pointer handling, the pointer state and the resting handle's
         // material are the transform gizmo's, shared so whichever handle of
         // either is nearest is the one taken; a joint gizmo needs them all.

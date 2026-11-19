@@ -121,7 +121,15 @@ impl Built {
 pub struct FrameAxesPlugin;
 
 impl Plugin for FrameAxesPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         add_handle_material(app);
         app.add_plugins(AxisLinePlugin);
         app.add_systems(

@@ -151,7 +151,15 @@ impl Material for GhostMaterial {
 pub struct GhostPlugin;
 
 impl Plugin for GhostPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         embedded_asset!(app, "ghost.wesl");
         app.add_plugins(MaterialPlugin::<GhostMaterial>::default())
             .init_resource::<GhostLook>()

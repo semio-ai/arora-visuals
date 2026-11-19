@@ -146,7 +146,15 @@ impl OverlaySink {
 pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         // After the gizmos have placed themselves, so their boxes are where
         // this frame draws them.
         app.init_resource::<Overlay>().add_systems(

@@ -121,7 +121,15 @@ struct Watched(HashMap<RetainedViewEntity, Watch>);
 pub struct DrawnPlugin;
 
 impl Plugin for DrawnPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         let (sender, receiver) = channel();
         app.insert_resource(Reports(Mutex::new(receiver)));
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {

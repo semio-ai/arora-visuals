@@ -182,7 +182,15 @@ impl Trackpad {
 pub struct CameraInputPlugin;
 
 impl Plugin for CameraInputPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         app.add_plugins(DefaultPanOrbitCameraPlugins)
             .init_resource::<Gesture>()
             .init_resource::<Trackpad>()

@@ -50,7 +50,15 @@ pub struct FramingSystems;
 pub struct ActiveAreaPlugin;
 
 impl Plugin for ActiveAreaPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         app.add_systems(
             PostUpdate,
             (ease_areas, release_areas)

@@ -610,11 +610,6 @@ pub(crate) fn add_handle_material(app: &mut App) {
 
 pub struct TransformGizmoPlugin;
 
-/// Marks the plugin installed. Its own, not a public resource a host might
-/// also create, so installing it again is the only way to skip installing it.
-#[derive(Resource, Default)]
-struct Installed;
-
 impl Plugin for TransformGizmoPlugin {
     /// The joint gizmo installs this one, and a host may too, in any order;
     /// installing it again does nothing.
@@ -623,10 +618,9 @@ impl Plugin for TransformGizmoPlugin {
     }
 
     fn build(&self, app: &mut App) {
-        if app.world().contains_resource::<Installed>() {
+        if !crate::installed::first_install::<Self>(app) {
             return;
         }
-        app.init_resource::<Installed>();
         add_handle_material(app);
         app.add_plugins(AxisLinePlugin);
         app.init_resource::<GizmoPointer>()

@@ -161,7 +161,15 @@ impl Material for OutlineMaterial {
 pub struct OutlinePlugin;
 
 impl Plugin for OutlinePlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         embedded_asset!(app, "outline.wesl");
         app.add_plugins((
             MaterialPlugin::<OutlineMaterial>::default(),
