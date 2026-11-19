@@ -223,7 +223,9 @@ fn layer_aids(
             Some(camera) => match views.get(camera) {
                 Ok(given) => only(given.aids),
                 Err(_) if !alive.contains(camera) => RenderLayers::none(),
-                // Given its layers in this pass, with nothing to read yet.
+                // Every live camera an aid names was asked for and given its
+                // layers earlier in this pass, so this is not reached; a
+                // part is left as it is rather than guessed at.
                 Err(_) => continue,
             },
         };
@@ -560,12 +562,18 @@ mod tests {
         );
     }
 
+    /// Added twice, the plugin still gives each view one pair of layers:
+    /// built twice, it would give each view two, one pair wasted.
     #[test]
     fn adding_the_plugin_twice_is_harmless() {
         let mut app = app();
         app.add_plugins(ViewLayerPlugin);
-        let view = app.world_mut().spawn(WantsViewLayers).id();
+        let [one, two] = [(); 2].map(|_| app.world_mut().spawn(WantsViewLayers).id());
         app.update();
-        assert!(app.world().get::<ViewLayers>(view).is_some());
+        let mut given: Vec<usize> = [one, two]
+            .map(|view| app.world().get::<ViewLayers>(view).unwrap().aids)
+            .to_vec();
+        given.sort();
+        assert_eq!(given, vec![VIEW_LAYERS_FROM, VIEW_LAYERS_FROM + 2]);
     }
 }

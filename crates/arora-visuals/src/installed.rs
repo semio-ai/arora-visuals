@@ -64,6 +64,8 @@ mod tests {
             ));
             #[cfg(feature = "camera_input")]
             app.add_plugins(crate::camera_input::CameraInputPlugin);
+            #[cfg(feature = "view_gizmo")]
+            app.add_plugins(crate::view_gizmo::ViewGizmoPlugin);
         }
         for label in [Update.intern(), PostUpdate.intern(), Last.intern()] {
             let world = app.world_mut();
