@@ -1,0 +1,48 @@
+{
+  "name": "@semio/import",
+  "version": "0.1.0",
+  "description": "Optional passes over a GLB at import time, compiled to WebAssembly.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/semio-ai/arora-visuals.git",
+    "directory": "packages/import"
+  },
+  "keywords": [
+    "arora",
+    "glb",
+    "gltf",
+    "morph-targets",
+    "wasm"
+  ],
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist/**",
+    "pkg/**",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:wasm": "../../crates/arora-import-wasm/build.sh",
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test dist-tests/*.test.js",
+    "prepack": "cp ../../LICENSE LICENSE && npm run build",
+    "prepublishOnly": "node -e \"if(!require('fs').existsSync('pkg/arora_import_wasm_bg.wasm')){console.error('Missing pkg/. Run npm run build:wasm.');process.exit(1)}\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^6.0.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

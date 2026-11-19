@@ -1,0 +1,18 @@
+[package]
+name = "arora-import-wasm"
+version = "0.1.0"
+edition = { workspace = true }
+license = { workspace = true }
+repository = { workspace = true }
+publish = false
+description = "wasm-bindgen interface for arora-import, shipped as the @semio/import npm package."
+
+[lib]
+# cdylib only: cargo applies no LTO to a lib that is also an rlib, and the
+# browser downloads this module.
+crate-type = ["cdylib"]
+
+[dependencies]
+arora-import = { path = "../arora-import" }
+serde_json = { workspace = true }
+wasm-bindgen = { workspace = true }

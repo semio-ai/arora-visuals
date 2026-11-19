@@ -127,6 +127,20 @@ once and hands the same JSON to both parses. It composes rather than extends:
 it owns a struct holding an `AssetMeta` and its own parse, so neither can grow
 a dependency on the other.
 
+## Import passes: `arora-import`
+
+The workspace's second crate, [`crates/arora-import`](crates/arora-import),
+holds the passes a GLB goes through when an asset is imported, before any
+renderer loads it: today, choosing triangles that stay unfolded across a
+mesh's morph targets. It reaches the browser as the npm package
+[`@semio/import`](packages/import), built from
+[`crates/arora-import-wasm`](crates/arora-import-wasm).
+
+It lives here because every product that loads deformable meshes needs the
+same answer, and it is a crate of its own because it names no Bevy type: a
+pass rewrites a file's bytes before any renderer sees them, so it stays out of
+the Bevy lockstep above, as the rule in "Two costs" asks.
+
 ## Depending on it
 
 **It is not on crates.io yet**, so take it from this repository's `main`,
@@ -171,6 +185,11 @@ by the `github:semio-ai:studio` team; this crate follows the same pattern.
 From then on a release is a version bump on `main`: the release workflow
 publishes whenever the manifest names a version crates.io does not have yet.
 Until step 1, that workflow publishes nothing and says so in its run.
+
+`arora-import` is not published to crates.io; it ships as `@semio/import` on
+npm. npm's trusted publishing cannot create a package either, so its first
+version is a person's too: from `main`, `npm run build:wasm` and then
+`npm publish` in `packages/import`.
 
 ## Consumers
 

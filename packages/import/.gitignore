@@ -1,0 +1,5 @@
+pkg/
+dist/
+dist-tests/
+node_modules/
+LICENSE

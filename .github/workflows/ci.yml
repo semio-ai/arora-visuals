@@ -42,3 +42,34 @@ jobs:
       # reads.
       - name: Package
         run: cargo publish --locked -p arora-visuals --dry-run --all-features --features bevy/x11
+
+  # `@semio/import`: the wasm module built the way a release builds it, then
+  # the package's tests run against it, so a change on either side of the
+  # wasm interface fails here rather than in a consumer.
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The CLI must be the version Cargo.lock pins for the wasm-bindgen crate.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Build and test the npm package
+        working-directory: packages/import
+        run: |
+          npm ci
+          npm run build:wasm
+          npm test
