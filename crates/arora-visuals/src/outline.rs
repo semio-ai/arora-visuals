@@ -18,15 +18,18 @@
 //! Because the mask camera draws each mesh as the GPU does, a mesh a morph has
 //! moved is outlined where it now is.
 //!
-//! The mask camera finds the selection through a render layer of its own,
-//! [`OUTLINE_LAYER`], which a selected mesh joins and leaves as the selection
-//! changes. Whatever layers the mesh had before are kept, so it stays visible
-//! everywhere it was.
+//! The mask camera finds the selection through its view's `mask` layer
+//! ([`ViewLayers`]), which a selected mesh joins and leaves as the selection
+//! changes. A mesh joins the mask of each outlined view that draws it, and
+//! no other, so a view outlines only what it shows even when another view's
+//! content stands in the same place. Whatever layers the mesh had before are
+//! kept, so it stays visible everywhere it was.
 //!
-//! [`glow`](crate::glow) marks a selection differently — with its feature
-//! edges — and the two read the same selections.
+//! A view's outline takes its colour, width and fill from the selection it
+//! shows: a highlight one of those selected elements brings applies to that
+//! view alone.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bevy::asset::{embedded_asset, embedded_path, AssetPath};
 use bevy::camera::visibility::RenderLayers;
@@ -44,12 +47,10 @@ use bevy::shader::ShaderRef;
 
 use crate::active_area::FramingSystems;
 use crate::instance::{EntityInstance, Superseded};
-#[cfg(test)]
-use crate::select::Selection;
-use crate::select::{covered, Highlight, Selections};
-
-/// The render layer the mask camera draws, and only selected meshes are on.
-pub const OUTLINE_LAYER: usize = 30;
+use crate::select::{covered, highlight_of, Highlight, Selection, Selections};
+use crate::view_layer::{
+    give_layers, keep_joined, only, without_masks, ViewLayerPlugin, ViewLayers, WantsViewLayers,
+};
 
 /// Outline this camera's view of the selection.
 #[derive(Component, Clone, Copy, Debug)]
@@ -89,60 +90,39 @@ pub struct OutlineOverlay;
 #[derive(Component)]
 struct OutlineMask;
 
-/// What an outlined view owns: its mask camera, the mask, the quad, and the
-/// render layer the quad is on, which the view joins beside its own.
+/// What an outlined view owns: its mask camera, the mask and the quad, which
+/// is on the view's `aids` layer so that no other camera draws it. And what
+/// the view's selection currently is: whether it holds anything, and the
+/// highlight it asks for.
 #[derive(Component)]
 struct OutlineParts {
     mask_camera: Entity,
     overlay: Entity,
     mask: Handle<Image>,
     material: Handle<OutlineMaterial>,
-    layer: usize,
+    selecting: bool,
+    highlight: Option<Highlight>,
 }
 
-/// The first of the render layers outline quads are drawn on, one per
-/// outlined view, upward from here. **A host must not draw its own entities
-/// on these**: an outlined view joins its quad's layer, so anything else on
-/// it would be drawn into that view.
-pub const OVERLAY_LAYERS_FROM: usize = OUTLINE_LAYER + 1;
-
-/// Which views hold which quad layers: slot `i` is layer
-/// `OVERLAY_LAYERS_FROM + i`. A quad rides its view's camera, so on a layer
-/// another camera drew it would show up in that camera's picture as a stray
-/// rectangle; a layer of its own, which only its view joins, keeps it to the
-/// view it belongs to, whatever other layers that view draws.
-#[derive(Resource, Default)]
-struct OverlayLayers(Vec<Option<Entity>>);
-
-impl OverlayLayers {
-    /// A free layer for `view`, reclaiming any slot whose view is gone.
-    fn take(&mut self, view: Entity, alive: impl Fn(Entity) -> bool) -> usize {
-        let slot = match self
-            .0
-            .iter()
-            .position(|held| held.is_none_or(|holder| !alive(holder)))
-        {
-            Some(slot) => slot,
-            None => {
-                self.0.push(None);
-                self.0.len() - 1
-            }
-        };
-        self.0[slot] = Some(view);
-        OVERLAY_LAYERS_FROM + slot
-    }
-
-    fn free(&mut self, layer: usize) {
-        if let Some(held) = self.0.get_mut(layer - OVERLAY_LAYERS_FROM) {
-            *held = None;
-        }
-    }
-}
-
-/// On a mesh currently in the mask: the layers it had before it joined.
+/// On a mesh currently in some view's mask: whether it had no layers of its
+/// own when it joined, so it can be given none again when it leaves.
+///
+/// What else it is on is read from its layers as they are, less the masks,
+/// not remembered from when it joined: a host may move a selected mesh to
+/// another layer, and that change stands.
 #[derive(Component)]
 struct Outlined {
-    before: Option<RenderLayers>,
+    bare: bool,
+}
+
+/// A mesh's own layers — what it is drawn on apart from any mask — or `None`
+/// for a mesh with no layers of its own.
+fn own_layers(now: Option<&RenderLayers>, marked: Option<&Outlined>) -> Option<RenderLayers> {
+    let Some(marked) = marked else {
+        return now.cloned();
+    };
+    let own = without_masks(&now.cloned().unwrap_or_default());
+    (!(marked.bare && own == RenderLayers::default())).then_some(own)
 }
 
 #[derive(ShaderType, Clone, Debug, Default)]
@@ -194,46 +174,80 @@ impl Material for OutlineMaterial {
 pub struct OutlinePlugin;
 
 impl Plugin for OutlinePlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         embedded_asset!(app, "outline.wesl");
-        app.add_plugins(MaterialPlugin::<OutlineMaterial>::default())
-            .init_resource::<Selections>()
-            .init_resource::<OverlayLayers>()
-            .add_systems(
-                Update,
-                (detach_outline, attach_outline, mark_selection).chain(),
+        app.add_plugins((
+            MaterialPlugin::<OutlineMaterial>::default(),
+            ViewLayerPlugin,
+        ))
+        .init_resource::<Selections>()
+        .add_systems(
+            Update,
+            (
+                // A view outlined this frame is given its layers here,
+                // not left for the view layers' own pass later in the
+                // frame, so it is outlined in the frame it asked.
+                ask_for_layers,
+                give_layers,
+                keep_joined,
+                detach_outline,
+                attach_outline,
+                mark_selection,
             )
-            // The mask follows the view's framing before Bevy computes either
-            // camera's projection; the quad is fitted to the projection Bevy
-            // then computed, sub-view and all.
-            .add_systems(
-                PostUpdate,
-                (
-                    sync_mask.after(FramingSystems).before(CameraUpdateSystems),
-                    fit_overlay
-                        .after(CameraUpdateSystems)
-                        .after(TransformSystems::Propagate),
-                ),
-            );
+                .chain(),
+        )
+        // The mask follows the view's framing before Bevy computes either
+        // camera's projection; the quad is fitted to the projection Bevy
+        // then computed, sub-view and all.
+        .add_systems(
+            PostUpdate,
+            (
+                sync_mask.after(FramingSystems).before(CameraUpdateSystems),
+                fit_overlay
+                    .after(CameraUpdateSystems)
+                    .after(TransformSystems::Propagate),
+            ),
+        );
     }
 }
 
-/// Gives each newly outlined view its mask camera, mask and overlay.
+/// Asks for the layers of each outlined view that has none yet.
+#[allow(clippy::type_complexity)]
+fn ask_for_layers(
+    mut commands: Commands,
+    views: Query<
+        Entity,
+        (
+            With<OutlineView>,
+            Without<ViewLayers>,
+            Without<WantsViewLayers>,
+        ),
+    >,
+) {
+    for view in &views {
+        commands.entity(view).insert(WantsViewLayers);
+    }
+}
+
+/// Gives each newly outlined view its mask camera, mask and overlay, once
+/// the view has its layers.
 #[allow(clippy::type_complexity)]
 fn attach_outline(
     mut commands: Commands,
-    views: Query<(Entity, &Camera, &OutlineView, Option<&RenderLayers>), Without<OutlineParts>>,
-    owners: Query<(), Or<(With<OutlineView>, With<OutlineParts>)>>,
-    mut layers: ResMut<OverlayLayers>,
+    views: Query<(Entity, &Camera, &OutlineView, &ViewLayers), Without<OutlineParts>>,
     mut images: ResMut<Assets<Image>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<OutlineMaterial>>,
 ) {
-    for (view, camera, settings, view_layers) in &views {
-        // A holder is alive while it still asks for an outline, so a view
-        // attaching earlier in this same pass, whose parts are not yet
-        // inserted, keeps its layer.
-        let layer = layers.take(view, |holder| owners.contains(holder));
+    for (view, camera, settings, given) in &views {
         // Resized to the view as soon as the view knows its size.
         let mask = images.add(Image::new_target_texture(
             1,
@@ -261,7 +275,7 @@ fn attach_outline(
                     handle: mask.clone(),
                     scale_factor: camera.target_scaling_factor().unwrap_or(1.0),
                 }),
-                RenderLayers::layer(OUTLINE_LAYER),
+                only(given.mask),
                 Msaa::Off,
                 Tonemapping::None,
                 Transform::IDENTITY,
@@ -274,7 +288,7 @@ fn attach_outline(
                 Mesh3d(meshes.add(Rectangle::new(1.0, 1.0))),
                 MeshMaterial3d(material.clone()),
                 Transform::IDENTITY,
-                RenderLayers::layer(layer),
+                only(given.aids),
                 NotShadowCaster,
                 NotShadowReceiver,
                 ChildOf(view),
@@ -285,37 +299,28 @@ fn attach_outline(
                 Pickable::IGNORE,
             ))
             .id();
-        commands.entity(view).insert((
-            view_layers.cloned().unwrap_or_default().with(layer),
-            OutlineParts {
-                mask_camera,
-                overlay,
-                mask,
-                material,
-                layer,
-            },
-        ));
+        commands.entity(view).insert(OutlineParts {
+            mask_camera,
+            overlay,
+            mask,
+            material,
+            selecting: false,
+            highlight: None,
+        });
     }
 }
 
 /// Takes an outline away from a view no longer asking for one: its mask
-/// camera and quad go, its layer is freed, and the view leaves that layer
-/// alone — whatever other layers it has now, the host's to keep, including
-/// any set since the outline came.
+/// camera and quad go. The view keeps its layers, which anything else drawn
+/// for it may still be on.
 fn detach_outline(
     mut commands: Commands,
-    views: Query<(Entity, &OutlineParts, Option<&RenderLayers>), Without<OutlineView>>,
-    mut layers: ResMut<OverlayLayers>,
+    views: Query<(Entity, &OutlineParts), Without<OutlineView>>,
 ) {
-    for (view, parts, view_layers) in &views {
+    for (view, parts) in &views {
         commands.entity(parts.mask_camera).despawn();
         commands.entity(parts.overlay).despawn();
-        layers.free(parts.layer);
-        let left = view_layers
-            .cloned()
-            .unwrap_or_default()
-            .without(parts.layer);
-        commands.entity(view).insert(left).remove::<OutlineParts>();
+        commands.entity(view).remove::<OutlineParts>();
     }
 }
 
@@ -332,99 +337,130 @@ fn uniform(settings: &OutlineView, highlight: Option<Highlight>, scale: f32) -> 
     }
 }
 
-/// Moves the selection's meshes into the mask and everything else out of it.
+/// Moves each selected mesh into the mask of every outlined view that draws
+/// it, and everything else out of the masks; and records, per view, whether
+/// it has anything to outline and the highlight its selection asks for.
 fn mark_selection(
     mut commands: Commands,
     selections: Res<Selections>,
     instances: Query<&EntityInstance, Without<Superseded>>,
     parents: Query<&ChildOf>,
-    layers: Query<Option<&RenderLayers>>,
+    mut views: Query<(&ViewLayers, Option<&RenderLayers>, &mut OutlineParts)>,
+    layers: Query<(Option<&RenderLayers>, Option<&Outlined>)>,
     outlined: Query<(Entity, &Outlined)>,
 ) {
-    let mut wanted = HashSet::new();
+    // Each selected mesh, with what it was on before any mask, and the
+    // selection it is selected through.
+    let mut selected: Vec<(Entity, Option<RenderLayers>, &Selection)> = Vec::new();
     for instance in &instances {
         if !instance.bindings.indexed {
             continue;
         }
-        let Some(selected) = selections.0.get(&instance.id) else {
+        let Some(chosen) = selections.0.get(&instance.id) else {
             continue;
         };
-        for selection in selected {
-            wanted.extend(
-                covered(instance, &selection.element, &parents)
-                    .into_iter()
-                    .filter_map(|element| element.mesh),
-            );
+        for selection in chosen {
+            for mesh in covered(instance, &selection.element, &parents)
+                .into_iter()
+                .filter_map(|element| element.mesh)
+            {
+                let Ok((now, marked)) = layers.get(mesh) else {
+                    continue;
+                };
+                selected.push((mesh, own_layers(now, marked), selection));
+            }
+        }
+    }
+
+    let views: Vec<_> = views
+        .iter_mut()
+        .map(|(given, layers, parts)| (*given, layers.cloned().unwrap_or_default(), parts))
+        .collect();
+    // Keyed, not searched: a held group selection can cover thousands of
+    // meshes, and this runs every frame.
+    let mut wanted: HashMap<Entity, (Option<RenderLayers>, RenderLayers)> = HashMap::new();
+    let mut shown: Vec<Vec<&Selection>> = vec![Vec::new(); views.len()];
+    let mut counted: Vec<HashSet<*const Selection>> = vec![HashSet::new(); views.len()];
+    for (mesh, own, selection) in &selected {
+        let drawn_on = own.clone().unwrap_or_default();
+        let mut joined = drawn_on.clone();
+        for (index, (given, content, _)) in views.iter().enumerate() {
+            if drawn_on.intersects(content) {
+                joined = joined.with(given.mask);
+                if counted[index].insert(std::ptr::from_ref(*selection)) {
+                    shown[index].push(selection);
+                }
+            }
+        }
+        if joined != drawn_on {
+            wanted.entry(*mesh).or_insert((own.clone(), joined));
+        }
+    }
+    for ((_, _, mut parts), shown) in views.into_iter().zip(shown) {
+        let selecting = !shown.is_empty();
+        let highlight = highlight_of(shown);
+        if parts.selecting != selecting {
+            parts.selecting = selecting;
+        }
+        if parts.highlight != highlight {
+            parts.highlight = highlight;
         }
     }
 
     for (mesh, marked) in &outlined {
-        if wanted.remove(&mesh) {
+        if wanted.contains_key(&mesh) {
             continue;
         }
+        let Ok((now, _)) = layers.get(mesh) else {
+            continue;
+        };
         let mut entity = commands.entity(mesh);
-        match &marked.before {
-            Some(before) => entity.insert(before.clone()),
+        match own_layers(now, Some(marked)) {
+            Some(own) => entity.insert(own),
             None => entity.remove::<RenderLayers>(),
         };
         entity.remove::<Outlined>();
     }
-    for mesh in wanted {
-        let Ok(before) = layers.get(mesh) else {
+    for (mesh, (own, joined)) in wanted {
+        let Ok((now, marked)) = layers.get(mesh) else {
             continue;
         };
-        let joined = before.cloned().unwrap_or_default().with(OUTLINE_LAYER);
-        commands.entity(mesh).insert((
-            joined,
-            Outlined {
-                before: before.cloned(),
-            },
-        ));
+        if marked.is_some() && now == Some(&joined) {
+            continue;
+        }
+        let bare = match marked {
+            Some(marked) => marked.bare,
+            None => own.is_none(),
+        };
+        commands.entity(mesh).insert((joined, Outlined { bare }));
     }
 }
 
 /// Keeps the mask the size of the view and the mask camera looking through
 /// the view's lens — its projection and its sub-view, so a view framed beside
-/// a panel masks what it draws — and keeps the view on its quad's layer if
-/// the host has since replaced the view's layers.
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+/// a panel masks what it draws.
+#[allow(clippy::type_complexity)]
 fn sync_mask(
-    mut commands: Commands,
-    selections: Res<Selections>,
-    views: Query<(
-        Entity,
-        &Camera,
-        &Projection,
-        &OutlineView,
-        &OutlineParts,
-        Option<&RenderLayers>,
-    )>,
+    views: Query<(&Camera, &Projection, &OutlineView, &OutlineParts)>,
     mut cameras: Query<
         (&mut Camera, &mut Projection, &mut RenderTarget),
         (With<OutlineMask>, Without<OutlineParts>),
     >,
     mut overlays: Query<&mut Visibility, With<OutlineOverlay>>,
-    outlined: Query<(), With<Outlined>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<OutlineMaterial>>,
 ) {
-    // With nothing selected there is nothing to outline, and the mask pass
-    // and the quad's dozens of samples a pixel are paid for nothing; both
-    // stand down until a selection appears.
-    let selecting = !outlined.is_empty();
-    for (view, camera, projection, settings, parts, view_layers) in &views {
+    for (camera, projection, settings, parts) in &views {
+        // With nothing of its own selected a view has nothing to outline, and
+        // the mask pass and the quad's dozens of samples a pixel would be
+        // paid for nothing; both stand down until a selection appears.
+        let selecting = parts.selecting;
         if let Ok(mut visibility) = overlays.get_mut(parts.overlay) {
             visibility.set_if_neq(if selecting {
                 Visibility::Inherited
             } else {
                 Visibility::Hidden
             });
-        }
-        let joined = RenderLayers::layer(parts.layer);
-        if !view_layers.is_some_and(|layers| layers.intersects(&joined)) {
-            commands
-                .entity(view)
-                .insert(view_layers.cloned().unwrap_or_default().with(parts.layer));
         }
         if let Ok((mut mask_camera, mut lens, mut target)) = cameras.get_mut(parts.mask_camera) {
             let scale = camera.target_scaling_factor().unwrap_or(1.0);
@@ -466,7 +502,7 @@ fn sync_mask(
         // resize counts, because it replaces the mask the material binds.
         let wanted = uniform(
             settings,
-            selections.highlight(),
+            parts.highlight,
             camera.target_scaling_factor().unwrap_or(1.0),
         );
         let stale = materials.get(&parts.material).is_some_and(|material| {
@@ -540,42 +576,52 @@ mod tests {
 
     fn outline_app() -> App {
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+        app.add_plugins((MinimalPlugins, AssetPlugin::default(), ViewLayerPlugin))
             .init_asset::<Image>()
             .init_asset::<Mesh>()
             .init_asset::<OutlineMaterial>()
-            .init_resource::<OverlayLayers>()
-            .add_systems(Update, (detach_outline, attach_outline).chain());
+            .add_systems(
+                Update,
+                (
+                    ask_for_layers,
+                    give_layers,
+                    keep_joined,
+                    detach_outline,
+                    attach_outline,
+                )
+                    .chain(),
+            );
         app
     }
 
-    fn quad_layer(app: &mut App, view: Entity) -> usize {
-        app.world()
-            .get::<OutlineParts>(view)
-            .expect("outlined")
-            .layer
-    }
-
-    /// Views outlined in the same frame each get a quad layer of their own.
+    /// An outlined view's quad is on its `aids` layer and its mask camera
+    /// draws its `mask` layer, so neither reaches another view.
     #[test]
-    fn views_outlined_together_get_layers_of_their_own() {
+    fn an_outlined_views_parts_are_on_its_own_layers() {
         let mut app = outline_app();
-        let first = app
+        let view = app
             .world_mut()
             .spawn((Camera::default(), OutlineView::default()))
             .id();
-        let second = app
-            .world_mut()
-            .spawn((Camera::default(), OutlineView::default()))
-            .id();
+        // Outlined in the frame it asks.
         app.update();
-        assert_ne!(quad_layer(&mut app, first), quad_layer(&mut app, second));
+        let given = *app.world().get::<ViewLayers>(view).expect("layers");
+        let parts = app.world().get::<OutlineParts>(view).expect("outlined");
+        let (overlay, mask_camera) = (parts.overlay, parts.mask_camera);
+        assert_eq!(
+            app.world().get::<RenderLayers>(overlay),
+            Some(&RenderLayers::layer(given.aids)),
+        );
+        assert_eq!(
+            app.world().get::<RenderLayers>(mask_camera),
+            Some(&RenderLayers::layer(given.mask)),
+        );
     }
 
-    /// Taking an outline away leaves the view every layer but the quad's,
-    /// including one the host gave it after the outline came.
+    /// Taking an outline away leaves the view the layers it has, the host's
+    /// included, and the parts go.
     #[test]
-    fn removing_an_outline_keeps_the_hosts_layers() {
+    fn removing_an_outline_keeps_the_views_layers() {
         let mut app = outline_app();
         let view = app
             .world_mut()
@@ -586,23 +632,24 @@ mod tests {
             ))
             .id();
         app.update();
-        let quad = quad_layer(&mut app, view);
+        app.update();
+        let overlay = app
+            .world()
+            .get::<OutlineParts>(view)
+            .expect("outlined")
+            .overlay;
         let given = app
             .world()
             .get::<RenderLayers>(view)
             .cloned()
             .unwrap()
             .with(5);
-        app.world_mut().entity_mut(view).insert(given);
+        app.world_mut().entity_mut(view).insert(given.clone());
         app.world_mut().entity_mut(view).remove::<OutlineView>();
         app.update();
-        let left = app.world().get::<RenderLayers>(view).cloned().unwrap();
-        assert_eq!(
-            left,
-            RenderLayers::from_layers(&[0, 5]),
-            "quad layer {quad}"
-        );
+        assert_eq!(app.world().get::<RenderLayers>(view), Some(&given));
         assert!(app.world().get::<OutlineParts>(view).is_none());
+        assert!(app.world().get_entity(overlay).is_err(), "the quad went");
     }
 
     /// The quad's corners, carried through `clip_from_view`, land just past
@@ -644,14 +691,44 @@ mod tests {
         }
     }
 
+    /// The layers of the two views in [`world`]: one drawing the default
+    /// layer, one drawing layer 2.
+    const ON_DEFAULT: ViewLayers = ViewLayers { aids: 31, mask: 32 };
+    const ON_TWO: ViewLayers = ViewLayers { aids: 33, mask: 34 };
+
+    fn parts() -> OutlineParts {
+        OutlineParts {
+            mask_camera: Entity::PLACEHOLDER,
+            overlay: Entity::PLACEHOLDER,
+            mask: Handle::default(),
+            material: Handle::default(),
+            selecting: false,
+            highlight: None,
+        }
+    }
+
     /// A world with one indexed instance of two elements, each with a mesh:
-    /// one already on a layer of its own, one on no layer at all.
-    fn world() -> (World, Entity, Entity) {
+    /// one on layer 2, one on no layer at all. And two outlined views, one
+    /// drawing the default layer and one drawing layer 2, as two consumers
+    /// sharing an app would, their content standing in the same place.
+    fn world() -> (World, Entity, Entity, [Entity; 2]) {
         let mut world = World::new();
         world.init_resource::<Selections>();
         let layered = world.spawn(RenderLayers::layer(2)).id();
         let bare = world.spawn_empty().id();
         let camera = world.spawn_empty().id();
+        let views = [
+            world
+                .spawn((
+                    ON_DEFAULT,
+                    RenderLayers::layer(0).with(ON_DEFAULT.aids),
+                    parts(),
+                ))
+                .id(),
+            world
+                .spawn((ON_TWO, RenderLayers::layer(2).with(ON_TWO.aids), parts()))
+                .id(),
+        ];
 
         let mut bindings = SceneBindings::default();
         for (id, mesh) in [("layered", layered), ("bare", bare)] {
@@ -674,38 +751,42 @@ mod tests {
             draw_order: 0,
             ready: true,
         });
-        (world, layered, bare)
+        (world, layered, bare, views)
     }
 
-    fn select(world: &mut World, ids: &[&str]) {
-        world.resource_mut::<Selections>().0.insert(
-            "robot".to_string(),
-            ids.iter().map(|id| Selection::of(*id)).collect(),
-        );
+    fn select(world: &mut World, chosen: Vec<Selection>) {
+        world
+            .resource_mut::<Selections>()
+            .0
+            .insert("robot".to_string(), chosen);
         world.run_system_once(mark_selection).unwrap();
     }
 
-    /// Joining the mask must not take a mesh off any layer it was on, and
-    /// leaving it must put back exactly what was there — including nothing.
-    /// A mesh left on the wrong layers either vanishes from views it belonged
-    /// to or stays outlined after it is deselected, and neither shows as an
-    /// error.
-    #[test]
-    fn a_selected_mesh_joins_the_mask_and_leaves_it_as_it_was() {
-        let (mut world, layered, bare) = world();
+    fn of(ids: &[&str]) -> Vec<Selection> {
+        ids.iter().map(|id| Selection::of(*id)).collect()
+    }
 
-        select(&mut world, &["layered", "bare"]);
+    /// A selected mesh joins the mask of the view that draws it and no
+    /// other, and leaving puts back exactly what was there — including
+    /// nothing. A mesh left on the wrong layers either vanishes from views it
+    /// belonged to, stays outlined after it is deselected, or is outlined in
+    /// a view that does not show it, and none of those shows as an error.
+    #[test]
+    fn a_selected_mesh_joins_only_the_masks_of_the_views_that_draw_it() {
+        let (mut world, layered, bare, _) = world();
+
+        select(&mut world, of(&["layered", "bare"]));
         assert_eq!(
             world.get::<RenderLayers>(layered),
-            Some(&RenderLayers::layer(2).with(OUTLINE_LAYER)),
+            Some(&RenderLayers::layer(2).with(ON_TWO.mask)),
         );
         assert_eq!(
             world.get::<RenderLayers>(bare),
-            Some(&RenderLayers::default().with(OUTLINE_LAYER)),
+            Some(&RenderLayers::default().with(ON_DEFAULT.mask)),
             "a mesh on no layer is on the default one, and keeps it",
         );
 
-        select(&mut world, &["bare"]);
+        select(&mut world, of(&["bare"]));
         assert_eq!(
             world.get::<RenderLayers>(layered),
             Some(&RenderLayers::layer(2)),
@@ -714,10 +795,94 @@ mod tests {
         assert!(world.get::<Outlined>(layered).is_none());
         assert!(world.get::<Outlined>(bare).is_some(), "still selected");
 
-        select(&mut world, &[]);
+        select(&mut world, of(&[]));
         assert!(
             world.get::<RenderLayers>(bare).is_none(),
             "a mesh that had no layers has none again",
+        );
+    }
+
+    /// A host moving a selected mesh to another layer is obeyed: the mesh
+    /// follows into the view that draws its new layer, leaves the old one's
+    /// mask, and keeps the new layer once deselected.
+    #[test]
+    fn a_host_may_move_a_selected_mesh_to_another_layer() {
+        let (mut world, layered, ..) = world();
+        select(&mut world, of(&["layered"]));
+        let moved = RenderLayers::layer(0).with(ON_TWO.mask);
+        world.entity_mut(layered).insert(moved);
+        select(&mut world, of(&["layered"]));
+        assert_eq!(
+            world.get::<RenderLayers>(layered),
+            Some(&RenderLayers::layer(0).with(ON_DEFAULT.mask)),
+        );
+        select(&mut world, of(&[]));
+        assert_eq!(
+            world.get::<RenderLayers>(layered),
+            Some(&RenderLayers::layer(0))
+        );
+    }
+
+    /// A selected mesh no outlined view draws is left exactly as it was: no
+    /// mask to join, so nothing to restore later.
+    #[test]
+    fn a_selected_mesh_no_view_draws_is_left_alone() {
+        let (mut world, ..) = world();
+        let unseen = world.spawn(RenderLayers::layer(7)).id();
+        let mut instances = world.query::<&mut EntityInstance>();
+        instances
+            .single_mut(&mut world)
+            .unwrap()
+            .bindings
+            .elements
+            .insert(
+                "unseen".to_string(),
+                ElementTargets {
+                    node: unseen,
+                    mesh: Some(unseen),
+                    morph: None,
+                },
+            );
+        select(&mut world, of(&["unseen"]));
+        assert_eq!(
+            world.get::<RenderLayers>(unseen),
+            Some(&RenderLayers::layer(7))
+        );
+        assert!(world.get::<Outlined>(unseen).is_none());
+    }
+
+    /// Each view outlines what it shows, with the highlight of what it shows:
+    /// a highlight brought by an element one view draws does not recolour
+    /// another view's outline.
+    #[test]
+    fn each_view_takes_the_highlight_of_its_own_selection() {
+        let (mut world, _, _, [on_default, on_two]) = world();
+        let red = Highlight {
+            colour: Some(Color::srgb(1.0, 0.0, 0.0)),
+            ..default()
+        };
+        select(
+            &mut world,
+            vec![
+                Selection {
+                    element: "layered".into(),
+                    highlight: Some(red),
+                },
+                Selection::of("bare"),
+            ],
+        );
+        let shown = |world: &World, view| {
+            let parts = world.get::<OutlineParts>(view).unwrap();
+            (parts.selecting, parts.highlight)
+        };
+        assert_eq!(shown(&world, on_two), (true, Some(red)));
+        assert_eq!(shown(&world, on_default), (true, None));
+
+        select(&mut world, of(&["layered"]));
+        assert_eq!(
+            shown(&world, on_default),
+            (false, None),
+            "a view with none of the selection has nothing to outline",
         );
     }
 
@@ -755,11 +920,21 @@ mod tests {
     /// that holds still costs no work and never flickers.
     #[test]
     fn a_held_selection_is_left_alone() {
-        let (mut world, layered, _) = world();
-        select(&mut world, &["layered"]);
+        let (mut world, layered, _, _) = world();
+        select(&mut world, of(&["layered"]));
         let before = world.get::<RenderLayers>(layered).cloned();
-        select(&mut world, &["layered"]);
+        let tick = world.change_tick();
+        select(&mut world, of(&["layered"]));
         assert_eq!(world.get::<RenderLayers>(layered).cloned(), before);
         assert!(world.get::<Outlined>(layered).is_some());
+        assert!(
+            !world
+                .entity(layered)
+                .get_ref::<RenderLayers>()
+                .unwrap()
+                .last_changed()
+                .is_newer_than(tick, world.change_tick()),
+            "the mesh's layers were not written again",
+        );
     }
 }

@@ -118,7 +118,15 @@ struct Hovered;
 pub struct ViewGizmoPlugin;
 
 impl Plugin for ViewGizmoPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         // Built and dropped in `Update`; placed in `PostUpdate`, once this
         // frame's camera turn has propagated and its framing has eased, and
         // before UI layout reads the placement.

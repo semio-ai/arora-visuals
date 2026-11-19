@@ -25,7 +25,9 @@
 //! the top of what it names, or to sit clear of a ring rather than over it.
 //! Anything partly behind its camera is left out, since half a projection is
 //! nothing to anchor to, and so is a hidden gizmo, which has nothing on screen
-//! at all.
+//! at all. So is anything seen only through a camera drawing into an image —
+//! a screen's texture, say: its pixels are the image's, which a host placing
+//! things over a window has no way to read.
 //!
 //! The pointer half says which gizmo is hovered or held, and for a joint its
 //! value, so a host can show the tooltip for the animatable that gizmo drives;
@@ -33,6 +35,7 @@
 
 use std::collections::HashMap;
 
+use bevy::camera::RenderTarget;
 use bevy::prelude::*;
 use serde::Serialize;
 
@@ -146,7 +149,15 @@ impl OverlaySink {
 pub struct OverlayPlugin;
 
 impl Plugin for OverlayPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         // After the gizmos have placed themselves, so their boxes are where
         // this frame draws them.
         app.init_resource::<Overlay>().add_systems(
@@ -168,7 +179,11 @@ fn publish(
         &InheritedVisibility,
     )>,
     joint_gizmos: Query<(Entity, &JointGizmo, Option<&Rest>, &InheritedVisibility)>,
-    cameras: Query<(&Camera, &GlobalTransform)>,
+    all_cameras: Query<(
+        &'static Camera,
+        &'static GlobalTransform,
+        &'static RenderTarget,
+    )>,
     globals: Query<&GlobalTransform>,
     aids: Query<(), With<GizmoPart>>,
     drawn: ElementMeshes,
@@ -180,6 +195,8 @@ fn publish(
     mut overlay: ResMut<Overlay>,
 ) {
     let mut frame = OverlayFrame::default();
+    // Only cameras drawing to a window place anything over one.
+    let cameras = Windowed(&all_cameras);
 
     for instance in &instances {
         if !instance.bindings.indexed {
@@ -341,6 +358,28 @@ fn publish(
     }
 }
 
+/// The cameras that draw to a window, looked up as a camera query is.
+struct Windowed<'a, 'w, 's>(
+    &'a Query<
+        'w,
+        's,
+        (
+            &'static Camera,
+            &'static GlobalTransform,
+            &'static RenderTarget,
+        ),
+    >,
+);
+
+impl Windowed<'_, '_, '_> {
+    fn get(&self, camera: Entity) -> Result<(&Camera, &GlobalTransform), ()> {
+        match self.0.get(camera) {
+            Ok((camera, at, RenderTarget::Window(_))) => Ok((camera, at)),
+            _ => Err(()),
+        }
+    }
+}
+
 /// A joint's value as a reading: an angle for a turn, a distance for a slide.
 fn joint_reading(gizmo: &JointGizmo) -> Reading {
     let (amount, unit) = match gizmo.motion {
@@ -367,6 +406,42 @@ fn box_of_points(points: &[Vec3], (camera, at): (&Camera, &GlobalTransform)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A camera drawing into an image places nothing over a window; one
+    /// drawing to a window does.
+    #[test]
+    fn only_a_camera_drawing_to_a_window_places_anything() {
+        use bevy::camera::ImageRenderTarget;
+        use bevy::ecs::system::SystemState;
+        use bevy::window::WindowRef;
+
+        let mut world = World::new();
+        let window = world
+            .spawn((
+                Camera::default(),
+                GlobalTransform::IDENTITY,
+                RenderTarget::Window(WindowRef::Primary),
+            ))
+            .id();
+        let image = world
+            .spawn((
+                Camera::default(),
+                GlobalTransform::IDENTITY,
+                RenderTarget::Image(ImageRenderTarget::from(Handle::<Image>::default())),
+            ))
+            .id();
+        let mut state: SystemState<
+            Query<(
+                &'static Camera,
+                &'static GlobalTransform,
+                &'static RenderTarget,
+            )>,
+        > = SystemState::new(&mut world);
+        let cameras = state.get(&world).unwrap();
+        let windowed = Windowed(&cameras);
+        assert!(windowed.get(window).is_ok());
+        assert!(windowed.get(image).is_err());
+    }
 
     /// A box is the extent of its points, centred between its edges.
     #[test]

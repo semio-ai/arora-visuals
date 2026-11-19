@@ -29,6 +29,10 @@ use crate::transform_gizmo::{
     AXIS_COLOURS, CONE_LENGTH, CONE_RADIUS, GIZMO_SIZE, SHAFT_LENGTH, TUBE,
 };
 
+/// Builds and sizes frames' arrows, in `PostUpdate`.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FrameAxesSystems;
+
 /// Shows this entity's reference frame ([module docs](self)).
 #[derive(Component, Clone, Debug)]
 pub struct FrameAxes {
@@ -88,7 +92,7 @@ const ARROW_OPACITY: f32 = 0.4;
 
 /// The arrows showing an entity's axes, held under it; `0` is the entity.
 #[derive(Component)]
-struct AxesOf(Entity);
+pub(crate) struct AxesOf(pub(crate) Entity);
 
 /// One of the lines showing an entity's axes, under it; `0` is the entity.
 #[derive(Component)]
@@ -121,13 +125,22 @@ impl Built {
 pub struct FrameAxesPlugin;
 
 impl Plugin for FrameAxesPlugin {
+    /// Both consumers sharing an app may add it; it installs once.
+    fn is_unique(&self) -> bool {
+        false
+    }
+
     fn build(&self, app: &mut App) {
+        if !crate::installed::first_install::<Self>(app) {
+            return;
+        }
         add_handle_material(app);
         app.add_plugins(AxisLinePlugin);
         app.add_systems(
             PostUpdate,
             (build_axes, (size_axes, drop_axes))
                 .chain()
+                .in_set(FrameAxesSystems)
                 .after(TransformSystems::Propagate),
         );
     }

@@ -113,7 +113,15 @@ pub struct AxisLineSystems;
 
 /// One drawn half of a line: `1.0` out along its direction, `-1.0` back.
 #[derive(Component)]
-struct Half(f32);
+pub(crate) struct Half(f32);
+
+#[cfg(test)]
+impl Half {
+    /// The outward half, for a test that only needs its mark.
+    pub(crate) fn stub() -> Self {
+        Self(1.0)
+    }
+}
 
 /// What a line's halves were built for, so a change rebuilds them.
 #[derive(Component, PartialEq)]
@@ -141,15 +149,20 @@ impl Plugin for AxisLinePlugin {
             return;
         }
         embedded_asset!(app, "axis_line.wesl");
-        app.add_plugins(MaterialPlugin::<AxisLineMaterial>::default())
-            .add_systems(Startup, make_tube)
-            .add_systems(
-                PostUpdate,
-                (drop_lines, build_lines, place_lines)
-                    .chain()
-                    .in_set(AxisLineSystems)
-                    .after(TransformSystems::Propagate),
-            );
+        // Every aid builds on this plugin, and each is kept to the view it is
+        // seen through.
+        app.add_plugins((
+            MaterialPlugin::<AxisLineMaterial>::default(),
+            crate::view_layer::ViewLayerPlugin,
+        ))
+        .add_systems(Startup, make_tube)
+        .add_systems(
+            PostUpdate,
+            (drop_lines, build_lines, place_lines)
+                .chain()
+                .in_set(AxisLineSystems)
+                .after(TransformSystems::Propagate),
+        );
     }
 }
 

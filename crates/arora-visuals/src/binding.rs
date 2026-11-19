@@ -26,7 +26,7 @@ pub struct ElementTargets {
     /// Its glTF node: the transform features.
     pub node: Entity,
     /// Its own mesh — the node's, or its first primitive's: the static
-    /// material features, the pick, the glow. `None` for a group.
+    /// material features, the pick, the outline. `None` for a group.
     pub mesh: Option<Entity>,
     /// The descendant carrying its morph weights, if it has morph targets.
     pub morph: Option<Entity>,
