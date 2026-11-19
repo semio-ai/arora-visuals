@@ -108,7 +108,7 @@ pub use hold::{HoldTarget, Holds};
 pub use instance::{ClearCamera, EntityInstance, Superseded, ViewOf, CLEAR_ORDER};
 pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 #[cfg(feature = "view")]
-pub use pick::{Picked, Picks};
+pub use pick::Picked;
 pub use target::OffscreenTarget;
 pub use tone::ToneMapping;
 pub use value::Decoded;

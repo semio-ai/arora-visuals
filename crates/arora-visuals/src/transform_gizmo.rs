@@ -1283,7 +1283,7 @@ pub(crate) struct HandleFinder<'w, 's> {
 /// Whether a camera drawing to `drawn` draws to `wanted`, where "the primary
 /// window" means `primary`. A pointer's position means something only in the
 /// window it is in, so only the gizmos seen there can be under it.
-fn draws_to(
+pub(crate) fn draws_to(
     drawn: Option<&bevy::camera::RenderTarget>,
     primary: Option<Entity>,
     wanted: &bevy::camera::NormalizedRenderTarget,

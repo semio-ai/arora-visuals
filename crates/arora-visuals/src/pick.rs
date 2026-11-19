@@ -17,6 +17,13 @@
 //!
 //! The pointer goes to the instances whose rectangle holds it, the one drawn
 //! last first, and the nearest element its ray meets is the one under it.
+//! Only an instance whose camera draws to the window the pointer is in can be
+//! under it: a camera filling a screen's texture is a picture on a mesh, not
+//! a view the pointer is over.
+//!
+//! **A pick is a [`Picked`] message.** Two consumers sharing an app each read
+//! every pick with a reader of their own, and tell theirs by
+//! [`Picked::instance`], so neither takes the other's.
 //!
 //! **A pick is a click, decided as Studio's scene decides one.** The press
 //! notes every element under the pointer; the release picks the element under
@@ -42,20 +49,20 @@ use bevy::prelude::*;
 
 use crate::binding::ElementTargets;
 use crate::instance::{EntityInstance, Superseded};
-use crate::transform_gizmo::GizmoPointer;
+use crate::transform_gizmo::{draws_to, GizmoPointer};
+use bevy::camera::{NormalizedRenderTarget, RenderTarget};
+use bevy::window::PrimaryWindow;
 
-/// A pointer press on an instance: the element under it, by the ids the
-/// asset's own `RobotData` declares, or `None` for a press that hit no
-/// element.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A click on an instance: the element under it, by the ids the asset's own
+/// `RobotData` declares, or `None` for a click that hit no element.
+#[derive(Message, Debug, Clone, PartialEq, Eq)]
 pub struct Picked {
+    /// The instance entity, which a consumer tells its own picks by.
+    pub instance: Entity,
+    /// What the host calls the instance ([`EntityInstance::id`]).
     pub instance_id: String,
     pub element_id: Option<String>,
 }
-
-/// The picks since a consumer last drained them.
-#[derive(Resource, Default)]
-pub struct Picks(pub Vec<Picked>);
 
 /// How far, in logical pixels, the pointer may move between press and release
 /// and a release over nothing still count as a miss.
@@ -69,8 +76,8 @@ struct Pressed(HashMap<PointerId, Press>);
 
 struct Press {
     position: Vec2,
-    /// Every `(instance id, element id)` under the pointer at the press.
-    under: HashSet<(String, String)>,
+    /// Every `(instance, element id)` under the pointer at the press.
+    under: HashSet<(Entity, String)>,
 }
 
 /// Picks and misses, decided on release as a click ([module docs](self)).
@@ -86,7 +93,7 @@ impl Plugin for PickPlugin {
         if !crate::installed::first_install::<Self>(app) {
             return;
         }
-        app.init_resource::<Picks>()
+        app.add_message::<Picked>()
             .init_resource::<Pressed>()
             .init_resource::<ReleasedElsewhere>()
             .add_observer(on_press)
@@ -98,28 +105,48 @@ impl Plugin for PickPlugin {
 /// What the pointer is over at `position`: the element nearest it, every
 /// element under it, and the topmost instance whose rectangle holds it.
 struct Under {
-    nearest: Option<(String, String)>,
-    all: HashSet<(String, String)>,
-    topmost: Option<String>,
+    nearest: Option<(Entity, String)>,
+    all: HashSet<(Entity, String)>,
+    topmost: Option<Entity>,
+}
+
+/// The cameras a pointer can be over, and the window that counts as primary.
+#[derive(SystemParam)]
+struct Views<'w, 's> {
+    cameras: Query<
+        'w,
+        's,
+        (
+            &'static Camera,
+            &'static GlobalTransform,
+            Option<&'static RenderTarget>,
+        ),
+    >,
+    primary: Query<'w, 's, Entity, With<PrimaryWindow>>,
 }
 
 fn under(
     position: Vec2,
-    instances: &Query<&EntityInstance, Without<Superseded>>,
-    cameras: &Query<(&Camera, &GlobalTransform)>,
+    target: &NormalizedRenderTarget,
+    instances: &Query<(Entity, &EntityInstance), Without<Superseded>>,
+    views: &Views,
     elements: &ElementMeshes,
 ) -> Under {
-    let mut held: Vec<(&EntityInstance, &Camera, &GlobalTransform)> = instances
+    let primary = views.primary.iter().next();
+    let mut held: Vec<(Entity, &EntityInstance, &Camera, &GlobalTransform)> = instances
         .iter()
-        .filter(|instance| instance.ready)
-        .filter_map(|instance| {
-            let (camera, transform) = cameras.get(instance.camera).ok()?;
+        .filter(|(_, instance)| instance.ready)
+        .filter_map(|(entity, instance)| {
+            let (camera, transform, drawn) = views.cameras.get(instance.camera).ok()?;
+            if !draws_to(drawn, primary, target) {
+                return None;
+            }
             camera
                 .is_active
                 .then(|| camera.logical_viewport_rect())
                 .flatten()?
                 .contains(position)
-                .then_some((instance, camera, transform))
+                .then_some((entity, instance, camera, transform))
         })
         .collect();
     // Every element of every instance under the pointer, with the order of
@@ -127,8 +154,8 @@ fn under(
     // resolved one instance at a time: where several share a camera they
     // share a ray, and the nearest of all of them is the one under it.
     let mut hits: Vec<(isize, f32)> = Vec::new();
-    let mut hit_of: Vec<(String, String)> = Vec::new();
-    for (instance, camera, transform) in &held {
+    let mut hit_of: Vec<(Entity, String)> = Vec::new();
+    for (entity, instance, camera, transform) in &held {
         let Ok(ray) = camera.viewport_to_world(transform, position) else {
             continue;
         };
@@ -137,14 +164,14 @@ fn under(
                 continue;
             };
             hits.push((camera.order, distance));
-            hit_of.push((instance.id.clone(), id.clone()));
+            hit_of.push((*entity, id.clone()));
         }
     }
-    held.sort_by_key(|(_, camera, _)| std::cmp::Reverse(camera.order));
+    held.sort_by_key(|(_, _, camera, _)| std::cmp::Reverse(camera.order));
     Under {
         nearest: winner(&hits).map(|won| hit_of[won].clone()),
         all: hit_of.into_iter().collect(),
-        topmost: held.first().map(|(instance, ..)| instance.id.clone()),
+        topmost: held.first().map(|(entity, ..)| *entity),
     }
 }
 
@@ -169,8 +196,8 @@ pub(crate) fn on_the_scene(
 /// Notes what a press found, for its release to decide by.
 fn on_press(
     press: On<PointerPress>,
-    instances: Query<&EntityInstance, Without<Superseded>>,
-    cameras: Query<(&Camera, &GlobalTransform)>,
+    instances: Query<(Entity, &EntityInstance), Without<Superseded>>,
+    views: Views,
     elements: ElementMeshes,
     windows: Query<(), With<Window>>,
     mut pressed: ResMut<Pressed>,
@@ -189,7 +216,14 @@ fn on_press(
         press.pointer.id,
         Press {
             position,
-            under: under(position, &instances, &cameras, &elements).all,
+            under: under(
+                position,
+                &press.pointer.target,
+                &instances,
+                &views,
+                &elements,
+            )
+            .all,
         },
     );
 }
@@ -198,14 +232,14 @@ fn on_press(
 #[allow(clippy::too_many_arguments)]
 fn on_release(
     release: On<PointerRelease>,
-    instances: Query<&EntityInstance, Without<Superseded>>,
-    cameras: Query<(&Camera, &GlobalTransform)>,
+    instances: Query<(Entity, &EntityInstance), Without<Superseded>>,
+    views: Views,
     elements: ElementMeshes,
     windows: Query<(), With<Window>>,
     gizmos: Option<Res<GizmoPointer>>,
     mut pressed: ResMut<Pressed>,
     mut elsewhere: ResMut<ReleasedElsewhere>,
-    mut picks: ResMut<Picks>,
+    mut picks: MessageWriter<Picked>,
 ) {
     // A release bubbles from where it landed; take it once. A click is the
     // primary button's, or a touch's.
@@ -234,14 +268,29 @@ fn on_release(
         return;
     }
     let position = release.pointer.position;
-    let found = under(position, &instances, &cameras, &elements);
-    if let Some(picked) = decide(&press, found, position) {
-        match &picked.element_id {
-            Some(element) => log::info!("{}: picked element {element}", picked.instance_id),
-            None => log::info!("{}: a click on no element", picked.instance_id),
-        }
-        picks.0.push(picked);
+    let found = under(
+        position,
+        &release.pointer.target,
+        &instances,
+        &views,
+        &elements,
+    );
+    let Some((instance, element_id)) = decide(&press, found, position) else {
+        return;
+    };
+    let Ok((_, held)) = instances.get(instance) else {
+        return;
+    };
+    let picked = Picked {
+        instance,
+        instance_id: held.id.clone(),
+        element_id,
+    };
+    match &picked.element_id {
+        Some(element) => log::info!("{}: picked element {element}", picked.instance_id),
+        None => log::info!("{}: a click on no element", picked.instance_id),
     }
+    picks.write(picked);
 }
 
 /// The pointers whose release this frame landed somewhere other than the
@@ -262,15 +311,13 @@ fn forget_unreleased_press(mut elsewhere: ResMut<ReleasedElsewhere>, mut pressed
 }
 
 /// What a release decides, given what its press found and what is under the
-/// pointer now ([module docs](self)).
-fn decide(press: &Press, found: Under, position: Vec2) -> Option<Picked> {
+/// pointer now ([module docs](self)): the instance clicked, and the element,
+/// or none for a miss.
+fn decide(press: &Press, found: Under, position: Vec2) -> Option<(Entity, Option<String>)> {
     match found.nearest {
         Some(nearest) if press.under.contains(&nearest) => {
-            let (instance_id, element_id) = nearest;
-            Some(Picked {
-                instance_id,
-                element_id: Some(element_id),
-            })
+            let (instance, element_id) = nearest;
+            Some((instance, Some(element_id)))
         }
         // Over an element the press did not find: not a click on anything.
         Some(_) => None,
@@ -278,10 +325,7 @@ fn decide(press: &Press, found: Under, position: Vec2) -> Option<Picked> {
             if position.distance(press.position) > MISS_SLOP {
                 return None;
             }
-            Some(Picked {
-                instance_id: found.topmost?,
-                element_id: None,
-            })
+            Some((found.topmost?, None))
         }
     }
 }
@@ -644,18 +688,54 @@ mod tests {
     #[test]
     fn a_release_a_gizmo_owns_picks_nothing() {
         use crate::transform_gizmo::GizmoHandle;
-        use bevy::camera::{ComputedCameraValues, NormalizedRenderTarget, RenderTargetInfo};
+
+        let picks_for = |gizmos: GizmoPointer| picks_through(gizmos, true);
+        let grip = (Entity::from_raw_u32(9).unwrap(), GizmoHandle::Arrow(0));
+        assert_eq!(picks_for(GizmoPointer::default()), 1, "a click on nothing");
+        let held = GizmoPointer {
+            dragging: Some(grip),
+            ..default()
+        };
+        assert_eq!(picks_for(held), 0, "the release of a drag in hand");
+        let ended = GizmoPointer {
+            ended: Some(grip),
+            ..default()
+        };
+        assert_eq!(
+            picks_for(ended),
+            0,
+            "the release of a drag ended by going inert"
+        );
+    }
+
+    /// A camera filling an image — a screen's texture — is a picture on a
+    /// mesh, not a view the pointer is over: a click where its viewport would
+    /// be is on no instance.
+    #[test]
+    fn an_instance_drawn_into_an_image_is_not_under_the_pointer() {
+        assert_eq!(picks_through(GizmoPointer::default(), true), 1);
+        assert_eq!(picks_through(GizmoPointer::default(), false), 0);
+    }
+
+    /// The picks a release over a robot with no elements makes, given what
+    /// the gizmos hold, through a camera drawing to the window the release is
+    /// in or into an image.
+    fn picks_through(gizmos: GizmoPointer, to_window: bool) -> usize {
+        use bevy::camera::{
+            ComputedCameraValues, ImageRenderTarget, NormalizedRenderTarget, RenderTarget,
+            RenderTargetInfo,
+        };
         use bevy::picking::backend::HitData;
         use bevy::picking::events::Pointer;
         use bevy::picking::pointer::Location;
         use bevy::window::WindowRef;
 
-        let picks_for = |gizmos: GizmoPointer| {
+        {
             let mut world = World::new();
             world.init_resource::<Assets<Mesh>>();
             world.init_resource::<Pressed>();
             world.init_resource::<ReleasedElsewhere>();
-            world.init_resource::<Picks>();
+            world.init_resource::<Messages<Picked>>();
             world.insert_resource(gizmos);
             world.add_observer(on_release);
             let window = world.spawn(Window::default()).id();
@@ -674,6 +754,11 @@ mod tests {
                         ..default()
                     },
                     GlobalTransform::IDENTITY,
+                    if to_window {
+                        RenderTarget::Window(WindowRef::Entity(window))
+                    } else {
+                        RenderTarget::Image(ImageRenderTarget::from(Handle::<Image>::default()))
+                    },
                 ))
                 .id();
             world.spawn(EntityInstance {
@@ -707,24 +792,8 @@ mod tests {
                 hit: HitData::new(window, 0.0, None, None),
             });
             world.flush();
-            world.resource::<Picks>().0.len()
-        };
-        let grip = (Entity::from_raw_u32(9).unwrap(), GizmoHandle::Arrow(0));
-        assert_eq!(picks_for(GizmoPointer::default()), 1, "a click on nothing");
-        let held = GizmoPointer {
-            dragging: Some(grip),
-            ..default()
-        };
-        assert_eq!(picks_for(held), 0, "the release of a drag in hand");
-        let ended = GizmoPointer {
-            ended: Some(grip),
-            ..default()
-        };
-        assert_eq!(
-            picks_for(ended),
-            0,
-            "the release of a drag ended by going inert"
-        );
+            world.resource::<Messages<Picked>>().len()
+        }
     }
 
     /// A press is kept while it is held — by a touch too, which sets no
@@ -767,8 +836,10 @@ mod tests {
         );
     }
 
-    fn pair(element: &str) -> (String, String) {
-        ("robot".to_string(), element.to_string())
+    const ROBOT: Entity = Entity::PLACEHOLDER;
+
+    fn pair(element: &str) -> (Entity, String) {
+        (ROBOT, element.to_string())
     }
 
     fn press_on(elements: &[&str], position: Vec2) -> Press {
@@ -782,7 +853,7 @@ mod tests {
         Under {
             nearest: nearest.map(pair),
             all: HashSet::new(),
-            topmost: Some("robot".to_string()),
+            topmost: Some(ROBOT),
         }
     }
 
@@ -792,7 +863,7 @@ mod tests {
     fn a_release_on_an_element_the_press_found_picks_it() {
         let press = press_on(&["head", "body"], Vec2::ZERO);
         let picked = decide(&press, found(Some("body")), Vec2::new(80.0, 0.0)).unwrap();
-        assert_eq!(picked.element_id.as_deref(), Some("body"));
+        assert_eq!(picked, (ROBOT, Some("body".to_string())));
     }
 
     /// A release on an element the press never found is not a click on it.
@@ -808,7 +879,7 @@ mod tests {
     fn a_release_over_nothing_misses_only_within_the_slop() {
         let press = press_on(&[], Vec2::ZERO);
         let miss = decide(&press, found(None), Vec2::new(MISS_SLOP, 0.0)).unwrap();
-        assert!(miss.element_id.is_none());
+        assert_eq!(miss, (ROBOT, None));
         assert!(decide(&press, found(None), Vec2::new(MISS_SLOP + 1.0, 0.0)).is_none());
     }
 
