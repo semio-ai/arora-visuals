@@ -36,8 +36,9 @@ Left alone, and reported:
   (a grid), a hole (a ring), or several outlines: their triangles were
   authored deliberately or cannot be re-chosen from one outline;
 - pieces with no area in any shape;
-- primitives without index data, other than triangle lists, Draco-compressed,
-  with quantized or non-finite positions, with data outside the GLB binary
+- primitives without index data, other than triangle lists, compressed
+  (Draco, or meshopt on any buffer view the pass reads, whose renderers decode
+  another buffer than the one the pass would rewrite), with quantized or non-finite positions, with data outside the GLB binary
   chunk (buffer 0), or whose index bytes anything else also reads — another
   primitive or accessor, an attribute, an image — since a rewrite would
   change that data too;
@@ -72,7 +73,10 @@ improvement is large enough to see, and the mode sets what else must hold:
   got worse are listed in the report.
 
 The search grows with the number of shapes as well as the outline, so a part
-with very many targets may be skipped as too large to check every blend.
+with very many targets may be skipped as too large to check every blend. A
+primitive is checked for this before anything is built for its targets: past
+about 316 targets, or ten million target vertices in all, it is skipped
+whole.
 
 ## Usage
 

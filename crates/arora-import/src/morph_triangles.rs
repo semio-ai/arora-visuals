@@ -69,6 +69,20 @@ const MAX_LOOP_VERTICES: usize = 256;
 /// this keeps one part to a few seconds there.
 const MAX_EVALUATIONS: f64 = 3e8;
 
+/// The most shapes a primitive may have checked: rest, each target at full
+/// and half weight, each pair of targets at full and half weight, and the
+/// default poses. Checked before any shape is built, because a file can
+/// reuse one small accessor for thousands of targets and the pairs grow with
+/// the square of their count. At this many (about 316 targets) a part's
+/// search fits [`MAX_EVALUATIONS`] only for an outline of at most 26 vertices.
+const MAX_SHAPES: f64 = 1e5;
+
+/// The most target vertices a primitive's targets may hold together (each
+/// target's delta for each vertex), about 120 MB of deltas. Checked before
+/// any delta is read, for the same reason: reused accessors cost a file
+/// nothing.
+const MAX_TARGET_VERTICES: f64 = 1e7;
+
 /// In [`Mode::Safe`], a rewrite is not written when it would add more than
 /// this much reversed area to any one checked shape, measured against the
 /// part's largest shape: no shape the pass checks comes out visibly worse,
@@ -150,7 +164,7 @@ pub enum Skip {
     NotTriangles,
     /// The primitive has no index data to rewrite.
     NotIndexed,
-    /// Its geometry is Draco-compressed.
+    /// Its geometry is compressed (Draco, or meshopt on a view it reads).
     Compressed,
     /// Its index bytes are also read by another accessor or primitive,
     /// which rewriting them would change too.
@@ -162,7 +176,8 @@ pub enum Skip {
     /// The outline has more vertices than the search takes.
     TooManyVertices,
     /// The outline and the shapes to check (every target and every pair of
-    /// targets) are together more than the search takes.
+    /// targets) are together more than the search takes, or the primitive
+    /// has more shapes or target vertices than the pass holds in memory.
     TooManyShapes,
     /// No shape of the piece has any area, so every triangulation draws the
     /// same nothing.
@@ -176,7 +191,7 @@ impl fmt::Display for Skip {
         match self {
             Skip::NotTriangles => f.write_str("not a triangle list"),
             Skip::NotIndexed => f.write_str("has no index data"),
-            Skip::Compressed => f.write_str("is Draco-compressed"),
+            Skip::Compressed => f.write_str("is compressed (Draco or meshopt)"),
             Skip::SharedIndices => {
                 f.write_str("shares its index data with other mesh data")
             }
@@ -185,7 +200,7 @@ impl fmt::Display for Skip {
             ),
             Skip::NoArea => f.write_str("has no area in any shape"),
             Skip::TooManyShapes => f.write_str(
-                "has too many outline vertices and morph targets to check every blend",
+                "has too many vertices and morph targets to check every blend",
             ),
             Skip::TooManyVertices => {
                 write!(f, "has more than {MAX_LOOP_VERTICES} outline vertices")
@@ -237,6 +252,7 @@ pub enum ShapeKind {
 impl From<Unsupported> for Skip {
     fn from(u: Unsupported) -> Self {
         Skip::Unreadable(match u {
+            Unsupported::Compressed => return Skip::Compressed,
             Unsupported::ExternalBuffer => "data is outside the GLB binary chunk".into(),
             Unsupported::NotFloat => "positions are not 32-bit floats".into(),
             Unsupported::SparseIndices => "indices are sparse".into(),
@@ -448,6 +464,17 @@ fn primitive_parts(
         return Err(fail(Skip::Unreadable(
             "indices do not form triangles over the vertices".into(),
         )));
+    }
+    let target_count = primitive
+        .get("targets")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let t = target_count as f64;
+    let poses = default_weights.len() as f64;
+    if 1.0 + 2.0 * t + t * (t - 1.0) + poses > MAX_SHAPES
+        || t * base.len() as f64 > MAX_TARGET_VERTICES
+    {
+        return Err(fail(Skip::TooManyShapes));
     }
     // Rest first; then each target at full weight, at half weight; every
     // pair of targets at full and at half weight; and the default pose.

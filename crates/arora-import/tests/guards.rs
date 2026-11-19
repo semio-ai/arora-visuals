@@ -791,3 +791,79 @@ fn only_outcome_in(bytes: &[u8], mode: Mode) -> Outcome {
     assert_eq!(optimized.report.parts.len(), 1, "{:?}", optimized.report);
     optimized.report.parts[0].outcome.clone()
 }
+
+/// A unit square with one morph target, so the pass considers it.
+fn morphed_square() -> MeshSpec {
+    let points = square("quad").positions;
+    square("quad").target("turn", points)
+}
+
+#[test]
+fn meshopt_compressed_index_data_is_left_alone() {
+    // A meshopt-aware renderer decodes the compressed stream and never reads
+    // the view's own bytes, even when they sit in the binary chunk.
+    let bytes = with_json(&build(&[morphed_square()]).bytes, |doc| {
+        let view = doc["accessors"][1]["bufferView"].as_u64().unwrap() as usize;
+        doc["bufferViews"][view]["extensions"] = json!({
+            "EXT_meshopt_compression": {
+                "buffer": 0, "byteLength": 4, "byteStride": 2, "count": 6, "mode": "TRIANGLES"
+            }
+        });
+    });
+    assert_eq!(skip_reason(&bytes), Skip::Compressed);
+}
+
+#[test]
+fn a_matrix_counts_its_column_padding_as_read() {
+    // A MAT3 of bytes takes 12 bytes, each column starting on a 4-byte
+    // boundary. Placed 10 bytes before the index data, its packed 9 bytes
+    // would end short of it; its 12 reach the first two index bytes.
+    let bytes = with_json(&build(&[morphed_square()]).bytes, |doc| {
+        let view = doc["accessors"][1]["bufferView"].as_u64().unwrap() as usize;
+        let start = doc["bufferViews"][view]["byteOffset"].as_u64().unwrap();
+        assert!(start >= 10, "the index data sits after the positions");
+        doc["bufferViews"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "buffer": 0, "byteOffset": start - 10, "byteLength": 12 }));
+        let last = doc["bufferViews"].as_array().unwrap().len() - 1;
+        doc["accessors"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "bufferView": last, "componentType": 5121, "count": 1, "type": "MAT3" }));
+    });
+    assert_eq!(skip_reason(&bytes), Skip::SharedIndices);
+}
+
+/// `bytes` with its first primitive's one target repeated `count` times,
+/// every copy reading the same accessor, as a file can at no cost to its
+/// size.
+fn with_repeated_target(bytes: &[u8], count: usize) -> Vec<u8> {
+    with_json(bytes, |doc| {
+        let primitive = &mut doc["meshes"][0]["primitives"][0];
+        let target = primitive["targets"][0].clone();
+        primitive["targets"] = json!(vec![target; count]);
+        doc["meshes"][0]["extras"] = json!({});
+    })
+}
+
+#[test]
+fn a_primitive_with_more_shapes_than_the_pass_holds_is_skipped_whole() {
+    // 400 targets make 160,401 shapes with their pairs. A four-vertex
+    // outline would fit the search budget; the shapes would not fit memory
+    // at a larger scale, so the limit holds before any is built.
+    let bytes = with_repeated_target(&build(&[morphed_square()]).bytes, 400);
+    assert_eq!(skip_reason(&bytes), Skip::TooManyShapes);
+}
+
+#[test]
+fn a_primitive_with_more_target_vertices_than_the_pass_holds_is_skipped_whole() {
+    // 200 targets over 50,001 vertices are ten million target vertices,
+    // checked before any delta is read. Their 40,201 shapes are within the
+    // shape limit, and the square's outline would fit the search budget.
+    let mut points = square("quad").positions;
+    points.resize(50_001, [0.0; 3]);
+    let mesh = MeshSpec::new("big", points.clone(), fan(4)).target("turn", points);
+    let bytes = with_repeated_target(&build(&[mesh]).bytes, 200);
+    assert_eq!(skip_reason(&bytes), Skip::TooManyShapes);
+}

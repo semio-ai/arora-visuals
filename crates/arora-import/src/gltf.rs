@@ -25,6 +25,10 @@ pub(crate) enum Unsupported {
     NotFloat,
     /// Indices are stored sparsely, so they have no dense range to rewrite.
     SparseIndices,
+    /// The view is meshopt-compressed: a renderer that understands the
+    /// extension decodes another buffer, and the view's own bytes are a
+    /// fallback that may hold nothing.
+    Compressed,
     /// The document does not describe the data consistently.
     Malformed(String),
 }
@@ -56,6 +60,14 @@ impl<'a> Document<'a> {
 
     fn view(&self, index: u64) -> Result<View, Unsupported> {
         let view = self.get("bufferViews", index)?;
+        // Checked before the buffer: a writer may point the fallback at the
+        // binary chunk, whose bytes then differ from what renderers draw.
+        if ["EXT_meshopt_compression", "KHR_meshopt_compression"]
+            .iter()
+            .any(|name| view.pointer(&format!("/extensions/{name}")).is_some())
+        {
+            return Err(Unsupported::Compressed);
+        }
         let buffer = view.get("buffer").and_then(Value::as_u64).unwrap_or(0);
         // In a GLB only buffer 0, without a uri, is the binary chunk. Any
         // other buffer — one with a uri, or a uri-less one such as an
@@ -369,7 +381,10 @@ fn fits(start: usize, count: usize, stride: usize, element: usize, view: &View) 
 }
 
 /// The byte size of one element of an accessor, from its component type
-/// and element type; `None` for a combination glTF does not define.
+/// and element type; `None` for a combination glTF does not define. glTF
+/// starts each column of a matrix on a 4-byte boundary, so a matrix of 1- or
+/// 2-byte components is larger than its components alone: a MAT3 of bytes
+/// takes 12, not 9.
 fn element_size(acc: &Value) -> Option<usize> {
     let component = match acc.get("componentType").and_then(Value::as_u64)? {
         5120 | 5121 => 1,
@@ -377,16 +392,25 @@ fn element_size(acc: &Value) -> Option<usize> {
         5125 | 5126 => 4,
         _ => return None,
     };
-    let width = match acc.get("type").and_then(Value::as_str)? {
-        "SCALAR" => 1,
-        "VEC2" => 2,
-        "VEC3" => 3,
-        "VEC4" | "MAT2" => 4,
-        "MAT3" => 9,
-        "MAT4" => 16,
+    let (columns, rows) = match acc.get("type").and_then(Value::as_str)? {
+        "SCALAR" => (1, 1),
+        "VEC2" => (1, 2),
+        "VEC3" => (1, 3),
+        "VEC4" => (1, 4),
+        "MAT2" => (2, 2),
+        "MAT3" => (3, 3),
+        "MAT4" => (4, 4),
         _ => return None,
     };
-    Some(component * width)
+    let column: usize = component * rows;
+    Some(
+        columns
+            * if columns > 1 {
+                column.next_multiple_of(4)
+            } else {
+                column
+            },
+    )
 }
 
 /// Writes index `value` into slot `i` of `slots`. The value must fit the
