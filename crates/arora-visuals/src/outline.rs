@@ -29,6 +29,8 @@
 //! shows: a highlight one of those selected elements brings applies to that
 //! view alone.
 
+use std::collections::{HashMap, HashSet};
+
 use bevy::asset::{embedded_asset, embedded_path, AssetPath};
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{CameraUpdateSystems, ImageRenderTarget, RenderTarget};
@@ -367,24 +369,24 @@ fn mark_selection(
         .iter_mut()
         .map(|(given, layers, parts)| (*given, layers.cloned().unwrap_or_default(), parts))
         .collect();
-    let mut wanted: Vec<(Entity, Option<RenderLayers>, RenderLayers)> = Vec::new();
+    // Keyed, not searched: a held group selection can cover thousands of
+    // meshes, and this runs every frame.
+    let mut wanted: HashMap<Entity, (Option<RenderLayers>, RenderLayers)> = HashMap::new();
     let mut shown: Vec<Vec<&Selection>> = vec![Vec::new(); views.len()];
+    let mut counted: Vec<HashSet<*const Selection>> = vec![HashSet::new(); views.len()];
     for (mesh, own, selection) in &selected {
         let drawn_on = own.clone().unwrap_or_default();
         let mut joined = drawn_on.clone();
         for (index, (given, content, _)) in views.iter().enumerate() {
             if drawn_on.intersects(content) {
                 joined = joined.with(given.mask);
-                if !shown[index]
-                    .iter()
-                    .any(|held| std::ptr::eq(*held, *selection))
-                {
+                if counted[index].insert(std::ptr::from_ref(*selection)) {
                     shown[index].push(selection);
                 }
             }
         }
-        if joined != drawn_on && !wanted.iter().any(|(held, ..)| held == mesh) {
-            wanted.push((*mesh, own.clone(), joined));
+        if joined != drawn_on {
+            wanted.entry(*mesh).or_insert((own.clone(), joined));
         }
     }
     for ((_, _, mut parts), shown) in views.into_iter().zip(shown) {
@@ -399,7 +401,7 @@ fn mark_selection(
     }
 
     for (mesh, marked) in &outlined {
-        if wanted.iter().any(|(held, ..)| *held == mesh) {
+        if wanted.contains_key(&mesh) {
             continue;
         }
         let Ok((now, _)) = layers.get(mesh) else {
@@ -412,7 +414,7 @@ fn mark_selection(
         };
         entity.remove::<Outlined>();
     }
-    for (mesh, own, joined) in wanted {
+    for (mesh, (own, joined)) in wanted {
         let Ok((now, marked)) = layers.get(mesh) else {
             continue;
         };

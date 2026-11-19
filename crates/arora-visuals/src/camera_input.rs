@@ -436,7 +436,7 @@ fn zoom(
         }
         if let Ok(mut projection) = projections.get_mut(entity) {
             if let Projection::Orthographic(lens) = &mut *projection {
-                lens.scale *= dolly(1.0, pixels, bindings.zoom_speed) as f32;
+                zoom_orthographic(lens, &mut controller, pixels, bindings.zoom_speed);
                 return;
             }
         }
@@ -457,6 +457,34 @@ fn zoom(
         {
             anchor.z = -closer;
         }
+    }
+}
+
+/// Zooms an orthographic camera by scaling its projection by the zoom's
+/// factor for `pixels` of scrolling.
+///
+/// The controller then moves the camera to a depth set by the scale,
+/// carrying along the anchor of a gesture in hand but not that of one
+/// carrying on under inertia; that one is told the depth here, as a
+/// perspective zoom tells it the distance it closed to.
+fn zoom_orthographic(
+    lens: &mut OrthographicProjection,
+    controller: &mut PanOrbitCamera,
+    pixels: f32,
+    zoom_speed: f32,
+) {
+    lens.scale *= dolly(1.0, pixels, zoom_speed) as f32;
+    let settings = &controller.orthographic;
+    let depth = (settings.scale_to_near_clip * lens.scale).clamp(
+        settings.near_clip_limits.start,
+        settings.near_clip_limits.end,
+    );
+    if let CurrentMotion::Momentum {
+        velocity: Velocity::Orbit { anchor, .. } | Velocity::Pan { anchor, .. },
+        ..
+    } = &mut controller.current_motion
+    {
+        anchor.z = -f64::from(depth);
     }
 }
 
@@ -633,6 +661,40 @@ mod tests {
         let (lens, at) = scrolled(Projection::Perspective(PerspectiveProjection::default()));
         assert!(matches!(lens, Projection::Perspective(_)));
         assert!((at.z - 5.0 * 0.95).abs() < 1e-4, "{at}");
+    }
+
+    /// An orbit carrying on under inertia, which the controller does not
+    /// carry along when it moves an orthographic camera to its scale's depth,
+    /// is told that depth by the zoom.
+    #[test]
+    fn an_orthographic_zoom_moves_an_orbits_anchor_under_inertia() {
+        use bevy::platform::time::Instant;
+
+        let mut controller = PanOrbitCamera {
+            current_motion: CurrentMotion::Momentum {
+                velocity: Velocity::Orbit {
+                    anchor: DVec3::new(0.0, 0.0, -1.0e6),
+                    velocity: bevy::math::DVec2::ONE,
+                },
+                momentum_start: Instant::now(),
+            },
+            ..default()
+        };
+        let mut lens = OrthographicProjection::default_3d();
+        zoom_orthographic(&mut lens, &mut controller, 100.0, 1.0);
+        let settings = &controller.orthographic;
+        let wanted = (settings.scale_to_near_clip * 0.95).clamp(
+            settings.near_clip_limits.start,
+            settings.near_clip_limits.end,
+        );
+        let CurrentMotion::Momentum {
+            velocity: Velocity::Orbit { anchor, .. },
+            ..
+        } = controller.current_motion
+        else {
+            panic!("still carrying on");
+        };
+        assert!((anchor.z + f64::from(wanted)).abs() < 1e-6, "{anchor}");
     }
 
     /// A camera below the floor is raised onto it and still looks at its
