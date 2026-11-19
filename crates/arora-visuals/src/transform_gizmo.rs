@@ -1342,7 +1342,9 @@ fn drive(
     globals: Query<&GlobalTransform>,
     mut locals: Query<&mut Transform>,
     parents: Query<&ChildOf>,
-    windows: Query<&Window>,
+    windows: Query<(Entity, &Window)>,
+    targets: Query<&bevy::camera::RenderTarget>,
+    primary: Query<Entity, With<bevy::window::PrimaryWindow>>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut pointer: ResMut<GizmoPointer>,
     mut pressed_scene: ResMut<PressedScene>,
@@ -1350,7 +1352,22 @@ fn drive(
 ) {
     // Taken every frame, so a press noted and not acted on cannot linger.
     let on_scene = std::mem::take(&mut pressed_scene.0);
-    let cursor = windows.iter().find_map(Window::cursor_position);
+    let (window, cursor) = windows
+        .iter()
+        .find_map(|(entity, window)| window.cursor_position().map(|cursor| (entity, cursor)))
+        .unzip();
+    // Only a gizmo seen in the window the cursor is in can be under it: one
+    // seen through a camera drawing into an image — a screen's texture — is
+    // nowhere on that window, whatever its handles project to.
+    let primary = primary.iter().next();
+    let in_window = window
+        .and_then(|window| bevy::window::WindowRef::Entity(window).normalize(primary))
+        .map(bevy::camera::NormalizedRenderTarget::Window);
+    let seen = |camera: Entity| {
+        in_window
+            .as_ref()
+            .is_some_and(|in_window| draws_to(targets.get(camera).ok(), primary, in_window))
+    };
     let ray_through = |camera: Entity| {
         cursor
             .zip(cameras.get(camera).ok())
@@ -1483,8 +1500,8 @@ fn drive(
     };
     let Some(candidate) = nearest_handle(
         cursor,
-        gizmos.iter(),
-        joints.iter(),
+        gizmos.iter().filter(|(_, gizmo, ..)| seen(gizmo.camera)),
+        joints.iter().filter(|(_, joint, ..)| seen(joint.camera)),
         &cameras,
         &globals,
         parent_of,
@@ -1878,6 +1895,7 @@ mod tests {
                 GlobalTransform::from(
                     Transform::from_xyz(0.0, -1.5, 0.4).looking_at(Vec3::ZERO, Vec3::Z),
                 ),
+                bevy::camera::RenderTarget::Window(bevy::window::WindowRef::Entity(window)),
             ))
             .id();
         let target = world
@@ -1894,6 +1912,37 @@ mod tests {
     /// the button stays the gizmo's until it comes up, which is what keeps a
     /// pick on the release from taking it for a click on the scene. Made
     /// interactive again, the gizmo takes a fresh press.
+    /// A gizmo seen through a camera drawing into an image — a screen's
+    /// texture — is nowhere on the window, so the cursor there finds none of
+    /// its handles, wherever they project to.
+    #[test]
+    fn a_gizmo_drawn_into_an_image_is_not_under_the_cursor() {
+        let under_cursor = |into_image: bool| {
+            let (mut app, window, gizmo) = driving(|world, target, camera| {
+                world
+                    .spawn(TransformGizmo::new(target, camera))
+                    .insert(Facing(Vec3::ONE))
+                    .id()
+            });
+            if into_image {
+                let camera = app.world().get::<TransformGizmo>(gizmo).unwrap().camera;
+                app.world_mut()
+                    .entity_mut(camera)
+                    .insert(bevy::camera::RenderTarget::Image(
+                        bevy::camera::ImageRenderTarget::from(Handle::<Image>::default()),
+                    ));
+            }
+            (0..200).any(|x| {
+                let mut held = app.world_mut().get_mut::<Window>(window).unwrap();
+                held.set_cursor_position(Some(Vec2::new(200.0 + x as f32, 200.0)));
+                app.update();
+                app.world().resource::<GizmoPointer>().hovered.is_some()
+            })
+        };
+        assert!(under_cursor(false), "seen in the window, a handle is found");
+        assert!(!under_cursor(true));
+    }
+
     fn inert_mid_drag(
         spawn: impl FnOnce(&mut World, Entity, Entity) -> Entity,
         set_interactive: fn(&mut World, Entity, bool),
