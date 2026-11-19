@@ -46,6 +46,17 @@ pub fn only(layer: usize) -> RenderLayers {
 /// mesh on another view's `mask` layer would be outlined there.
 pub const VIEW_LAYERS_FROM: usize = 31;
 
+/// Whether `layer` is some view's `mask` layer, given or not.
+pub fn is_mask(layer: usize) -> bool {
+    layer >= VIEW_LAYERS_FROM && (layer - VIEW_LAYERS_FROM) % 2 == 1
+}
+
+/// `layers` less every view's `mask` layer: what a mesh is drawn on, apart
+/// from the masks the outline has joined it to.
+pub fn without_masks(layers: &RenderLayers) -> RenderLayers {
+    layers.iter().filter(|layer| !is_mask(*layer)).collect()
+}
+
 /// On a camera: the render layers that are its alone ([module docs](self)).
 #[derive(Component, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ViewLayers {

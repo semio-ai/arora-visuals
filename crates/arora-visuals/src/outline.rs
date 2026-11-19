@@ -46,7 +46,7 @@ use bevy::shader::ShaderRef;
 use crate::active_area::FramingSystems;
 use crate::instance::{EntityInstance, Superseded};
 use crate::select::{covered, highlight_of, Highlight, Selection, Selections};
-use crate::view_layer::{only, ViewLayerPlugin, ViewLayers, WantsViewLayers};
+use crate::view_layer::{only, without_masks, ViewLayerPlugin, ViewLayers, WantsViewLayers};
 
 /// Outline this camera's view of the selection.
 #[derive(Component, Clone, Copy, Debug)]
@@ -100,11 +100,25 @@ struct OutlineParts {
     highlight: Option<Highlight>,
 }
 
-/// On a mesh currently in some view's mask: the layers it had before it
-/// joined.
+/// On a mesh currently in some view's mask: whether it had no layers of its
+/// own when it joined, so it can be given none again when it leaves.
+///
+/// What else it is on is read from its layers as they are, less the masks,
+/// not remembered from when it joined: a host may move a selected mesh to
+/// another layer, and that change stands.
 #[derive(Component)]
 struct Outlined {
-    before: Option<RenderLayers>,
+    bare: bool,
+}
+
+/// A mesh's own layers — what it is drawn on apart from any mask — or `None`
+/// for a mesh with no layers of its own.
+fn own_layers(now: Option<&RenderLayers>, marked: Option<&Outlined>) -> Option<RenderLayers> {
+    let Some(marked) = marked else {
+        return now.cloned();
+    };
+    let own = without_masks(&now.cloned().unwrap_or_default());
+    (!(marked.bare && own == RenderLayers::default())).then_some(own)
 }
 
 #[derive(ShaderType, Clone, Debug, Default)]
@@ -344,11 +358,7 @@ fn mark_selection(
                 let Ok((now, marked)) = layers.get(mesh) else {
                     continue;
                 };
-                let own = match marked {
-                    Some(marked) => marked.before.clone(),
-                    None => now.cloned(),
-                };
-                selected.push((mesh, own, selection));
+                selected.push((mesh, own_layers(now, marked), selection));
             }
         }
     }
@@ -392,21 +402,28 @@ fn mark_selection(
         if wanted.iter().any(|(held, ..)| *held == mesh) {
             continue;
         }
+        let Ok((now, _)) = layers.get(mesh) else {
+            continue;
+        };
         let mut entity = commands.entity(mesh);
-        match &marked.before {
-            Some(before) => entity.insert(before.clone()),
+        match own_layers(now, Some(marked)) {
+            Some(own) => entity.insert(own),
             None => entity.remove::<RenderLayers>(),
         };
         entity.remove::<Outlined>();
     }
-    for (mesh, before, joined) in wanted {
+    for (mesh, own, joined) in wanted {
         let Ok((now, marked)) = layers.get(mesh) else {
             continue;
         };
         if marked.is_some() && now == Some(&joined) {
             continue;
         }
-        commands.entity(mesh).insert((joined, Outlined { before }));
+        let bare = match marked {
+            Some(marked) => marked.bare,
+            None => own.is_none(),
+        };
+        commands.entity(mesh).insert((joined, Outlined { bare }));
     }
 }
 
@@ -767,6 +784,27 @@ mod tests {
         assert!(
             world.get::<RenderLayers>(bare).is_none(),
             "a mesh that had no layers has none again",
+        );
+    }
+
+    /// A host moving a selected mesh to another layer is obeyed: the mesh
+    /// follows into the view that draws its new layer, leaves the old one's
+    /// mask, and keeps the new layer once deselected.
+    #[test]
+    fn a_host_may_move_a_selected_mesh_to_another_layer() {
+        let (mut world, layered, ..) = world();
+        select(&mut world, of(&["layered"]));
+        let moved = RenderLayers::layer(0).with(ON_TWO.mask);
+        world.entity_mut(layered).insert(moved);
+        select(&mut world, of(&["layered"]));
+        assert_eq!(
+            world.get::<RenderLayers>(layered),
+            Some(&RenderLayers::layer(0).with(ON_DEFAULT.mask)),
+        );
+        select(&mut world, of(&[]));
+        assert_eq!(
+            world.get::<RenderLayers>(layered),
+            Some(&RenderLayers::layer(0))
         );
     }
 
