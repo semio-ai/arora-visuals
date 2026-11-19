@@ -12,7 +12,7 @@ use wasm_bindgen::prelude::*;
 /// version, which catches a stale `pkg/` after a rebuild of one side only.
 #[wasm_bindgen]
 pub fn abi_version() -> u32 {
-    4
+    5
 }
 
 /// The outcome of [`optimize_morph_triangles`].
@@ -105,6 +105,7 @@ fn report_json(report: &Report) -> Value {
                 "vertices": part.vertices,
                 "outcome": outcome,
                 "skipReason": skip_reason,
+                "flat": part.flat,
                 "folds": folds,
             })
         })
@@ -127,6 +128,7 @@ mod tests {
                     primitive: 0,
                     vertices: 65,
                     outcome: Outcome::Retriangulated,
+                    flat: false,
                     folds: vec![ShapeFold {
                         shape: "smile_shape + sad_shape".into(),
                         kind: ShapeKind::Blend,
@@ -143,6 +145,7 @@ mod tests {
                     vertices: 64,
                     outcome: Outcome::Skipped(Skip::NotAPolygon),
                     folds: Vec::new(),
+                    flat: true,
                 },
             ],
         };
@@ -151,7 +154,7 @@ mod tests {
             json!({ "parts": [
                 {
                     "mesh": 2, "meshName": "mouth", "primitive": 0, "vertices": 65,
-                    "outcome": "retriangulated", "skipReason": null,
+                    "outcome": "retriangulated", "skipReason": null, "flat": false,
                     "folds": [{
                         "shape": "smile_shape + sad_shape", "kind": "blend",
                         "before": 0.4, "after": null,
@@ -162,6 +165,7 @@ mod tests {
                     "mesh": 3, "meshName": null, "primitive": 1, "vertices": 64,
                     "outcome": "skipped",
                     "skipReason": "is not a single polygon (vertices inside its outline, a hole, or several outlines)",
+                    "flat": true,
                     "folds": []
                 }
             ]})

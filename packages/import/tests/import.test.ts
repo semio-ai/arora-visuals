@@ -89,6 +89,7 @@ test("a file whose triangles fold comes back rewritten, with a report", async ()
   assert.notDeepEqual(result.bytes, input);
   assert.equal(result.report.parts[0].meshName, "quad");
   assert.equal(result.report.parts[0].outcome, "retriangulated");
+  assert.equal(result.report.parts[0].flat, true);
   assert.ok(
     result.report.parts[0].folds.some((fold) => fold.shape === "turn (halfway)"),
   );
@@ -111,6 +112,7 @@ test("stillFolding keeps only shapes above the threshold", () => {
     vertices: 65,
     outcome: "retriangulated" as const,
     skipReason: null,
+    flat: true,
     folds: [
       { shape: "smile_shape", kind: "target" as const, before: 0.4, after: 0.12, visiblyWorse: false, visiblyBetter: false },
       { shape: "a_shape", kind: "target" as const, before: 0.007, after: 0, visiblyWorse: false, visiblyBetter: false },

@@ -50,6 +50,12 @@ use crate::gltf::{write_index, Document, IndexSlots, Unsupported};
 /// not count: any triangulation of them is equally invisible.
 const DEGENERATE_AREA: f64 = 1e-3;
 
+/// A part is flat when no outline point of its rest shape or any target
+/// lies further from that shape's best-fit plane than this fraction of the
+/// part's size (the square root of its largest shape's area). Blends are not
+/// counted: they add targets past what was modelled.
+pub const FLATNESS: f64 = 0.01;
+
 /// A replacement is written only when it removes more than this much
 /// reversed area, summed over the shapes and measured against the part's
 /// largest shape. Below it the difference is not visible, so a file is not
@@ -139,6 +145,14 @@ pub struct Part {
     pub outcome: Outcome,
     /// Reversed area before and after, per shape. Empty when skipped.
     pub folds: Vec<ShapeFold>,
+    /// Whether every authored shape of the part (rest and each target) lies
+    /// in one plane, to within [`FLATNESS`] of its size; true for a part not
+    /// measured. A part that is not flat has triangles that make its
+    /// surface, not only cover its outline, so other triangles change that
+    /// surface: safe mode declines such a rewrite, and overall mode makes it.
+    /// Out-of-plane change does not show on a part drawn head-on and unlit
+    /// (a face); on a lit 3D part it does.
+    pub flat: bool,
 }
 
 /// What the pass did with a part.
@@ -296,6 +310,7 @@ pub(crate) fn optimize(json: &Value, bin: &mut [u8], mode: Mode) -> Report {
                 vertices,
                 outcome: Outcome::Skipped(why),
                 folds: Vec::new(),
+                flat: true,
             };
             let doc = Document { json, bin: &*bin };
             let default_weights = default_weight_sets(json, m, mesh);
@@ -576,6 +591,7 @@ fn primitive_parts(
             vertices: piece.vertices,
             outcome,
             folds,
+            flat: true,
         };
         let Some(outline) = outline(&triangles, &piece) else {
             parts.push(part(Outcome::Skipped(Skip::NotAPolygon), Vec::new()));
@@ -601,8 +617,8 @@ fn primitive_parts(
         let after = measured.fold_per_shape(&chosen);
         let better_overall =
             measured.weighted_total(&current) - measured.weighted_total(&chosen) > IMPROVEMENT;
-        let harms_a_shape =
-            mode == Mode::Safe && measured.worsens_any(&current, &chosen, VISIBLY_WORSE);
+        let harms_a_shape = mode == Mode::Safe
+            && (!measured.flat || measured.worsens_any(&current, &chosen, VISIBLY_WORSE));
         let improved = better_overall && !harms_a_shape;
         let change = measured.reversed_change(&current, &chosen);
         let folds = shapes
@@ -618,18 +634,22 @@ fn primitive_parts(
                 visibly_better: improved && delta < -VISIBLY_WORSE,
             })
             .collect();
-        if improved {
+        let outcome = if improved {
             for (slot, tri) in piece.triangles.iter().zip(&chosen) {
                 for (k, &v) in tri.iter().enumerate() {
                     writes.push((slots, slot * 3 + k, v));
                 }
             }
-            parts.push(part(Outcome::Retriangulated, folds));
+            Outcome::Retriangulated
         } else if better_overall {
-            parts.push(part(Outcome::Declined, folds));
+            Outcome::Declined
         } else {
-            parts.push(part(Outcome::Kept, folds));
-        }
+            Outcome::Kept
+        };
+        parts.push(Part {
+            flat: measured.flat,
+            ..part(outcome, folds)
+        });
     }
     Ok((parts, writes))
 }
@@ -759,6 +779,8 @@ struct Measured {
     /// shapes off by the overdraw a viewer sees: a sliver-thin shape (a
     /// mouth resting nearly closed) does not outweigh an open one.
     largest: f64,
+    /// Whether the part is flat (see [`FLATNESS`]).
+    flat: bool,
     /// Vertex index → position in the outline.
     position_of: HashMap<u32, usize>,
 }
@@ -838,9 +860,15 @@ fn measure(
             shape.normal = reference;
         }
     }
+    let tolerance = FLATNESS * largest.sqrt();
+    let flat = shapes.iter().zip(&measured).all(|(recipe, shape)| {
+        !matches!(recipe.kind, ShapeKind::Rest | ShapeKind::Target)
+            || off_plane(&shape.points) <= tolerance
+    });
     Measured {
         shapes: measured,
         largest,
+        flat,
         position_of: outline.iter().enumerate().map(|(i, &v)| (v, i)).collect(),
     }
 }
@@ -962,5 +990,105 @@ impl Measured {
             stack.push((k, j));
         }
         triangles
+    }
+}
+
+/// How far the furthest of `points` lies from their best-fit plane: the
+/// plane through their centroid normal to the direction they spread least
+/// in (the eigenvector of their covariance with the smallest eigenvalue).
+/// A best fit, unlike a plane from the outline's own winding, stays sound
+/// for a sliver-thin outline, whose winding gives no reliable normal.
+fn off_plane(points: &[[f64; 3]]) -> f64 {
+    let n = points.len() as f64;
+    let c = points.iter().fold([0.0; 3], |c, p| {
+        [c[0] + p[0] / n, c[1] + p[1] / n, c[2] + p[2] / n]
+    });
+    let mut a = [[0.0f64; 3]; 3];
+    for p in points {
+        let d = sub(*p, c);
+        for (i, row) in a.iter_mut().enumerate() {
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell += d[i] * d[j];
+            }
+        }
+    }
+    // Jacobi rotations: each zeroes the largest off-diagonal entry, and the
+    // accumulated rotation's columns become the eigenvectors.
+    let mut v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for _ in 0..32 {
+        let (p, q) = [(0, 1), (0, 2), (1, 2)]
+            .into_iter()
+            .max_by(|&(i, j), &(k, l)| a[i][j].abs().total_cmp(&a[k][l].abs()))
+            .unwrap_or((0, 1));
+        if a[p][q].abs() < 1e-300 {
+            break;
+        }
+        let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+        let t = if theta == 0.0 {
+            1.0
+        } else {
+            theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt())
+        };
+        let (cs, sn) = (1.0 / (t * t + 1.0).sqrt(), t / (t * t + 1.0).sqrt());
+        let mut b = a;
+        for k in 0..3 {
+            b[p][k] = cs * a[p][k] - sn * a[q][k];
+            b[q][k] = sn * a[p][k] + cs * a[q][k];
+        }
+        a = b;
+        for row in &mut a {
+            let (x, y) = (row[p], row[q]);
+            row[p] = cs * x - sn * y;
+            row[q] = sn * x + cs * y;
+        }
+        for row in &mut v {
+            let (x, y) = (row[p], row[q]);
+            row[p] = cs * x - sn * y;
+            row[q] = sn * x + cs * y;
+        }
+    }
+    let k = (0..3)
+        .min_by(|&i, &j| a[i][i].total_cmp(&a[j][j]))
+        .unwrap_or(0);
+    let axis = [v[0][k], v[1][k], v[2][k]];
+    points
+        .iter()
+        .map(|&p| dot(sub(p, c), axis).abs())
+        .fold(0.0, f64::max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::off_plane;
+
+    #[test]
+    fn a_plane_in_any_orientation_lies_flat() {
+        let tilted = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.3, 0.0],
+            [1.0, 0.3, 1.0],
+            [0.0, 0.0, 1.0],
+        ];
+        assert!(off_plane(&tilted) < 1e-12);
+        let sliver = [
+            [0.0, 0.0, 0.0],
+            [2.0, 0.01, 0.0],
+            [1.0, 0.0, 0.0],
+            [3.0, 0.02, 0.0],
+        ];
+        assert!(off_plane(&sliver) < 1e-12);
+    }
+
+    #[test]
+    fn a_lifted_corner_lies_off_the_plane() {
+        let lifted = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 0.0],
+        ];
+        // The best plane splits the lift between the corners; it cannot
+        // fit all four within a tenth of the square's side.
+        assert!(off_plane(&lifted) > 0.1);
     }
 }

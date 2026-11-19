@@ -143,8 +143,15 @@ fn print_part(path: &Path, part: &Part) {
         .clone()
         .unwrap_or_else(|| format!("mesh {}", part.mesh));
     let what = match &part.outcome {
+        PartOutcome::Retriangulated if !part.flat => {
+            "retriangulated (not flat, so its surface changed too)".to_string()
+        }
         PartOutcome::Retriangulated => "retriangulated".to_string(),
         PartOutcome::Kept => "kept".to_string(),
+        PartOutcome::Declined if !part.flat => {
+            "kept (not flat: other triangles would change its surface; overall mode rewrites it)"
+                .to_string()
+        }
         PartOutcome::Declined => {
             "kept (overall mode would rewrite it, making some checked shape worse)".to_string()
         }

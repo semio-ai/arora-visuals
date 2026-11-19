@@ -39,14 +39,24 @@ target and each pair of targets at full and at half weight, and the mesh's
 default pose. `mode` sets how far it may go:
 
 - `"safe"`: a part is rewritten only when no checked shape comes out visibly
-  worse (gains more than 1% of the part's largest area). Fixes less.
+  worse (gains more than 1% of the part's largest area) and the part is
+  flat. Fixes less.
 - `"overall"`: a part is rewritten whenever the checked shapes improve
-  overall. Fixes more; some blends may get worse, and the report shows which. It returns the rewritten file
+  overall. Fixes more; some blends may get worse, and the report shows which.
+
+A part is `flat` when its rest shape and each target lie in one plane, to
+within 1% of its size. A part that is not flat has triangles that make its
+surface, so other triangles change that surface too: invisible on a part
+drawn head-on and unlit (a face), visible on a lit 3D part. Safe mode leaves
+such a part as it was; overall mode rewrites it and reports it.
+
+`optimizeMorphTriangles` returns the rewritten file
 (`null` when nothing changed) and a report: for each part, whether it was
 `retriangulated`; `kept`, because no triangulation folds noticeably less;
 `declined`, left as it was in safe mode because the triangulation that folds
-less overall would make a checked shape visibly worse (overall mode writes
-it); or `skipped`, with the reason. For each shape checked,
+less overall would make a checked shape visibly worse or the part is not flat
+(overall mode writes it); or `skipped`, with the reason; and whether it is
+`flat`. For each shape checked,
 with its `kind`, it gives the area drawn with reversed winding before and
 after, relative to the shape's own area; `null` for a shape with almost no
 net area of its own (collapsed, or crossing itself), which is still checked.

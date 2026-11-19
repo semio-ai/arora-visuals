@@ -8,7 +8,7 @@
 import initWasm, * as wasm from "../pkg/arora_import_wasm.js";
 
 /** The wasm interface version this wrapper is written against. */
-const EXPECTED_ABI = 4;
+const EXPECTED_ABI = 5;
 
 /**
  * Where `init` finds the wasm module: its bytes, a compiled module, or a URL
@@ -78,9 +78,10 @@ export type ShapeKind =
   | "defaultPose";
 
 /**
- * What the morph-triangle pass did with one part of a mesh. `kept`: no triangulation folds noticeably less. `declined`: in safe mode,
- * one that folds less overall exists but would make some checked shape
- * visibly worse; overall mode would write it.
+ * What the morph-triangle pass did with one part of a mesh. `kept`: no
+ * triangulation folds noticeably less. `declined`: in safe mode, one that
+ * folds less overall exists but would make some checked shape visibly worse,
+ * or the part is not `flat`; overall mode would write it.
  */
 export type MorphTrianglesOutcome =
   | "retriangulated"
@@ -120,6 +121,14 @@ export interface MorphTrianglesPart {
   outcome: MorphTrianglesOutcome;
   /** Why the part was left alone, when `outcome` is `skipped`. */
   skipReason: string | null;
+  /**
+   * Whether the part's rest shape and each target lie in one plane, to
+   * within 1% of its size; true for a part not measured. Other triangles
+   * change the surface of a part that is not flat, which shows on a lit 3D
+   * part but not on one drawn head-on and unlit (a face). Safe mode declines
+   * such a rewrite; overall mode makes it.
+   */
+  flat: boolean;
   folds: ShapeFold[];
 }
 

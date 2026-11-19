@@ -927,3 +927,45 @@ fn index_data_read_as_an_instance_attribute_is_left_alone() {
     });
     assert_eq!(skip_reason(&bytes), Skip::SharedIndices);
 }
+
+/// The halfway-folding square with one rest corner lifted out of its plane:
+/// its two triangulations are two different surfaces at rest, not two
+/// coverings of one outline.
+fn lifted_folding_square() -> MeshSpec {
+    let mut spec = square("quad").target(
+        "turn",
+        flat(&[[1.4, 0.3], [-1.0, 0.8], [0.5, -1.8], [1.0, -1.1]]),
+    );
+    spec.positions[2][2] = 1.0;
+    spec
+}
+
+#[test]
+fn safe_mode_declines_to_rewrite_a_part_that_is_not_flat() {
+    let optimized =
+        optimize_morph_triangles(&build(&[lifted_folding_square()]).bytes, Mode::Safe).unwrap();
+    assert!(optimized.bytes.is_none(), "the file is left as it was");
+    let part = &optimized.report.parts[0];
+    assert_eq!(part.outcome, Outcome::Declined);
+    assert!(!part.flat);
+}
+
+#[test]
+fn overall_mode_rewrites_a_part_that_is_not_flat_and_says_so() {
+    let optimized =
+        optimize_morph_triangles(&build(&[lifted_folding_square()]).bytes, Mode::Overall).unwrap();
+    assert!(optimized.bytes.is_some());
+    let part = &optimized.report.parts[0];
+    assert_eq!(part.outcome, Outcome::Retriangulated);
+    assert!(!part.flat);
+}
+
+#[test]
+fn a_flat_part_is_reported_flat() {
+    let spec = square("quad").target(
+        "turn",
+        flat(&[[1.4, 0.3], [-1.0, 0.8], [0.5, -1.8], [1.0, -1.1]]),
+    );
+    let optimized = optimize_morph_triangles(&build(&[spec]).bytes, Mode::Safe).unwrap();
+    assert!(optimized.report.parts[0].flat);
+}

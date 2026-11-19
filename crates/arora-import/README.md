@@ -66,11 +66,19 @@ unfolded at 0, ½ and 1 and still fold at a weight in between, and blends of
 three or more targets are not checked. A part is rewritten only when the
 improvement is large enough to see, and the mode sets what else must hold:
 
-- `safe` (the default): no checked shape may come out visibly worse. Fixes
-  less. A shape may still gain up to 1% of the part's largest area, too
-  little to see.
+- `safe` (the default): no checked shape may come out visibly worse, and
+  the part must be flat. Fixes less. A shape may still gain up to 1% of the
+  part's largest area, too little to see.
 - `overall`: the checked shapes must improve overall. Fixes more; blends that
   got worse are listed in the report.
+
+A part is flat when its rest shape and each target lie in one plane, to
+within 1% of the part's size (`morph_triangles::FLATNESS`). A part that is
+not flat has triangles that make its surface, not only cover its outline,
+so other triangles change that surface too. That does not show on a part
+drawn head-on and unlit, such as a face, whose parts often move slightly in
+depth; on a lit 3D part it does. Safe mode therefore leaves such a part as it
+was, and overall mode rewrites it and reports it as not flat.
 
 The search grows with the number of shapes as well as the outline, so a part
 with very many targets may be skipped as too large to check every blend. A
@@ -92,7 +100,8 @@ At least one pass must be named. Exit status: `0` success (including
 nothing to do), `1` `--check` found files that would change, `2` error.
 
 The report lists each part the pass changed, skipped, declined (in safe mode,
-a rewrite overall mode would make), or that still folds. For each shape
+a rewrite overall mode would make), or that still folds, and whether it is
+flat. For each shape
 checked it gives the area drawn with reversed winding before and after,
 relative to that shape's own area; this exceeds 100% when the wrongly drawn
 area is larger than the shape itself, as with a pupil squashed to a thin arc.
@@ -105,11 +114,11 @@ $ arora-import --morph-triangles --dry-run face.glb
 face.glb: left_pupil (primitive 0, 32 vertices): retriangulated
     wink_shape               folded 380.1% -> 0.0%
     sleeping_shape           folded 2160.2% -> 0.0%
-face.glb: mouth (primitive 0, 65 vertices): kept (overall mode would rewrite it, making some checked shape worse)
+face.glb: mouth (primitive 0, 65 vertices): kept (not flat: other triangles would change its surface; overall mode rewrites it)
     rest                     folded 46.4% -> 46.4%  still folds
 
 $ arora-import --morph-triangles=overall --dry-run face.glb
-face.glb: mouth (primitive 0, 65 vertices): retriangulated
+face.glb: mouth (primitive 0, 65 vertices): retriangulated (not flat, so its surface changed too)
     smile_shape              folded 41.2% -> 1.3%  still folds
     approval_shape           folded 23.3% -> 5.8%  still folds
     blends of two targets: 139 better, 4 worse
