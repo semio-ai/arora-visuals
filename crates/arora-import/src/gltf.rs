@@ -296,6 +296,19 @@ impl Document<'_> {
                 ranges.push((None, view.offset..view.offset + view.length));
             }
         }
+        // A meshopt-compressed view is refused by `view`, but its fallback
+        // and its compressed source can both lie in the binary chunk, and
+        // a renderer reads one or the other: both stay protected.
+        let views = self.json.get("bufferViews").and_then(Value::as_array);
+        for view in views.into_iter().flatten() {
+            for name in ["EXT_meshopt_compression", "KHR_meshopt_compression"] {
+                let Some(source) = view.pointer(&format!("/extensions/{name}")) else {
+                    continue;
+                };
+                ranges.extend(self.chunk_range(view).map(|r| (None, r)));
+                ranges.extend(self.chunk_range(source).map(|r| (None, r)));
+            }
+        }
         let accessors = self.json.get("accessors").and_then(Value::as_array);
         for (a, acc) in accessors.into_iter().flatten().enumerate() {
             let a = a as u64;
@@ -338,6 +351,22 @@ impl Document<'_> {
             }
         }
         ranges
+    }
+}
+
+impl Document<'_> {
+    /// The binary-chunk bytes `spec` (a bufferView, or a meshopt
+    /// extension's source) names by its `buffer`, `byteOffset` and
+    /// `byteLength`, clamped to the chunk; `None` for another buffer.
+    fn chunk_range(&self, spec: &Value) -> Option<Range<usize>> {
+        let buffer = spec.get("buffer").and_then(Value::as_u64).unwrap_or(0);
+        if buffer != 0 || self.get("buffers", buffer).ok()?.get("uri").is_some() {
+            return None;
+        }
+        let start = spec.get("byteOffset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let length = spec.get("byteLength").and_then(Value::as_u64)? as usize;
+        let start = start.min(self.bin.len());
+        Some(start..start.saturating_add(length).min(self.bin.len()))
     }
 }
 

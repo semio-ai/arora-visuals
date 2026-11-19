@@ -402,6 +402,16 @@ fn accessor_uses(json: &Value) -> HashMap<u64, usize> {
     for skin in list("skins") {
         count(skin.get("inverseBindMatrices"));
     }
+    // GPU instancing reads per-instance attributes, custom ones included,
+    // from any accessor, so one of them can be a primitive's index data.
+    for node in list("nodes") {
+        let instancing = node.pointer("/extensions/EXT_mesh_gpu_instancing/attributes");
+        instancing
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .for_each(|(_, a)| count(Some(a)));
+    }
     for animation in list("animations") {
         let samplers = animation.get("samplers").and_then(Value::as_array);
         for sampler in samplers.into_iter().flatten() {

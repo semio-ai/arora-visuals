@@ -867,3 +867,63 @@ fn a_primitive_with_more_target_vertices_than_the_pass_holds_is_skipped_whole() 
     let bytes = with_repeated_target(&build(&[mesh]).bytes, 200);
     assert_eq!(skip_reason(&bytes), Skip::TooManyShapes);
 }
+
+/// The byte range of the first primitive's index data in `doc`.
+fn index_bytes(doc: &serde_json::Value) -> (u64, u64) {
+    let view = doc["accessors"][1]["bufferView"].as_u64().unwrap() as usize;
+    let start = doc["bufferViews"][view]["byteOffset"].as_u64().unwrap();
+    (
+        start,
+        doc["bufferViews"][view]["byteLength"].as_u64().unwrap(),
+    )
+}
+
+#[test]
+fn index_bytes_under_a_meshopt_fallback_are_left_alone() {
+    // A compressed view whose fallback is the index data's bytes: a
+    // renderer without meshopt reads them as that view's data.
+    let bytes = with_json(&build(&[morphed_square()]).bytes, |doc| {
+        let (start, length) = index_bytes(doc);
+        doc["buffers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "byteLength": 64 }));
+        doc["bufferViews"].as_array_mut().unwrap().push(json!({
+            "buffer": 0, "byteOffset": start, "byteLength": length,
+            "extensions": { "EXT_meshopt_compression": {
+                "buffer": 1, "byteLength": 4, "byteStride": 2, "count": 1, "mode": "ATTRIBUTES"
+            } }
+        }));
+    });
+    assert_eq!(skip_reason(&bytes), Skip::SharedIndices);
+}
+
+#[test]
+fn index_bytes_under_a_meshopt_source_are_left_alone() {
+    // A compressed view whose compressed stream is the index data's bytes:
+    // a meshopt-aware renderer decodes them.
+    let bytes = with_json(&build(&[morphed_square()]).bytes, |doc| {
+        let (start, length) = index_bytes(doc);
+        doc["buffers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({ "byteLength": 64 }));
+        doc["bufferViews"].as_array_mut().unwrap().push(json!({
+            "buffer": 1, "byteLength": 8,
+            "extensions": { "KHR_meshopt_compression": {
+                "buffer": 0, "byteOffset": start, "byteLength": length,
+                "byteStride": 2, "count": 4, "mode": "ATTRIBUTES"
+            } }
+        }));
+    });
+    assert_eq!(skip_reason(&bytes), Skip::SharedIndices);
+}
+
+#[test]
+fn index_data_read_as_an_instance_attribute_is_left_alone() {
+    let bytes = with_json(&build(&[morphed_square()]).bytes, |doc| {
+        doc["nodes"][0]["extensions"] =
+            json!({ "EXT_mesh_gpu_instancing": { "attributes": { "_ID": 1 } } });
+    });
+    assert_eq!(skip_reason(&bytes), Skip::SharedIndices);
+}
