@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/arora-visuals"]
+members = ["crates/arora-visuals", "crates/arora-import", "crates/arora-import-wasm"]
 resolver = "2"
 
 [workspace.package]
@@ -14,6 +14,10 @@ serde_json = "1"
 # The facade only. A library records what happened and leaves the choice of
 # where it goes to whatever binary ends up embedding it.
 log = "0.4"
+thiserror = "2"
+# `arora-import-wasm` only. The wasm-bindgen CLI that generates its JS glue
+# must be this exact version (Cargo.lock), or the glue and module disagree.
+wasm-bindgen = "0.2.129"
 
 # Every consumer of this workspace must build against the same Bevy minor.
 # Bevy's derives produce concrete types, so a `Component` from one minor and

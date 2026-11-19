@@ -215,6 +215,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "arora-import"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "arora-import-wasm"
+version = "0.1.0"
+dependencies = [
+ "arora-import",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "arora-visuals"
 version = "0.1.0"
 dependencies = [
