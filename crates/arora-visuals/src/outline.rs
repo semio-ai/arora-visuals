@@ -47,7 +47,7 @@ use crate::active_area::FramingSystems;
 use crate::instance::{EntityInstance, Superseded};
 use crate::select::{covered, highlight_of, Highlight, Selection, Selections};
 use crate::view_layer::{
-    content_layers, ViewLayerPlugin, ViewLayerSystems, ViewLayers, WantsViewLayers,
+    content_layers, only, ViewLayerPlugin, ViewLayerSystems, ViewLayers, WantsViewLayers,
 };
 
 /// Outline this camera's view of the selection.
@@ -257,7 +257,7 @@ fn attach_outline(
                     handle: mask.clone(),
                     scale_factor: camera.target_scaling_factor().unwrap_or(1.0),
                 }),
-                RenderLayers::layer(given.mask),
+                only(given.mask),
                 Msaa::Off,
                 Tonemapping::None,
                 Transform::IDENTITY,
@@ -270,7 +270,7 @@ fn attach_outline(
                 Mesh3d(meshes.add(Rectangle::new(1.0, 1.0))),
                 MeshMaterial3d(material.clone()),
                 Transform::IDENTITY,
-                RenderLayers::layer(given.aids),
+                only(given.aids),
                 NotShadowCaster,
                 NotShadowReceiver,
                 ChildOf(view),

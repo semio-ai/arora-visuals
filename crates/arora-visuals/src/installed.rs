@@ -26,6 +26,7 @@ pub(crate) fn first_install<P: Send + Sync + 'static>(app: &mut App) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use bevy::ecs::schedule::ScheduleLabel;
     use bevy::prelude::*;
 
     use crate::active_area::ActiveAreaPlugin;
@@ -40,7 +41,10 @@ mod tests {
 
     /// The plugins two consumers sharing an app would each add, added twice:
     /// Bevy panics on a unique plugin added again, and a plugin that built
-    /// twice would run its systems twice a frame.
+    /// twice would run its systems twice a frame. With Bevy's transform and
+    /// visibility systems beside them, and the frame's schedules built, so
+    /// the order the plugins put themselves in among Bevy's is free of
+    /// cycles.
     #[test]
     fn two_consumers_can_add_the_same_plugins() {
         let consumer = || {
@@ -57,9 +61,22 @@ mod tests {
             )
         };
         let mut app = App::new();
-        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
-            .add_plugins(consumer())
-            .add_plugins(consumer());
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            TransformPlugin,
+            bevy::camera::visibility::VisibilityPlugin,
+        ))
+        .add_plugins(consumer())
+        .add_plugins(consumer());
+        for label in [Update.intern(), PostUpdate.intern(), Last.intern()] {
+            let world = app.world_mut();
+            let Some(mut schedule) = world.resource_mut::<Schedules>().remove(label) else {
+                continue;
+            };
+            schedule.initialize(world).expect("an ordered schedule");
+            world.resource_mut::<Schedules>().insert(schedule);
+        }
         assert!(app.is_plugin_added::<OutlinePlugin>());
     }
 }

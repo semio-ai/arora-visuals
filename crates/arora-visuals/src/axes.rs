@@ -29,6 +29,10 @@ use crate::transform_gizmo::{
     AXIS_COLOURS, CONE_LENGTH, CONE_RADIUS, GIZMO_SIZE, SHAFT_LENGTH, TUBE,
 };
 
+/// Builds and sizes frames' arrows, in `PostUpdate`.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FrameAxesSystems;
+
 /// Shows this entity's reference frame ([module docs](self)).
 #[derive(Component, Clone, Debug)]
 pub struct FrameAxes {
@@ -136,6 +140,7 @@ impl Plugin for FrameAxesPlugin {
             PostUpdate,
             (build_axes, (size_axes, drop_axes))
                 .chain()
+                .in_set(FrameAxesSystems)
                 .after(TransformSystems::Propagate),
         );
     }
