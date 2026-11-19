@@ -39,16 +39,19 @@ mod tests {
     use crate::pick::PickPlugin;
     use crate::transform_gizmo::TransformGizmoPlugin;
 
-    /// The plugins two consumers sharing an app would each add, added twice:
-    /// Bevy panics on a unique plugin added again, and a plugin that built
-    /// twice would run its systems twice a frame. With Bevy's transform and
-    /// visibility systems beside them, and the frame's schedules built, so
-    /// the order the plugins put themselves in among Bevy's is free of
-    /// cycles.
-    #[test]
-    fn two_consumers_can_add_the_same_plugins() {
-        let consumer = || {
-            (
+    /// An app with the plugins one consumer adds, `times` over, beside
+    /// Bevy's transform, camera and visibility systems, its frame's schedules
+    /// built.
+    fn with_plugins(times: usize) -> App {
+        let mut app = App::new();
+        app.add_plugins((
+            MinimalPlugins,
+            AssetPlugin::default(),
+            TransformPlugin,
+            bevy::camera::CameraPlugin,
+        ));
+        for _ in 0..times {
+            app.add_plugins((
                 ActiveAreaPlugin,
                 FrameAxesPlugin,
                 DrawnPlugin,
@@ -58,17 +61,10 @@ mod tests {
                 OverlayPlugin,
                 PickPlugin,
                 TransformGizmoPlugin,
-            )
-        };
-        let mut app = App::new();
-        app.add_plugins((
-            MinimalPlugins,
-            AssetPlugin::default(),
-            TransformPlugin,
-            bevy::camera::visibility::VisibilityPlugin,
-        ))
-        .add_plugins(consumer())
-        .add_plugins(consumer());
+            ));
+            #[cfg(feature = "camera_input")]
+            app.add_plugins(crate::camera_input::CameraInputPlugin);
+        }
         for label in [Update.intern(), PostUpdate.intern(), Last.intern()] {
             let world = app.world_mut();
             let Some(mut schedule) = world.resource_mut::<Schedules>().remove(label) else {
@@ -77,6 +73,39 @@ mod tests {
             schedule.initialize(world).expect("an ordered schedule");
             world.resource_mut::<Schedules>().insert(schedule);
         }
-        assert!(app.is_plugin_added::<OutlinePlugin>());
+        app
+    }
+
+    /// What an app runs: the systems in each of its schedules, and its
+    /// observers.
+    fn runs(app: &mut App) -> (Vec<usize>, usize) {
+        let systems = [Update.intern(), PostUpdate.intern(), Last.intern()]
+            .map(|label| {
+                app.world()
+                    .resource::<Schedules>()
+                    .get(label)
+                    .map_or(0, |schedule| schedule.systems_len())
+            })
+            .to_vec();
+        let observers = app
+            .world_mut()
+            .query::<&bevy::ecs::observer::Observer>()
+            .iter(app.world())
+            .count();
+        (systems, observers)
+    }
+
+    /// Two consumers sharing an app each add the plugins they use. Bevy
+    /// panics on a unique plugin added again, and a plugin that built twice
+    /// would run its systems and observers twice — two picks for one click.
+    /// Added twice, the app runs exactly what it runs with them added once,
+    /// and the order they put themselves in among Bevy's camera and
+    /// visibility systems is free of cycles.
+    #[test]
+    fn two_consumers_can_add_the_same_plugins() {
+        let once = runs(&mut with_plugins(1));
+        let twice = runs(&mut with_plugins(2));
+        assert_eq!(twice, once);
+        assert!(once.0.iter().sum::<usize>() > 0);
     }
 }

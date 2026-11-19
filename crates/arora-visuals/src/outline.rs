@@ -46,9 +46,7 @@ use bevy::shader::ShaderRef;
 use crate::active_area::FramingSystems;
 use crate::instance::{EntityInstance, Superseded};
 use crate::select::{covered, highlight_of, Highlight, Selection, Selections};
-use crate::view_layer::{
-    content_layers, only, ViewLayerPlugin, ViewLayerSystems, ViewLayers, WantsViewLayers,
-};
+use crate::view_layer::{only, ViewLayerPlugin, ViewLayers, WantsViewLayers};
 
 /// Outline this camera's view of the selection.
 #[derive(Component, Clone, Copy, Debug)]
@@ -189,10 +187,7 @@ impl Plugin for OutlinePlugin {
         .add_systems(
             PostUpdate,
             (
-                sync_mask
-                    .after(FramingSystems)
-                    .after(ViewLayerSystems)
-                    .before(CameraUpdateSystems),
+                sync_mask.after(FramingSystems).before(CameraUpdateSystems),
                 fit_overlay
                     .after(CameraUpdateSystems)
                     .after(TransformSystems::Propagate),
@@ -360,7 +355,7 @@ fn mark_selection(
 
     let views: Vec<_> = views
         .iter_mut()
-        .map(|(given, layers, parts)| (*given, content_layers(layers, Some(given)), parts))
+        .map(|(given, layers, parts)| (*given, layers.cloned().unwrap_or_default(), parts))
         .collect();
     let mut wanted: Vec<(Entity, Option<RenderLayers>, RenderLayers)> = Vec::new();
     let mut shown: Vec<Vec<&Selection>> = vec![Vec::new(); views.len()];
@@ -773,6 +768,34 @@ mod tests {
             world.get::<RenderLayers>(bare).is_none(),
             "a mesh that had no layers has none again",
         );
+    }
+
+    /// A selected mesh no outlined view draws is left exactly as it was: no
+    /// mask to join, so nothing to restore later.
+    #[test]
+    fn a_selected_mesh_no_view_draws_is_left_alone() {
+        let (mut world, ..) = world();
+        let unseen = world.spawn(RenderLayers::layer(7)).id();
+        let mut instances = world.query::<&mut EntityInstance>();
+        instances
+            .single_mut(&mut world)
+            .unwrap()
+            .bindings
+            .elements
+            .insert(
+                "unseen".to_string(),
+                ElementTargets {
+                    node: unseen,
+                    mesh: Some(unseen),
+                    morph: None,
+                },
+            );
+        select(&mut world, of(&["unseen"]));
+        assert_eq!(
+            world.get::<RenderLayers>(unseen),
+            Some(&RenderLayers::layer(7))
+        );
+        assert!(world.get::<Outlined>(unseen).is_none());
     }
 
     /// Each view outlines what it shows, with the highlight of what it shows:

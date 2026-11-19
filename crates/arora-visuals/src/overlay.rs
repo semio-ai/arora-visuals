@@ -182,7 +182,7 @@ fn publish(
     all_cameras: Query<(
         &'static Camera,
         &'static GlobalTransform,
-        Option<&'static RenderTarget>,
+        &'static RenderTarget,
     )>,
     globals: Query<&GlobalTransform>,
     aids: Query<(), With<GizmoPart>>,
@@ -358,7 +358,6 @@ fn publish(
     }
 }
 
-/// A joint's value as a reading: an angle for a turn, a distance for a slide.
 /// The cameras that draw to a window, looked up as a camera query is.
 struct Windowed<'a, 'w, 's>(
     &'a Query<
@@ -367,7 +366,7 @@ struct Windowed<'a, 'w, 's>(
         (
             &'static Camera,
             &'static GlobalTransform,
-            Option<&'static RenderTarget>,
+            &'static RenderTarget,
         ),
     >,
 );
@@ -375,17 +374,13 @@ struct Windowed<'a, 'w, 's>(
 impl Windowed<'_, '_, '_> {
     fn get(&self, camera: Entity) -> Result<(&Camera, &GlobalTransform), ()> {
         match self.0.get(camera) {
-            // A camera with no target of its own draws to the primary window.
-            Ok((camera, at, target))
-                if target.is_none_or(|target| matches!(target, RenderTarget::Window(_))) =>
-            {
-                Ok((camera, at))
-            }
+            Ok((camera, at, RenderTarget::Window(_))) => Ok((camera, at)),
             _ => Err(()),
         }
     }
 }
 
+/// A joint's value as a reading: an angle for a turn, a distance for a slide.
 fn joint_reading(gizmo: &JointGizmo) -> Reading {
     let (amount, unit) = match gizmo.motion {
         JointMotion::Turn => (gizmo.value.to_degrees(), ReadingUnit::Degrees),
@@ -412,9 +407,8 @@ fn box_of_points(points: &[Vec3], (camera, at): (&Camera, &GlobalTransform)) -> 
 mod tests {
     use super::*;
 
-    /// A box is the extent of its points, centred between its edges.
     /// A camera drawing into an image places nothing over a window; one
-    /// drawing to a window, or to the primary window by default, does.
+    /// drawing to a window does.
     #[test]
     fn only_a_camera_drawing_to_a_window_places_anything() {
         use bevy::camera::ImageRenderTarget;
@@ -440,7 +434,7 @@ mod tests {
             Query<(
                 &'static Camera,
                 &'static GlobalTransform,
-                Option<&'static RenderTarget>,
+                &'static RenderTarget,
             )>,
         > = SystemState::new(&mut world);
         let cameras = state.get(&world).unwrap();
@@ -449,6 +443,7 @@ mod tests {
         assert!(windowed.get(image).is_err());
     }
 
+    /// A box is the extent of its points, centred between its edges.
     #[test]
     fn a_box_spans_its_points() {
         let screen = ScreenBox::around([Vec2::new(10.0, 40.0), Vec2::new(30.0, 20.0)]).unwrap();

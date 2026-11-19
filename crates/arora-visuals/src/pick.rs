@@ -55,6 +55,9 @@ use bevy::window::PrimaryWindow;
 
 /// A click on an instance: the element under it, by the ids the asset's own
 /// `RobotData` declares, or `None` for a click that hit no element.
+///
+/// Like any Bevy message it is kept for two frames, so a consumer reads picks
+/// every frame, from a system, and keeps any it needs longer itself.
 #[derive(Message, Debug, Clone, PartialEq, Eq)]
 pub struct Picked {
     /// The instance entity, which a consumer tells its own picks by.
