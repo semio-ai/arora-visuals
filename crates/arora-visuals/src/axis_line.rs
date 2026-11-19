@@ -141,15 +141,20 @@ impl Plugin for AxisLinePlugin {
             return;
         }
         embedded_asset!(app, "axis_line.wesl");
-        app.add_plugins(MaterialPlugin::<AxisLineMaterial>::default())
-            .add_systems(Startup, make_tube)
-            .add_systems(
-                PostUpdate,
-                (drop_lines, build_lines, place_lines)
-                    .chain()
-                    .in_set(AxisLineSystems)
-                    .after(TransformSystems::Propagate),
-            );
+        // Every aid builds on this plugin, and each is kept to the view it is
+        // seen through.
+        app.add_plugins((
+            MaterialPlugin::<AxisLineMaterial>::default(),
+            crate::view_layer::ViewLayerPlugin,
+        ))
+        .add_systems(Startup, make_tube)
+        .add_systems(
+            PostUpdate,
+            (drop_lines, build_lines, place_lines)
+                .chain()
+                .in_set(AxisLineSystems)
+                .after(TransformSystems::Propagate),
+        );
     }
 }
 

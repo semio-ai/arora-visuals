@@ -53,15 +53,20 @@ impl Selections {
     /// to its own — Studio's rule, which keeps two highlights from fighting
     /// over one outline.
     pub fn highlight(&self) -> Option<Highlight> {
-        let mut asking = self
-            .0
-            .values()
-            .flatten()
-            .filter_map(|selection| selection.highlight);
-        match (asking.next(), asking.next()) {
-            (Some(highlight), None) => Some(highlight),
-            _ => None,
-        }
+        highlight_of(self.0.values().flatten())
+    }
+}
+
+/// The highlight these selected elements are shown with together, by the
+/// rule [`Selections::highlight`] gives. A view applies it to the part of the
+/// selection it shows.
+pub fn highlight_of<'a>(selected: impl IntoIterator<Item = &'a Selection>) -> Option<Highlight> {
+    let mut asking = selected
+        .into_iter()
+        .filter_map(|selection| selection.highlight);
+    match (asking.next(), asking.next()) {
+        (Some(highlight), None) => Some(highlight),
+        _ => None,
     }
 }
 

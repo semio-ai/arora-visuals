@@ -22,6 +22,16 @@
 //!
 //! Line gizmos are used because WebGL2 has no wireframe, which settles *how*
 //! edges get drawn. It does not make edges the right thing to draw.
+//!
+//! # Where it shows
+//!
+//! A host marks the cameras that show the glow with [`GlowView`], as it marks
+//! the ones that outline with [`OutlineView`](crate::outline::OutlineView).
+//! The lines are drawn on those views' `aids` layers
+//! ([`ViewLayers`](crate::view_layer::ViewLayers)), so a camera filling a
+//! screen's texture never shows them, and only for meshes one of those views
+//! draws. The lines are one batch for every glow view, so two glow views whose
+//! content stands in the same place each show the other's glow.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,6 +43,10 @@ use bevy::prelude::*;
 use crate::instance::{EntityInstance, Superseded};
 use crate::pick::ElementMeshes;
 use crate::select::{covered, Selections};
+use crate::view_layer::{
+    content_layers, ViewLayerPlugin, ViewLayerSystems, ViewLayers, WantsViewLayers,
+};
+use bevy::camera::visibility::RenderLayers;
 
 /// The angle two adjacent triangles turn by for their shared edge to be
 /// outlined — the authoring app's glow threshold.
@@ -44,11 +58,16 @@ const GLOW: Color = Color::srgba(1.0, 16.0 / 255.0, 16.0 / 255.0, 0.9);
 /// The outline's line width, in logical pixels.
 const GLOW_WIDTH: f32 = 3.0;
 
+/// Show the glow in this camera's view.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct GlowView;
+
 pub struct GlowPlugin;
 
 impl Plugin for GlowPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<Selections>()
+        app.add_plugins(ViewLayerPlugin)
+            .init_resource::<Selections>()
             .init_resource::<FeatureEdges>()
             .insert_gizmo_config(
                 SelectionGlow,
@@ -62,9 +81,12 @@ impl Plugin for GlowPlugin {
                     ..default()
                 },
             )
+            .add_systems(Update, ask_for_layers)
             .add_systems(
                 PostUpdate,
-                draw_glow.after(bevy::transform::TransformSystems::Propagate),
+                draw_glow
+                    .after(bevy::transform::TransformSystems::Propagate)
+                    .after(ViewLayerSystems),
             );
     }
 }
@@ -77,15 +99,51 @@ struct SelectionGlow;
 #[derive(Resource, Default)]
 struct FeatureEdges(HashMap<AssetId<Mesh>, Arc<Vec<[u32; 2]>>>);
 
-/// Outline every selected element of every indexed instance.
+/// Asks for the layers of each glow view that has none yet.
+#[allow(clippy::type_complexity)]
+fn ask_for_layers(
+    mut commands: Commands,
+    views: Query<
+        Entity,
+        (
+            With<GlowView>,
+            Without<ViewLayers>,
+            Without<WantsViewLayers>,
+        ),
+    >,
+) {
+    for view in &views {
+        commands.entity(view).insert(WantsViewLayers);
+    }
+}
+
+/// Outline every selected element a glow view draws, on the glow views'
+/// `aids` layers.
+#[allow(clippy::too_many_arguments)]
 fn draw_glow(
     selections: Res<Selections>,
     instances: Query<&EntityInstance, Without<Superseded>>,
     parents: Query<&ChildOf>,
+    views: Query<(&ViewLayers, Option<&RenderLayers>), With<GlowView>>,
+    layers: Query<&RenderLayers>,
     elements: ElementMeshes,
     mut edges: ResMut<FeatureEdges>,
     mut gizmos: Gizmos<SelectionGlow>,
+    mut store: ResMut<GizmoConfigStore>,
 ) {
+    let mut aids = RenderLayers::none();
+    let mut content = RenderLayers::none();
+    for (given, held) in &views {
+        aids = aids.with(given.aids);
+        content = content.union(&content_layers(held, Some(given)));
+    }
+    let (config, _) = store.config_mut::<SelectionGlow>();
+    if config.render_layers != aids {
+        config.render_layers = aids;
+    }
+    if views.is_empty() {
+        return;
+    }
     for instance in &instances {
         if !instance.bindings.indexed {
             continue;
@@ -95,6 +153,15 @@ fn draw_glow(
         };
         for selection in selected {
             for element in covered(instance, &selection.element, &parents) {
+                // A mesh on no layers is on the default one, as Bevy draws it.
+                let drawn_on = element
+                    .mesh
+                    .and_then(|mesh| layers.get(mesh).ok())
+                    .cloned()
+                    .unwrap_or_default();
+                if !drawn_on.intersects(&content) {
+                    continue;
+                }
                 let Some((mesh_id, mesh)) = elements.mesh(element) else {
                     continue;
                 };

@@ -97,6 +97,8 @@ pub mod value;
 #[cfg(feature = "view_gizmo")]
 pub mod view_gizmo;
 #[cfg(feature = "view")]
+pub mod view_layer;
+#[cfg(feature = "view")]
 pub mod view_offset;
 
 pub use binding::{ElementTargets, SceneBinding, SceneBindings};
