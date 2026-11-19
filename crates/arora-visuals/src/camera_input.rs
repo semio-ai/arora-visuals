@@ -436,7 +436,13 @@ fn zoom(
         }
         if let Ok(mut projection) = projections.get_mut(entity) {
             if let Projection::Orthographic(lens) = &mut *projection {
-                zoom_orthographic(lens, &mut controller, pixels, bindings.zoom_speed);
+                zoom_orthographic(
+                    lens,
+                    &mut controller,
+                    &mut transform,
+                    pixels,
+                    bindings.zoom_speed,
+                );
                 return;
             }
         }
@@ -463,28 +469,35 @@ fn zoom(
 /// Zooms an orthographic camera by scaling its projection by the zoom's
 /// factor for `pixels` of scrolling.
 ///
-/// The controller then moves the camera to a depth set by the scale,
-/// carrying along the anchor of a gesture in hand but not that of one
-/// carrying on under inertia; that one is told the depth here, as a
-/// perspective zoom tells it the distance it closed to.
+/// The controller keeps an orthographic camera at a depth from its target set
+/// by the scale. It is moved there along its axis here, at once, with its
+/// target and the anchor of any gesture carrying on under inertia moved to
+/// match, as a perspective zoom moves them: the controller turns an orbit
+/// about that anchor before it places the camera, so an anchor moved alone
+/// would shift the point the view turns about.
 fn zoom_orthographic(
     lens: &mut OrthographicProjection,
     controller: &mut PanOrbitCamera,
+    transform: &mut Transform,
     pixels: f32,
     zoom_speed: f32,
 ) {
     lens.scale *= dolly(1.0, pixels, zoom_speed) as f32;
     let settings = &controller.orthographic;
-    let depth = (settings.scale_to_near_clip * lens.scale).clamp(
+    let depth = f64::from((settings.scale_to_near_clip * lens.scale).clamp(
         settings.near_clip_limits.start,
         settings.near_clip_limits.end,
-    );
+    ));
+    let distance = controller.last_anchor_depth().abs();
+    let forward = transform.forward().as_vec3();
+    transform.translation += forward * (distance - depth) as f32;
+    controller.last_anchor_depth = -depth;
     if let CurrentMotion::Momentum {
         velocity: Velocity::Orbit { anchor, .. } | Velocity::Pan { anchor, .. },
         ..
     } = &mut controller.current_motion
     {
-        anchor.z = -f64::from(depth);
+        anchor.z = -depth;
     }
 }
 
@@ -587,8 +600,9 @@ mod tests {
     }
 
     /// A scroll over an orthographic camera scales its projection by the
-    /// zoom's factor and leaves the camera where it stands; over a
-    /// perspective camera it moves the camera and leaves the projection.
+    /// zoom's factor, the camera moving along its axis only to the depth the
+    /// controller keeps at that scale; over a perspective camera it moves the
+    /// camera and leaves the projection.
     #[test]
     fn a_scroll_zooms_an_orthographic_camera_by_its_scale() {
         use bevy::camera::{ComputedCameraValues, RenderTargetInfo};
@@ -656,18 +670,27 @@ mod tests {
             panic!("still orthographic");
         };
         assert!((lens.scale - 0.95).abs() < 1e-6, "{}", lens.scale);
-        assert_eq!(at, Vec3::new(0.0, 0.0, 5.0), "the camera stays put");
+        let settings = PanOrbitCamera::default().orthographic;
+        let depth = (settings.scale_to_near_clip * 0.95).clamp(
+            settings.near_clip_limits.start,
+            settings.near_clip_limits.end,
+        );
+        assert!(
+            at.truncate() == Vec2::ZERO && (at.z - depth).abs() < 1e-4,
+            "{at}: the target at the origin stays at the origin",
+        );
 
         let (lens, at) = scrolled(Projection::Perspective(PerspectiveProjection::default()));
         assert!(matches!(lens, Projection::Perspective(_)));
         assert!((at.z - 5.0 * 0.95).abs() < 1e-4, "{at}");
     }
 
-    /// An orbit carrying on under inertia, which the controller does not
-    /// carry along when it moves an orthographic camera to its scale's depth,
-    /// is told that depth by the zoom.
+    /// An orthographic zoom keeps the point the view turns about where it
+    /// was, for the camera's target and for an orbit carrying on under
+    /// inertia: the camera moves to its scale's depth along its axis, and both
+    /// anchors move with it.
     #[test]
-    fn an_orthographic_zoom_moves_an_orbits_anchor_under_inertia() {
+    fn an_orthographic_zoom_keeps_the_point_an_orbit_turns_about() {
         use bevy::platform::time::Instant;
 
         let mut controller = PanOrbitCamera {
@@ -680,13 +703,11 @@ mod tests {
             },
             ..default()
         };
+        controller.last_anchor_depth = -1.0e6;
         let mut lens = OrthographicProjection::default_3d();
-        zoom_orthographic(&mut lens, &mut controller, 100.0, 1.0);
-        let settings = &controller.orthographic;
-        let wanted = (settings.scale_to_near_clip * 0.95).clamp(
-            settings.near_clip_limits.start,
-            settings.near_clip_limits.end,
-        );
+        // Looking down −Z at the origin, a million units away.
+        let mut at = Transform::from_xyz(0.0, 0.0, 1.0e6);
+        zoom_orthographic(&mut lens, &mut controller, &mut at, 100.0, 1.0);
         let CurrentMotion::Momentum {
             velocity: Velocity::Orbit { anchor, .. },
             ..
@@ -694,7 +715,19 @@ mod tests {
         else {
             panic!("still carrying on");
         };
-        assert!((anchor.z + f64::from(wanted)).abs() < 1e-6, "{anchor}");
+        // The point an anchor names: its depth along the camera's axis.
+        let pivot = |depth: f64| f64::from(at.translation.z) + depth;
+        assert!(
+            pivot(anchor.z).abs() < 1e-3,
+            "orbit pivot {}",
+            pivot(anchor.z)
+        );
+        assert!(
+            pivot(controller.last_anchor_depth).abs() < 1e-3,
+            "target {}",
+            pivot(controller.last_anchor_depth)
+        );
+        assert!(at.translation.z < 1.0e6, "the camera moved to its depth");
     }
 
     /// A camera below the floor is raised onto it and still looks at its
