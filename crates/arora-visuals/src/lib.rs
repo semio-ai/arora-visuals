@@ -69,6 +69,8 @@ pub mod binding;
 #[cfg(feature = "camera_input")]
 pub mod camera_input;
 #[cfg(feature = "view")]
+pub mod control;
+#[cfg(feature = "view")]
 pub mod drawn;
 #[cfg(feature = "view")]
 pub mod ghost;
@@ -100,7 +102,7 @@ pub mod view_layer;
 
 pub use binding::{ElementTargets, SceneBinding, SceneBindings};
 pub use hold::{HoldTarget, Holds};
-pub use instance::{ClearCamera, EntityInstance, Superseded, ViewOf, CLEAR_ORDER};
+pub use instance::{ClearCamera, EntityInstance, Loading, Superseded, ViewOf, CLEAR_ORDER};
 pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 #[cfg(feature = "view")]
 pub use pick::Picked;

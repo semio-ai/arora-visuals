@@ -77,3 +77,23 @@ pub struct ClearCamera;
 /// which is how an instance that is not ready is hidden without being
 /// despawned or made invisible — it keeps warming where it cannot be seen.
 pub const CLEAR_ORDER: isize = -1;
+
+/// On an entity a host is loading an instance into, until it carries the
+/// [`EntityInstance`] that instance becomes: what is asked of `instance`
+/// before it can be addressed waits for it, rather than being refused.
+///
+/// **A host marks its loading roots**, and takes the mark off when it puts
+/// the instance on. Whether an instance is still to come is the host's to
+/// know — only it has the load under way — and without the mark a control
+/// added in the frames a load takes is refused as being on nothing. A host
+/// that spawns each instance whole, with no load in between, never adds it.
+///
+/// It may stand beside an instance of the same id already there, as when a
+/// host loads a replacement in the background: what addresses the id reaches
+/// the one there, and the mark says only that another is on its way.
+#[derive(Component, Clone, Debug)]
+pub struct Loading {
+    /// The host's id for the instance being loaded, which becomes its
+    /// [`EntityInstance::id`].
+    pub instance: String,
+}
