@@ -16,7 +16,13 @@ default = []
 # here that needs a whole Bevy app — `DefaultPlugins`, the render stack, winit
 # and a PNG encoder — and a consumer that wants the asset parse should not pay
 # for an engine to get it.
-snapshot = ["dep:bevy", "dep:image"]
+snapshot = [
+  "dep:bevy",
+  "dep:image",
+  "bevy/default_app",
+  "bevy/multi_threaded",
+  "bevy/bevy_winit",
+]
 # The parts of a view that need the render stack: knowing when an instance is
 # actually drawable, picking over the mesh as drawn, and the selection
 # outline. Off by default for the same reason as `snapshot` — a consumer that
@@ -60,19 +66,19 @@ bevy_ecs = { workspace = true }
 bevy_image = { workspace = true }
 bevy_math = { workspace = true }
 
-# `snapshot` only.
+# What `view` and `snapshot` both draw with. What the capture harness alone
+# needs — `DefaultPlugins`, the multi-threaded executor, winit to switch off —
+# is added by `snapshot`, so a renderer that takes `view` without it, as a
+# browser build counting its download does, does not pay for them.
 bevy = { workspace = true, optional = true, features = [
-  "default_app",
   "std",
   "async_executor",
-  "multi_threaded",
   "bevy_asset",
   "bevy_render",
   "bevy_core_pipeline",
   "bevy_camera",
   "bevy_image",
   "bevy_window",
-  "bevy_winit",
   # `view`: the morph-aware pick casts over morphed positions and needs the
   # material pipeline cache to know what has compiled; the outline draws line
   # gizmos, which is the portable answer where WebGL2 has no wireframe.
