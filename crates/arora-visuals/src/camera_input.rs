@@ -5,6 +5,11 @@
 //! The bindings default to Studio's: the left button orbits, the right pans,
 //! the wheel zooms.
 //!
+//! **Which way is up is each camera's own**: the controller's
+//! `orbit_constraint`, Bevy's Y by default. A view of a Z-up world, such as a
+//! face's, sets it to that world's up on its camera, and a robot scene's
+//! camera in the same app keeps Y.
+//!
 //! **A gesture is the camera's only if it begins on the scene.** A press that
 //! lands on a UI node — a panel, a toggle, a slider — reaches that node and
 //! not the window, so it never starts one; neither does a press that takes a
@@ -24,7 +29,10 @@
 //! **A zoom is OrbitControls' zoom.** Each scroll moves the camera along its
 //! axis at once, scaling its distance to the target by
 //! `0.95^(|pixels| × 0.01 × zoom_speed)`: no smoothing to spread a scroll
-//! over the frames after it, and no momentum of its own. What the camera has
+//! over the frames after it, and no momentum of its own. Under an
+//! orthographic projection, where moving the camera changes nothing on
+//! screen, the same factor scales the projection instead, unbounded as
+//! OrbitControls' orthographic zoom is by default. What the camera has
 //! moved is exactly what has been scrolled, so a zoom stops the moment the
 //! scrolling does. As in OrbitControls, a scroll during an orbit or a pan is
 //! ignored.
@@ -391,11 +399,13 @@ fn dolly(distance: f64, pixels: f32, zoom_speed: f32) -> f64 {
 
 /// Zooms the camera under a scroll that reaches the scene toward its target,
 /// unless an orbit or pan is in hand.
+#[allow(clippy::too_many_arguments)]
 fn zoom(
     scroll: On<PointerScroll>,
     windows: Query<(), With<Window>>,
     all: AllCameras,
     mut cameras: Cameras,
+    mut projections: Query<&mut Projection>,
     gesture: Res<Gesture>,
     time: Res<Time>,
     mut trackpad: ResMut<Trackpad>,
@@ -423,6 +433,12 @@ fn zoom(
             };
         if pixels == 0.0 {
             return;
+        }
+        if let Ok(mut projection) = projections.get_mut(entity) {
+            if let Projection::Orthographic(lens) = &mut *projection {
+                lens.scale *= dolly(1.0, pixels, bindings.zoom_speed) as f32;
+                return;
+            }
         }
         let distance = controller.last_anchor_depth().abs();
         let closer = dolly(distance, pixels, bindings.zoom_speed).clamp(
@@ -540,6 +556,83 @@ mod tests {
         assert!((closer - 2.0 * 0.95).abs() < 1e-9, "{closer}");
         assert!((dolly(closer, -100.0, 1.0) - 2.0).abs() < 1e-9);
         assert!((dolly(2.0, 100.0, 2.0) - 2.0 * 0.95 * 0.95).abs() < 1e-9);
+    }
+
+    /// A scroll over an orthographic camera scales its projection by the
+    /// zoom's factor and leaves the camera where it stands; over a
+    /// perspective camera it moves the camera and leaves the projection.
+    #[test]
+    fn a_scroll_zooms_an_orthographic_camera_by_its_scale() {
+        use bevy::camera::{ComputedCameraValues, RenderTargetInfo};
+        use bevy::picking::backend::HitData;
+        use bevy::picking::pointer::{Location, PointerId};
+        use bevy::window::WindowRef;
+
+        let scrolled = |projection: Projection| {
+            let mut world = World::new();
+            world.init_resource::<Gesture>();
+            world.init_resource::<Trackpad>();
+            world.init_resource::<Time>();
+            world.add_observer(zoom);
+            let window = world.spawn(Window::default()).id();
+            let camera = world
+                .spawn((
+                    Camera {
+                        computed: ComputedCameraValues {
+                            target_info: Some(RenderTargetInfo {
+                                physical_size: UVec2::splat(400),
+                                scale_factor: 1.0,
+                            }),
+                            ..default()
+                        },
+                        ..default()
+                    },
+                    RenderTarget::Window(WindowRef::Entity(window)),
+                    CameraBindings::default(),
+                    projection,
+                    Transform::from_xyz(0.0, 0.0, 5.0),
+                ))
+                .id();
+            world
+                .get_mut::<PanOrbitCamera>(camera)
+                .unwrap()
+                .last_anchor_depth = -5.0;
+            let target =
+                NormalizedRenderTarget::Window(WindowRef::Entity(window).normalize(None).unwrap());
+            world.trigger(PointerScroll {
+                entity: window,
+                pointer: Pointer::new(
+                    PointerId::Mouse,
+                    Location {
+                        target,
+                        position: Vec2::splat(200.0),
+                    },
+                ),
+                unit: MouseScrollUnit::Pixel,
+                x: 0.0,
+                y: 100.0,
+                hit: HitData::new(window, 0.0, None, None),
+                phase: TouchPhase::Moved,
+            });
+            world.flush();
+            (
+                world.get::<Projection>(camera).unwrap().clone(),
+                world.get::<Transform>(camera).unwrap().translation,
+            )
+        };
+
+        let (lens, at) = scrolled(Projection::Orthographic(
+            OrthographicProjection::default_3d(),
+        ));
+        let Projection::Orthographic(lens) = lens else {
+            panic!("still orthographic");
+        };
+        assert!((lens.scale - 0.95).abs() < 1e-6, "{}", lens.scale);
+        assert_eq!(at, Vec3::new(0.0, 0.0, 5.0), "the camera stays put");
+
+        let (lens, at) = scrolled(Projection::Perspective(PerspectiveProjection::default()));
+        assert!(matches!(lens, Projection::Perspective(_)));
+        assert!((at.z - 5.0 * 0.95).abs() < 1e-4, "{at}");
     }
 
     /// A camera below the floor is raised onto it and still looks at its
