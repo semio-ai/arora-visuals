@@ -91,7 +91,6 @@ pub mod pick;
 pub mod select;
 #[cfg(feature = "snapshot")]
 pub mod snapshot;
-pub mod target;
 pub mod tone;
 #[cfg(feature = "view")]
 pub mod transform_gizmo;
@@ -100,8 +99,6 @@ pub mod value;
 pub mod view_gizmo;
 #[cfg(feature = "view")]
 pub mod view_layer;
-#[cfg(feature = "view")]
-pub mod view_offset;
 
 pub use binding::{ElementTargets, SceneBinding, SceneBindings};
 pub use hold::{HoldTarget, Holds};
@@ -109,6 +106,5 @@ pub use instance::{ClearCamera, EntityInstance, Superseded, ViewOf, CLEAR_ORDER}
 pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 #[cfg(feature = "view")]
 pub use pick::Picked;
-pub use target::OffscreenTarget;
 pub use tone::ToneMapping;
 pub use value::Decoded;

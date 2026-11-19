@@ -36,8 +36,6 @@ use bevy::window::ExitCondition;
 use bevy::winit::WinitPlugin;
 use image::RgbaImage;
 
-use crate::target::OffscreenTarget;
-
 /// Matches `TextureFormat::bevy_default()` on desktop, and keeps readback
 /// bytes in plain RGBA order so a capture needs no channel swizzle.
 pub const FORMAT: TextureFormat = TextureFormat::Rgba8UnormSrgb;
@@ -46,12 +44,17 @@ pub const FORMAT: TextureFormat = TextureFormat::Rgba8UnormSrgb;
 /// fails fast instead of hanging.
 const MAX_READBACK_FRAMES: u32 = 120;
 
+/// The image the harness reads back. Point the cameras whose picture is to be
+/// captured at it, with `RenderTarget::Image`.
+#[derive(Resource, Clone)]
+pub struct SnapshotTarget(pub Handle<Image>);
+
 /// Latest raw (row-padded) frame from the GPU readback.
 #[derive(Resource, Default)]
 struct Frame(Option<Vec<u8>>);
 
 /// Windowless app base: `DefaultPlugins` without a window or winit, driven by
-/// manual updates. Inserts the offscreen target the view's cameras draw into.
+/// manual updates. Inserts the [`SnapshotTarget`] a capture reads back.
 pub struct SnapshotPlugin {
     pub width: u32,
     pub height: u32,
@@ -89,7 +92,7 @@ impl Plugin for SnapshotPlugin {
         let mut target = Image::new_target_texture(self.width, self.height, FORMAT, None);
         target.texture_descriptor.usage |= TextureUsages::COPY_SRC;
         let handle = app.world_mut().resource_mut::<Assets<Image>>().add(target);
-        app.insert_resource(OffscreenTarget(handle.clone()));
+        app.insert_resource(SnapshotTarget(handle.clone()));
         app.world_mut().spawn(Readback::texture(handle)).observe(
             |event: On<ReadbackComplete>, mut frame: ResMut<Frame>| {
                 frame.0 = Some(event.data.clone());
@@ -176,9 +179,10 @@ fn frame_to_image(data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
 
 /// Saves a captured frame as PNG.
 pub fn save_png(img: &RgbaImage, path: &std::path::Path) -> Result<()> {
-    img.save_with_format(path, image::ImageFormat::Png).map_err(|e| {
-        anyhow::Error::new(e).context(format!("failed to save PNG to {}", path.display()))
-    })
+    img.save_with_format(path, image::ImageFormat::Png)
+        .map_err(|e| {
+            anyhow::Error::new(e).context(format!("failed to save PNG to {}", path.display()))
+        })
 }
 
 #[cfg(test)]
