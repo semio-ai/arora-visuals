@@ -281,7 +281,16 @@ pub fn ready_drawn_instances(
     let Ok(reports) = reports.0.lock() else {
         return;
     };
+    // Cameras made ready in this run. `Warming` comes off through commands,
+    // which land only after it, so a second terminal report for the same
+    // camera — the GPU's drawn and the timeout's give-up can both arrive
+    // before one drain — would still find it warming. The first says what
+    // the instance became; the rest are about a transition already made.
+    let mut made_ready = std::collections::HashSet::new();
     for message in reports.try_iter() {
+        if made_ready.contains(&message.camera) {
+            continue;
+        }
         let Ok((&ViewOf(instance), mut placed)) = cameras.get_mut(message.camera) else {
             continue;
         };
@@ -314,6 +323,7 @@ pub fn ready_drawn_instances(
         placed.order = instance.draw_order;
         instance.ready = true;
         commands.entity(message.camera).remove::<Warming>();
+        made_ready.insert(message.camera);
         ready.write(InstanceReady {
             instance: entity,
             id: instance.id.clone(),
@@ -352,7 +362,9 @@ mod tests {
     use crate::binding::SceneBindings;
 
     /// An instance made ready says whether it was seen drawn or given up on,
-    /// once, and a superseded one says nothing.
+    /// once, and a superseded one says nothing. Two terminal reports for one
+    /// camera in one frame — drawn, and the timeout racing it — make it
+    /// ready once, as the first said.
     #[test]
     fn a_ready_instance_says_whether_it_was_drawn() {
         let mut app = App::new();
@@ -387,6 +399,7 @@ mod tests {
             (drawn, Report::Drawn),
             (gave_up, Report::GaveUp),
             (gone, Report::Drawn),
+            (drawn, Report::GaveUp),
         ] {
             sender
                 .send(Message {
