@@ -70,7 +70,7 @@ parts need remodelling. The crate README explains which parts the pass considers
 ## Development
 
 ```
-npm install
+npm ci --include=dev # the build needs TypeScript, even where NODE_ENV=production
 npm run build:wasm   # cargo, then wasm-bindgen-cli at the version Cargo.lock pins, into pkg/
 npm test             # builds dist/ and runs the tests on the real wasm module
 ```

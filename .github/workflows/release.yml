@@ -1,18 +1,19 @@
 name: Release
 
-# Publishes arora-visuals to crates.io on push to main, when its manifest names
-# a version crates.io does not have yet. A release is therefore a version bump;
-# a merge that leaves the version alone publishes nothing.
+# On push to main, publishes arora-visuals to crates.io and @semio/import to
+# npm, each when its manifest names a version its registry does not have yet.
+# A release is therefore a version bump; a merge that leaves a version alone
+# publishes nothing for it.
 #
-# Until the crate is on crates.io at all, this publishes nothing and says so.
-# crates.io takes a new crate's first upload only from a person: trusted
-# publishing is configured on a crate that already exists. The README's
-# "Releasing" section has the steps; after them, this workflow takes over.
+# Until a package is on its registry at all, its job publishes nothing and
+# says so: neither registry's trusted publishing can create a package, so a
+# first upload is a person's. The README's "Releasing" section has the steps;
+# after them, this workflow takes over.
 on:
   push:
     branches: [main]
 
-# One release run at a time, none cancelled: two runs that both found the
+# One release run at a time, none cancelled: two runs that both found a
 # version missing would both try to upload it.
 concurrency:
   group: release
@@ -82,3 +83,84 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked -p arora-visuals
+
+  publish-npm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC) and provenance: no stored token
+    defaults:
+      run:
+        working-directory: packages/import
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Read the manifest version
+        id: version
+        run: echo "version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
+
+      # As for crates.io: only a 404 means missing, and anything else fails
+      # the run rather than risk uploading a version twice.
+      - name: Check whether npm has it
+        id: published
+        run: |
+          ask() {
+            curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/@semio%2Fimport$1"
+          }
+          package=$(ask "")
+          case "$package" in
+            200) ;;
+            404)
+              echo "::notice::@semio/import is not on npm yet; its first upload is a person's (see the README's Releasing section), so nothing is published"
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              exit 0 ;;
+            *) echo "::error::npm answered $package; cannot tell whether the package exists"; exit 1 ;;
+          esac
+          status=$(ask "/${{ steps.version.outputs.version }}")
+          case "$status" in
+            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::npm answered $status; cannot tell whether the version exists"; exit 1 ;;
+          esac
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.published.outputs.exists == 'false'
+        with:
+          targets: wasm32-unknown-unknown
+
+      # The CLI must be the version Cargo.lock pins for the wasm-bindgen
+      # crate. No wasm-opt: the build is the one CI's import job tests, and
+      # wasm-opt saves under 1% once the module is compressed in transit.
+      - uses: taiki-e/install-action@v2
+        if: steps.published.outputs.exists == 'false'
+        with:
+          tool: wasm-bindgen@0.2.129
+
+      - uses: actions/setup-node@v5
+        if: steps.published.outputs.exists == 'false'
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm 11.5.1 or later, whatever Node bundles.
+      - name: Update npm
+        if: steps.published.outputs.exists == 'false'
+        run: npm install -g npm@^11.5.1
+
+      # The tests run on the module being published, so a version that fails
+      # them never reaches npm.
+      - name: Build and test
+        if: steps.published.outputs.exists == 'false'
+        run: |
+          npm ci --include=dev
+          npm run build:wasm
+          npm test
+
+      # Trusted publishing exchanges this workflow's GitHub identity for a
+      # short-lived npm token, and attaches provenance on its own. It needs
+      # this repository and workflow registered as the package's Trusted
+      # Publisher.
+      - name: Publish
+        if: steps.published.outputs.exists == 'false'
+        run: npm publish
