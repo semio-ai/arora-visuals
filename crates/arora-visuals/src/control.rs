@@ -443,27 +443,34 @@ impl ControlCommands {
     /// otherwise wait for a control that never comes, or land on another's.
     ///
     /// A change is an add's when it follows the add under its key, up to the
-    /// next add or remove, and when it was sent before the add with no add
-    /// since the key's last remove — a change sent before its control's add
-    /// waits for that add. A later add under the key is another control's and
-    /// stays, as does a remove, which is never held: what follows a remove is
-    /// not the forgotten add's.
-    pub fn forget_instance(&mut self, instance: &str) {
+    /// next add or remove, and when it was sent before the add with no
+    /// control for it to act on: none placed under the key in `controls` or
+    /// added before it, since the key's last remove — such a change waits
+    /// for the add. A change sent while a control is placed under the key is
+    /// that control's, and stays. A later add under the key is another
+    /// control's and stays, as does a remove, which is never held: what
+    /// follows a remove is not the forgotten add's.
+    pub fn forget_instance(&mut self, instance: &str, controls: &Controls) {
         /// One key's commands, as far as the walk has read them.
-        #[derive(Default)]
         struct Run {
-            /// Changes since the key's last remove with no add before them:
-            /// the next add's, whichever it is.
+            /// Changes since the key's last remove with no control before
+            /// them: the next add's, whichever it is.
             loose: Vec<usize>,
-            /// Whether an add precedes what comes next, which is then its.
-            after_add: bool,
+            /// Whether a control — placed, or added before — is there for what
+            /// comes next to act on, which is then that control's.
+            on_control: bool,
             /// Whether what comes next is a forgotten add's.
             dropping: bool,
         }
         let mut keep = vec![true; self.0.len()];
         let mut runs: HashMap<&str, Run> = HashMap::new();
         for (at, command) in self.0.iter().enumerate() {
-            let run = runs.entry(command.key()).or_default();
+            let key = command.key();
+            let run = runs.entry(key).or_insert_with(|| Run {
+                loose: Vec::new(),
+                on_control: controls.0.contains_key(key),
+                dropping: false,
+            });
             match command {
                 ControlCommand::Add { control, .. } if control.instance() == Some(instance) => {
                     keep[at] = false;
@@ -471,20 +478,20 @@ impl ControlCommands {
                         keep[loose] = false;
                     }
                     run.dropping = true;
-                    run.after_add = false;
+                    run.on_control = false;
                 }
                 ControlCommand::Add { .. } => {
                     run.loose.clear();
                     run.dropping = false;
-                    run.after_add = true;
+                    run.on_control = true;
                 }
                 ControlCommand::Remove { .. } => {
                     run.loose.clear();
                     run.dropping = false;
-                    run.after_add = false;
+                    run.on_control = false;
                 }
                 _ if run.dropping => keep[at] = false,
-                _ if !run.after_add => run.loose.push(at),
+                _ if !run.on_control => run.loose.push(at),
                 _ => {}
             }
         }
@@ -1242,6 +1249,20 @@ fn carry_out(
                     },
                 };
                 // An instance's own camera, or for a goal the view it names.
+                // A goal at something that is not a pose is refused before its
+                // view is looked for: waiting for a view that may never come,
+                // it would hold every later add under its key for good.
+                if let Control::Transform {
+                    target: Target::Goal { pose, .. },
+                    ..
+                } = &control
+                {
+                    if !pose.is_valid() {
+                        let why = format!("{pose:?} is not a pose a goal can stand at");
+                        refuse_add(&why, key, &mut waiting, &mut holds, &mut failed);
+                        continue;
+                    }
+                }
                 let camera = match (on, &control) {
                     (Some((_, instance)), _) => instance.camera,
                     (
@@ -1285,9 +1306,6 @@ fn carry_out(
                             .get(id)
                             .map(|element| Some(element.node))
                             .ok_or_else(|| format!("no element {id:?} on {}", instance.id)),
-                        (Target::Goal { pose, .. }, _) if !pose.is_valid() => {
-                            Err(format!("{pose:?} is not a pose a goal can stand at"))
-                        }
                         (Target::Goal { .. }, _) => Ok(None),
                         (Target::Instance { .. } | Target::Element { .. }, None) => continue,
                     },
@@ -3305,7 +3323,7 @@ mod tests {
             add("a", joint_on("robot-1")),
             show("a"),
         ]);
-        commands.forget_instance(ROBOT);
+        commands.forget_instance(ROBOT, &Controls::default());
         let left: Vec<(&str, bool)> = commands
             .0
             .iter()
@@ -3993,7 +4011,7 @@ mod tests {
             show("j", false),
             add("j", joint_on(ROBOT)),
         ]);
-        commands.forget_instance(ROBOT);
+        commands.forget_instance(ROBOT, &Controls::default());
         assert_eq!(
             left(&commands),
             [
@@ -4015,11 +4033,57 @@ mod tests {
             show("k", true),
             add("k", joint_on("robot-1")),
         ]);
-        commands.forget_instance(ROBOT);
+        commands.forget_instance(ROBOT, &Controls::default());
         assert_eq!(
             left(&commands),
             [("k", "remove"), ("k", "show"), ("k", "add on robot-1")]
         );
+    }
+
+    /// A change sent under a key with a control placed acts on that control,
+    /// whatever add follows it, so forgetting the add's instance leaves it.
+    #[test]
+    fn forgetting_an_instance_keeps_the_changes_for_a_placed_control() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        add_goal(&mut app, "k", None);
+        let mut commands = ControlCommands(vec![
+            show("k", false),
+            add("k", joint_on("loading")),
+            show("free", false),
+            add("free", joint_on("loading")),
+        ]);
+        commands.forget_instance("loading", app.world().resource::<Controls>());
+        assert_eq!(
+            left(&commands),
+            [("k", "show")],
+            "the placed control's show stays; a show for no control was the add's"
+        );
+    }
+
+    /// A goal at something that is not a pose is refused at once, whichever
+    /// view it names: it does not wait for a view, holding the adds after it
+    /// under its key.
+    #[test]
+    fn a_goal_at_no_pose_is_refused_before_its_view_is_looked_for() {
+        let mut app = bare();
+        app.world_mut().spawn(ControlCamera);
+        let mut bad = goal_at([0.0, 0.0, 1.0]);
+        if let Control::Transform {
+            target: Target::Goal { pose, view },
+            ..
+        } = &mut bad
+        {
+            pose.rotation = [0.0; 4];
+            *view = Some("nowhere".into());
+        }
+        queue(
+            &mut app,
+            [add("k", bad), add("k", goal_at([0.0, 0.0, 2.0]))],
+        );
+        app.update();
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+        assert!(only::<TransformGizmo>(&mut app).is_some(), "the later add");
     }
 
     /// A control hidden, by its driver or by a ghosting, is not interactive
