@@ -31,6 +31,7 @@ mod tests {
 
     use crate::active_area::ActiveAreaPlugin;
     use crate::axes::FrameAxesPlugin;
+    use crate::control::ControlsPlugin;
     use crate::drawn::DrawnPlugin;
     use crate::ghost::GhostPlugin;
     use crate::joint_gizmo::JointGizmoPlugin;
@@ -53,6 +54,7 @@ mod tests {
         for _ in 0..times {
             app.add_plugins((
                 ActiveAreaPlugin,
+                ControlsPlugin,
                 FrameAxesPlugin,
                 DrawnPlugin,
                 GhostPlugin,
