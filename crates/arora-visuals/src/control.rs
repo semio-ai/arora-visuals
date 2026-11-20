@@ -106,17 +106,27 @@
 //!   an add still to come. A change for a key nothing will add is dropped, so
 //!   it does not ask for frames for good.
 //! - **A change sent with its control's add takes hold the frame the control
-//!   first shows**, however many replacements the batch chains under its
-//!   key. Commands are carried out in passes, each [`ControlPass`], and the
-//!   gizmos a pass spawns are there for the next; a frame runs another pass
-//!   while the last took something off the queue and left a change for a
-//!   control now placed, up to a small limit past which the rest waits for
-//!   the next frame and the log says so.
-//! - A control whose gizmo went with its instance is forgotten, and its key is
-//!   free again.
+//!   first shows**, for any batch that sends up to seven adds under one key,
+//!   each with its changes (six replacements). Commands are carried out in
+//!   passes, each [`ControlPass`], and the gizmos a pass spawns are there
+//!   for the next; a frame runs another pass while the last took something
+//!   off the queue and left a change for a control now placed, up to eight
+//!   passes a frame.
+//! - **Past that limit**, a batch chaining more replacements under one key
+//!   than a frame's passes carry out lands over more than one frame: the
+//!   control placed by the frame's last pass draws one frame as added — at
+//!   full opacity and live, say — before the changes sent with it land in
+//!   the next, and a warning is logged. Order under the key is kept
+//!   throughout. A driver sending one add per control, as drivers do, never
+//!   comes near it.
+//! - **A control whose target or camera is gone is forgotten**, at the start
+//!   of each pass: its gizmo goes, and its key is free again, so what is
+//!   sent under the key next acts as for a key with nothing placed. This
+//!   does not wait on a host to take a control's gizmo with its instance.
 
 use std::collections::{HashMap, HashSet};
 
+use bevy::ecs::entity::Entities;
 use bevy::math::Affine3A;
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
@@ -627,7 +637,7 @@ impl Plugin for ControlsPlugin {
             .add_systems(
                 ControlPass,
                 (
-                    carry_out.in_set(Pass::CarryOut),
+                    (forget_orphans, carry_out).chain().in_set(Pass::CarryOut),
                     finish_joints.in_set(Pass::Finish),
                 ),
             )
@@ -660,6 +670,43 @@ impl Plugin for ControlsPlugin {
             .add_observer(report_joint_drag)
             .add_observer(report_press);
     }
+}
+
+/// Forgets each control whose target or camera is gone: despawns its gizmo,
+/// and its goal if it brought one, and frees its key, so what is sent under
+/// the key next acts as for a key with nothing placed.
+///
+/// A host may take an instance away without taking the gizmos on it — one
+/// that despawns an instance and its camera together, say — and a control
+/// kept for a target that is gone would hold its key for good: a pose for it
+/// waits on a transform that never comes, asking for frames, and holds every
+/// later command under the key behind it. So this does not depend on a
+/// host's cleanup.
+fn forget_orphans(
+    mut controls: ResMut<Controls>,
+    entities: &Entities,
+    joint_gizmos: Query<&JointGizmo>,
+    mut commands: Commands,
+) {
+    controls.0.retain(|key, placed| {
+        // A joint control's target is the body its gizmo turns or slides.
+        let body = joint_gizmos
+            .get(placed.gizmo)
+            .ok()
+            .map(|gizmo| gizmo.target);
+        let there = std::iter::once(placed.camera)
+            .chain(placed.target)
+            .chain(body)
+            .all(|entity| entities.contains_spawned(entity));
+        if !there {
+            log::debug!("{key:?}'s target or camera is gone; its control goes too");
+            commands.entity(placed.gizmo).try_despawn();
+            if let Some(goal) = placed.goal {
+                commands.entity(goal).try_despawn();
+            }
+        }
+        there
+    });
 }
 
 /// Runs [`ControlPass`] until a pass leaves nothing that another would carry
@@ -3114,6 +3161,61 @@ mod tests {
         .to_world(&y_up());
         let goal = app.world().get::<Transform>(gizmo.target).unwrap();
         assert!(goal.translation.abs_diff_eq(wanted.translation, 1e-5));
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+    }
+
+    /// A control whose target and camera went, without its host taking its
+    /// gizmo, is forgotten: the gizmo goes, the key is free, and what is sent
+    /// under it next acts as for a key with nothing placed — a pose sent
+    /// before the next add acts on the control that add makes.
+    #[test]
+    fn a_control_whose_target_went_is_forgotten_with_its_gizmo() {
+        let (mut app, _) = scene();
+        let own = app.world_mut().spawn_empty().id();
+        let face = app
+            .world_mut()
+            .spawn((instance("face", own), Transform::default()))
+            .id();
+        let camera = camera(app.world_mut());
+        let other = app
+            .world_mut()
+            .spawn((instance("other", camera), Transform::default()))
+            .id();
+        let whole = |instance: &str| Control::Transform {
+            target: Target::Instance {
+                instance: instance.into(),
+            },
+            modes: None,
+            local: false,
+            colors: None,
+        };
+        send(&mut app, add("k", whole("face")));
+        let old = only::<TransformGizmo>(&mut app).expect("on the face");
+        app.world_mut().despawn(face);
+        app.world_mut().despawn(own);
+        queue(
+            &mut app,
+            [
+                ControlCommand::SetPose {
+                    key: "k".into(),
+                    pose: Pose {
+                        position: [5.0, 0.0, 0.0],
+                        rotation: no_turn(),
+                    },
+                    scale: None,
+                },
+                add("k", whole("other")),
+            ],
+        );
+        app.update();
+        assert!(app.world().get_entity(old).is_err(), "the old gizmo went");
+        let gizmo = only::<TransformGizmo>(&mut app).expect("the new control");
+        assert_eq!(
+            app.world().get::<TransformGizmo>(gizmo).unwrap().target,
+            other
+        );
+        let at = app.world().get::<Transform>(other).unwrap().translation;
+        assert!(at.abs_diff_eq(Vec3::new(5.0, 0.0, 0.0), 1e-5), "{at}");
         assert!(app.world().resource::<ControlCommands>().0.is_empty());
     }
 
