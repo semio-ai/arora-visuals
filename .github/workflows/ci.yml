@@ -36,6 +36,14 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace --all-features --features bevy/x11
 
+      # The view without the capture harness, as a browser renderer takes it:
+      # every feature at once would hide a view module that leans on what only
+      # `snapshot` brings in.
+      - name: View alone, for the browser
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo check --locked -p arora-visuals --no-default-features --features view,camera_input --target wasm32-unknown-unknown
+
       # The package a release would upload, built and checked from the
       # packaged sources with every feature, so a file the package leaves out
       # fails here rather than on publish, including one only a gated module
