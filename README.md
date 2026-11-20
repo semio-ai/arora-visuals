@@ -188,12 +188,25 @@ publishes whenever the manifest names a version crates.io does not have yet.
 Until step 1, that workflow publishes nothing and says so in its run.
 
 `arora-import` is not published to crates.io; it ships as `@semio/import` on
-npm, and the same release workflow publishes it once npm trusts it: on
-npmjs.com, under the package's Settings → Trusted Publisher, choose GitHub
-Actions with the organization `semio-ai`, the repository `arora-visuals` and
-the workflow `release.yml`. A release is then a bump of `version` in
-`packages/import/package.json` on `main`. Its first version was a person's,
-since npm's trusted publishing cannot create a package either.
+npm. Its first version was a person's, since npm's trusted publishing cannot
+create a package either. Later versions go through the same release workflow,
+which stages them rather than publishing them, so each goes public only when
+a maintainer approves it with 2FA:
+
+1. **npm trusts the workflow.** On npmjs.com, under the package's Settings →
+   Trusted Publisher, choose GitHub Actions with the organization
+   `semio-ai`, the repository `arora-visuals` and the workflow `release.yml`,
+   and no environment. Staging is always allowed; "Allow npm publish" stays
+   off.
+2. **A release is a version bump** of `packages/import/package.json` on
+   `main`. The push that changes the version builds, tests and stages it.
+3. **A maintainer approves it,** on npmjs.com or with
+   `npm stage list @semio/import` and `npm stage approve <stage-id>`.
+
+A staged version is not visible on the registry, so a push that leaves the
+version alone stages nothing. To stage the current version again (when a
+staging run failed, or a staged version was rejected), run the workflow by
+hand: Actions → Release → Run workflow.
 
 ## Consumers
 
