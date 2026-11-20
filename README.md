@@ -206,7 +206,8 @@ a maintainer approves it with 2FA:
 A staged version is not visible on the registry, so a push that leaves the
 version alone stages nothing. To stage the current version again (when a
 staging run failed, or a staged version was rejected), run the workflow by
-hand: Actions → Release → Run workflow.
+hand, on `main`: Actions → Release → Run workflow. A run on any other branch
+releases nothing.
 
 ## Consumers
 

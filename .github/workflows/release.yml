@@ -21,14 +21,17 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# One release run at a time, none cancelled: two runs that both found a
-# version missing would both try to upload it.
-concurrency:
-  group: release
-  cancel-in-progress: false
-
 jobs:
   publish:
+    # A run started by hand can name any branch; only main releases.
+    if: github.ref == 'refs/heads/main'
+    # One crates.io release at a time, none cancelled: two that both found the
+    # version missing would both try to upload it. A newer run may replace a
+    # pending one, which loses nothing, since this job decides from what
+    # crates.io holds.
+    concurrency:
+      group: release-crates
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -93,6 +96,10 @@ jobs:
         run: cargo publish --locked -p arora-visuals
 
   publish-npm:
+    if: github.ref == 'refs/heads/main'
+    # No concurrency group: this job decides from its own push, so a run a
+    # concurrency group dropped while pending would lose a version bump.
+    # Overlapping runs cannot stage a version twice; npm refuses the second.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
