@@ -117,7 +117,9 @@
 //!   at something that is not a pose ([`Pose::is_valid`]) or a goal whose
 //!   view is ambiguous is refused, and said in the log; the control it would
 //!   have replaced stays. A joint its host cannot resolve fails the same way
-//!   once its pass has ended. Either way the changes that were the add's —
+//!   once its pass has ended: a joint add replaces the control under its key
+//!   only when its host resolves it, so until then that control is kept, and
+//!   on a failure it stays. Either way the changes that were the add's —
 //!   sent before it and waiting for it, or after it up to the next add or
 //!   remove under its key — are dropped, rather than landing on the next
 //!   add's control.
@@ -125,10 +127,13 @@
 //!   is not a number or a zero rotation is refused, as is one for a target
 //!   with no transform to set.
 //! - **A control that does not show takes no input.** Hidden by its driver
-//!   or by a ghosting, its gizmo takes no press from the frame it is hidden,
-//!   and a drag in hand ends, as one does when the control is made not
-//!   `interactive`. What the driver last asked of `interactive` is kept, and
-//!   holds again once the control shows.
+//!   or by a ghosting, its gizmo takes no press from the frame after the one
+//!   it is hidden in, and a drag in hand ends, as one does when the control
+//!   is made not `interactive`. A press in the frame it is hidden in can
+//!   still be reported: a press with another button than the primary is
+//!   taken in `PreUpdate`, before this frame's commands, and so was made on
+//!   a control that showed when it was made. What the driver last asked of
+//!   `interactive` is kept, and holds again once the control shows.
 //! - **A key names one control in the view**; an add under a key in use
 //!   replaces its control.
 //! - A change for a key — a show, a pose, a configure, a highlight — waits for
@@ -165,7 +170,6 @@
 use std::collections::{HashMap, HashSet};
 
 use bevy::ecs::entity::Entities;
-use bevy::math::Affine3A;
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 use bevy::window::RequestRedraw;
@@ -175,7 +179,7 @@ use crate::ghost::Ghost;
 use crate::instance::{EntityInstance, Loading, Superseded};
 use crate::joint_gizmo::{JointDrag, JointGizmo};
 use crate::transform_gizmo::{
-    DragPhase, GizmoDrag, GizmoHandle, GizmoPress, GizmoSpace, TransformGizmo,
+    current_global, DragPhase, GizmoDrag, GizmoHandle, GizmoPress, GizmoSpace, TransformGizmo,
     TransformGizmoSystems, TransformModes,
 };
 
@@ -238,15 +242,17 @@ impl DriverFrame {
 
 impl Pose {
     /// Whether something can stand at this pose: every value a number, and a
-    /// rotation that is a turn. The zero quaternion is none, and normalizing
-    /// it, or anything not finite, gives a transform the renderer cannot draw,
-    /// so a command carrying such a pose is refused rather than carried out.
+    /// rotation that is a turn. The rotation is judged by what normalizing it
+    /// gives, since that is what [`to_world`](Self::to_world) uses: the zero
+    /// quaternion normalizes to nothing finite, and one with components so
+    /// large its length overflows normalizes to zero. Either, or a position
+    /// not finite, gives a transform the renderer cannot draw, so a command
+    /// carrying such a pose is refused rather than carried out.
     pub fn is_valid(&self) -> bool {
-        self.position
-            .iter()
-            .chain(&self.rotation)
-            .all(|value| value.is_finite())
-            && Quat::from_array(self.rotation).length_squared() > 1e-12
+        let turn = Quat::from_array(self.rotation).normalize();
+        self.position.iter().all(|value| value.is_finite())
+            && turn.is_finite()
+            && (turn.length() - 1.0).abs() < 1e-3
     }
 
     /// Where `transform`, in the world, stands as the driver sees it.
@@ -485,6 +491,27 @@ impl ControlCommands {
         let mut keep = keep.into_iter();
         self.0.retain(|_| keep.next().unwrap_or(true));
     }
+
+    /// Drops the changes under `key` that come before its next add or
+    /// remove: when an add placed under `key` fails after its pass, the
+    /// changes still waiting under the key are the ones held behind it, and
+    /// were its.
+    fn drop_changes_ahead_of_next_add(&mut self, key: &str) {
+        let mut ahead = true;
+        self.0.retain(|command| {
+            if command.key() != key || !ahead {
+                return true;
+            }
+            if matches!(
+                command,
+                ControlCommand::Add { .. } | ControlCommand::Remove { .. }
+            ) {
+                ahead = false;
+                return true;
+            }
+            false
+        });
+    }
 }
 
 /// On a control the driver has hidden. A view also hides controls on its own
@@ -627,6 +654,9 @@ struct Placed {
     /// Whether its driver wants it to take the pointer. The gizmo takes it
     /// only while this holds and the control shows.
     interactive: bool,
+    /// Whether it is a joint add its host has yet to resolve: not yet a
+    /// control, so an add replacing it cancels it rather than keeping it.
+    resolving: bool,
     /// The opacity the host asked for, which the gizmo's fades toward.
     opacity: f32,
     /// The fade toward `opacity` under way, if one is.
@@ -653,6 +683,7 @@ impl Placed {
             camera,
             instance,
             interactive: true,
+            resolving: false,
             opacity: 1.0,
             fade: None,
             shown: false,
@@ -715,11 +746,14 @@ enum Pass {
 struct PassState {
     /// Whether another pass would carry out more of what is waiting.
     again: bool,
-    /// Keys whose add failed after its pass — a joint request its host did
-    /// not resolve — so the next pass drops the changes waiting on that add,
-    /// which were its, rather than giving them to the next add under the key.
-    failed: HashSet<String>,
 }
+
+/// The controls joint adds would replace, by key, kept until their hosts
+/// resolve them. A joint add replaces the control under its key only once
+/// it is resolved: one that fails leaves that control as it was, as any
+/// refused add does.
+#[derive(Resource, Default)]
+struct Replaced(HashMap<String, Placed>);
 
 /// Commands, events and presses for every host's controls
 /// ([module docs](self)). A host adds the gizmos' own plugins beside it.
@@ -741,6 +775,7 @@ impl Plugin for ControlsPlugin {
             .init_resource::<Controls>()
             .init_resource::<DefaultDriverFrame>()
             .init_resource::<PassState>()
+            .init_resource::<Replaced>()
             .add_message::<RequestRedraw>();
         // Small and run several times a frame, so on one thread: the cost of
         // handing a few systems to a pool would outweigh the work. It applies
@@ -855,17 +890,17 @@ fn run_passes(world: &mut World) {
              the rest wait for the next frame"
         );
     }
-    // A failed add's changes are dropped by the pass after it; a frame's
-    // last pass has no next, and a key's failure is not the next frame's.
-    world.resource_mut::<PassState>().failed.clear();
 }
 
 /// Makes each control's gizmo take the pointer only while its driver wants
 /// it to and it shows. A gizmo's hit test reads last frame's visibility, so a
-/// control hidden this frame — by its driver or by a ghosting — would still
-/// take a press, and a drag in hand would go on reporting until released.
-/// Not interactive, it takes neither, and a drag in hand ends; the driver's
-/// own setting is kept on the control, and comes back when it shows again.
+/// control hidden — by its driver or by a ghosting — would go on taking
+/// presses, and a drag in hand would go on reporting until released. Not
+/// interactive, it takes neither from the next frame on, and a drag in hand
+/// ends; the driver's own setting is kept on the control, and comes back
+/// when it shows again. A press with another button than the primary is
+/// taken in `PreUpdate`, before this runs, so one in the frame a control is
+/// hidden in is still reported: it was made while the control showed.
 fn take_input_only_while_shown(
     controls: Res<Controls>,
     visibility: Query<&Visibility>,
@@ -885,30 +920,6 @@ fn take_input_only_while_shown(
             if gizmo.interactive != wanted {
                 gizmo.interactive = wanted;
             }
-        }
-    }
-}
-
-/// Where `entity` stands in the world as the transforms say now. Its
-/// `GlobalTransform` lags a transform written earlier in the frame — an
-/// instance a host moved this frame — until propagation in `PostUpdate`, so
-/// the chain is composed here, falling back to the propagated transform of an
-/// ancestor with none of its own.
-fn current_global(
-    mut entity: Entity,
-    transform_of: impl Fn(Entity) -> Option<Transform>,
-    parents: &Query<&ChildOf>,
-    globals: &Query<&GlobalTransform>,
-) -> Option<Affine3A> {
-    let mut affine = Affine3A::IDENTITY;
-    loop {
-        let Some(transform) = transform_of(entity) else {
-            return globals.get(entity).ok().map(|g| g.affine() * affine);
-        };
-        affine = transform.compute_affine() * affine;
-        match parents.get(entity) {
-            Ok(parent) => entity = parent.parent(),
-            Err(_) => return Some(affine),
         }
     }
 }
@@ -1028,34 +1039,61 @@ fn hide_ghosted(
 
 /// Finishes each joint request its host resolved, and drops each it did not
 /// ([module docs](self#joint-controls-jointrequest)).
+///
+/// A resolved joint replaces the control its add would replace, kept until
+/// now. A failed one leaves that control as it was, and takes the changes
+/// waiting on it out of the queue there and then: they were its, and left
+/// there they would wait for, and land on, the next add under the key —
+/// in a later frame, if this was a frame's last pass.
 fn finish_joints(
     mut commands: Commands,
     mut requests: Query<(Entity, &JointRequest, Option<&mut JointGizmo>)>,
     instances: Query<&EntityInstance>,
-    mut state: ResMut<PassState>,
+    mut controls: ResMut<Controls>,
+    mut replaced: ResMut<Replaced>,
+    mut pending: ResMut<ControlCommands>,
 ) {
     for (entity, request, gizmo) in &mut requests {
+        let key = &request.key;
+        // A later add under the key has taken it since; whatever it replaced
+        // is that add's business.
+        let current = controls.owns(key, entity);
         match gizmo {
             Some(mut gizmo) => {
-                gizmo.key = request.key.clone();
+                gizmo.key = key.clone();
                 gizmo.apply = false;
                 if let Some(colour) = request.colour {
                     gizmo.colour = colour;
                 }
+                if !current {
+                    // Cancelled by the add that took its key.
+                    commands.entity(entity).despawn();
+                    continue;
+                }
                 commands.entity(entity).remove::<JointRequest>();
+                if let Some(placed) = controls.0.get_mut(key) {
+                    placed.resolving = false;
+                }
+                if let Some(old) = replaced.0.remove(key) {
+                    despawn(&mut commands, old);
+                }
             }
             None => {
                 let instance = instances
                     .get(request.instance)
                     .map_or("an instance gone", |instance| instance.id.as_str());
                 log::warn!(
-                    "no joint of {instance} is driven by {:?}; no control added for {:?}",
+                    "no joint of {instance} is driven by {:?}; no control added for {key:?}",
                     request.joint,
-                    request.key
                 );
                 commands.entity(entity).despawn();
-                // The add failed: the changes waiting on it go with it.
-                state.failed.insert(request.key.clone());
+                if current {
+                    controls.0.remove(key);
+                    if let Some(old) = replaced.0.remove(key) {
+                        controls.0.insert(key.clone(), old);
+                    }
+                    pending.drop_changes_ahead_of_next_add(key);
+                }
             }
         }
     }
@@ -1082,11 +1120,14 @@ fn carry_out(
     mut joint_gizmos: Query<&mut JointGizmo>,
     mut redraw: MessageWriter<RequestRedraw>,
     mut state: ResMut<PassState>,
+    mut replaced: ResMut<Replaced>,
 ) {
     state.again = false;
-    // Keys whose add failed, and whose changes are dropped up to the next add
-    // or remove under the key: those changes were the failed add's.
-    let mut failed = std::mem::take(&mut state.failed);
+    // Keys whose add was refused in this pass, and whose changes are dropped
+    // up to the next add or remove under the key: those changes were the
+    // refused add's. A pass carries out every command it does not put off,
+    // so the changes this owns are all met in this pass.
+    let mut failed: HashSet<String> = HashSet::new();
     if pending.0.is_empty() {
         return;
     }
@@ -1258,8 +1299,25 @@ fn carry_out(
                         continue;
                     }
                 };
+                // A joint add replaces the control under its key once its
+                // host resolves it, so that control is kept until then. Any
+                // other add replaces it now, and with it a control a joint
+                // add still being resolved would have replaced. A joint add
+                // still being resolved is no control yet: replaced, it is
+                // cancelled, and the control it would have replaced is kept
+                // for the add that replaces it.
+                let joint = matches!(control, Control::Joint { .. });
                 if let Some(old) = controls.0.remove(&key) {
-                    despawn(&mut commands, old);
+                    if joint && !old.resolving && !replaced.0.contains_key(&key) {
+                        replaced.0.insert(key.clone(), old);
+                    } else {
+                        despawn(&mut commands, old);
+                    }
+                }
+                if !joint {
+                    if let Some(kept) = replaced.0.remove(&key) {
+                        despawn(&mut commands, kept);
+                    }
                 }
                 again = true;
                 let root = on.map(|(root, _)| root);
@@ -1275,7 +1333,16 @@ fn carry_out(
                             key: key.clone(),
                             colour: color.as_deref().and_then(colour),
                         };
-                        Placed::new(commands.spawn(request).id(), None, None, camera, Some(root))
+                        Placed {
+                            resolving: true,
+                            ..Placed::new(
+                                commands.spawn(request).id(),
+                                None,
+                                None,
+                                camera,
+                                Some(root),
+                            )
+                        }
                     }
                     Control::Transform {
                         target: asked,
@@ -1332,6 +1399,10 @@ fn carry_out(
             ControlCommand::Remove { key } => {
                 if let Some(old) = controls.0.remove(&key) {
                     despawn(&mut commands, old);
+                    again = true;
+                }
+                if let Some(kept) = replaced.0.remove(&key) {
+                    despawn(&mut commands, kept);
                     again = true;
                 }
                 // Whatever the driver asked of this key that is still
@@ -3857,7 +3928,13 @@ mod tests {
                 position: [0.0, 0.0, 0.0],
                 rotation: [f32::INFINITY, 0.0, 0.0, 1.0],
             },
+            // Finite, but its length overflows: normalized, it is zero.
+            Pose {
+                position: [0.0, 0.0, 0.0],
+                rotation: [1e20, 0.0, 0.0, 0.0],
+            },
         ] {
+            assert!(!pose.is_valid(), "{pose:?}");
             send(
                 &mut app,
                 ControlCommand::SetPose {
@@ -3945,10 +4022,10 @@ mod tests {
         );
     }
 
-    /// A control hidden, by its driver or by a ghosting, takes no press from
-    /// the frame it is hidden: its gizmo is not interactive while it does not
-    /// show, which also ends a drag in hand. Shown again, it takes what its
-    /// driver last asked for.
+    /// A control hidden, by its driver or by a ghosting, is not interactive
+    /// by the end of the frame it is hidden in, so it takes no press after
+    /// it and a drag in hand ends. Shown again, it takes what its driver last
+    /// asked for.
     #[test]
     fn a_hidden_control_takes_no_input_and_keeps_what_its_driver_asked() {
         let (mut app, body) = scene();
@@ -4033,6 +4110,88 @@ mod tests {
             );
         }
         assert!(app.world().resource::<ControlCommands>().0.is_empty());
+    }
+
+    /// A joint add's changes go with it when it fails, however late in a
+    /// frame's passes it fails: past the passes a frame runs, what it leaves
+    /// for the next frame is not given to the control left under its key.
+    #[test]
+    fn a_failed_joint_s_changes_go_with_it_past_a_frame_s_passes() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        let mut batch = Vec::new();
+        for link in 0..7 {
+            batch.push(add("k", goal_at([0.0, 0.0, link as f32])));
+            batch.push(configure("k", None, Some(true)));
+        }
+        batch.push(add(
+            "k",
+            Control::Joint {
+                instance: ROBOT.into(),
+                joint: "nothing drives this".into(),
+                color: None,
+            },
+        ));
+        batch.push(configure("k", Some(0.25), Some(false)));
+        queue(&mut app, batch);
+        for _ in 0..4 {
+            app.update();
+        }
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+        // The control the joint would have replaced is the key's still, as
+        // it was: the joint's configure went with the joint.
+        let gizmo = only::<TransformGizmo>(&mut app).expect("the last goal");
+        let gizmo = app.world().get::<TransformGizmo>(gizmo).unwrap();
+        assert_eq!(
+            (gizmo.opacity, gizmo.interactive),
+            (1.0, true),
+            "the failed joint's configure went with it"
+        );
+        let goal = app.world().get::<Transform>(gizmo.target).unwrap();
+        let last = Pose {
+            position: [0.0, 0.0, 6.0],
+            rotation: no_turn(),
+        }
+        .to_world(&y_up());
+        assert!(goal.translation.abs_diff_eq(last.translation, 1e-5));
+    }
+
+    /// A joint add replaces the control under its key only once its host
+    /// resolves it: one the host cannot resolve leaves that control as it
+    /// was, as any refused add does.
+    #[test]
+    fn a_joint_its_host_cannot_resolve_leaves_the_control_it_would_replace() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        let old = add_goal(&mut app, "k", None);
+        let goal = app.world().get::<TransformGizmo>(old).unwrap().target;
+        send(
+            &mut app,
+            add(
+                "k",
+                Control::Joint {
+                    instance: ROBOT.into(),
+                    joint: "nothing drives this".into(),
+                    color: None,
+                },
+            ),
+        );
+        app.update();
+        assert_eq!(app.world().resource::<Controls>().gizmo("k"), Some(old));
+        assert!(app.world().get_entity(old).is_ok(), "its gizmo stays");
+        assert!(app.world().get_entity(goal).is_ok(), "and its goal");
+        send(&mut app, configure("k", None, Some(false)));
+        assert!(
+            !app.world().get::<TransformGizmo>(old).unwrap().interactive,
+            "and it is the key's control still"
+        );
+
+        // One its host resolves replaces it.
+        send(&mut app, add("k", joint_on(ROBOT)));
+        assert!(app.world().get_entity(old).is_err(), "replaced");
+        assert!(app.world().get_entity(goal).is_err(), "goal and all");
+        let joint = only::<JointGizmo>(&mut app).expect("the joint control");
+        assert_eq!(app.world().resource::<Controls>().gizmo("k"), Some(joint));
     }
 
     /// A goal is the control's own, so it goes when the control does, even
