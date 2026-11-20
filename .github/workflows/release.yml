@@ -1,9 +1,16 @@
 name: Release
 
-# On push to main, publishes arora-visuals to crates.io and @semio/import to
-# npm, each when its manifest names a version its registry does not have yet.
-# A release is therefore a version bump; a merge that leaves a version alone
-# publishes nothing for it.
+# On push to main, publishes arora-visuals to crates.io and stages
+# @semio/import on npm, each when its manifest names a version its registry
+# does not have yet. A release is therefore a version bump; a merge that
+# leaves a version alone publishes nothing for it.
+#
+# @semio/import is staged, not published: a staged version goes public only
+# when a maintainer approves it on npm, with 2FA, so no release reaches npm
+# without a person. Since a staged version is not visible on the registry,
+# the npm job stages only on a push that changes the version, or on a run
+# started by hand (Actions > Release > Run workflow), which stages the
+# current version if npm does not have it.
 #
 # Until a package is on its registry at all, its job publishes nothing and
 # says so: neither registry's trusted publishing can create a package, so a
@@ -12,15 +19,19 @@ name: Release
 on:
   push:
     branches: [main]
-
-# One release run at a time, none cancelled: two runs that both found a
-# version missing would both try to upload it.
-concurrency:
-  group: release
-  cancel-in-progress: false
+  workflow_dispatch:
 
 jobs:
   publish:
+    # A run started by hand can name any branch; only main releases.
+    if: github.ref == 'refs/heads/main'
+    # One crates.io release at a time, none cancelled: two that both found the
+    # version missing would both try to upload it. A newer run may replace a
+    # pending one, which loses nothing, since this job decides from what
+    # crates.io holds.
+    concurrency:
+      group: release-crates
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -85,6 +96,10 @@ jobs:
         run: cargo publish --locked -p arora-visuals
 
   publish-npm:
+    if: github.ref == 'refs/heads/main'
+    # No concurrency group: this job decides from its own push, so a run a
+    # concurrency group dropped while pending would lose a version bump.
+    # Overlapping runs cannot stage a version twice; npm refuses the second.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -101,31 +116,42 @@ jobs:
         run: echo "version=$(jq -r .version package.json)" >> "$GITHUB_OUTPUT"
 
       # As for crates.io: only a 404 means missing, and anything else fails
-      # the run rather than risk uploading a version twice.
-      - name: Check whether npm has it
-        id: published
+      # the run rather than risk uploading a version twice. A push stages
+      # only a version it changed: an unapproved staged version still reads
+      # as missing, and staging it again fails.
+      - name: Decide whether to stage
+        id: decide
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BEFORE: ${{ github.event.before }}
         run: |
+          skip() { echo "::notice::$1"; echo "stage=false" >> "$GITHUB_OUTPUT"; exit 0; }
           ask() {
             curl -s -o /dev/null -w '%{http_code}' "https://registry.npmjs.org/@semio%2Fimport$1"
           }
           package=$(ask "")
           case "$package" in
             200) ;;
-            404)
-              echo "::notice::@semio/import is not on npm yet; its first upload is a person's (see the README's Releasing section), so nothing is published"
-              echo "exists=true" >> "$GITHUB_OUTPUT"
-              exit 0 ;;
+            404) skip "@semio/import is not on npm yet; its first upload is a person's (see the README's Releasing section), so nothing is staged" ;;
             *) echo "::error::npm answered $package; cannot tell whether the package exists"; exit 1 ;;
           esac
-          status=$(ask "/${{ steps.version.outputs.version }}")
+          status=$(ask "/$VERSION")
           case "$status" in
-            200) echo "exists=true" >> "$GITHUB_OUTPUT" ;;
-            404) echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            200) skip "@semio/import $VERSION is on npm already" ;;
+            404) ;;
             *) echo "::error::npm answered $status; cannot tell whether the version exists"; exit 1 ;;
           esac
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            git fetch -q --depth=1 origin "$BEFORE"
+            previous=$(git show "$BEFORE:packages/import/package.json" | jq -r .version)
+            if [ "$previous" = "$VERSION" ]; then
+              skip "@semio/import $VERSION is not on npm, but this push did not change its version, so it may be staged already; run this workflow by hand to stage it"
+            fi
+          fi
+          echo "stage=true" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
-        if: steps.published.outputs.exists == 'false'
+        if: steps.decide.outputs.stage == 'true'
         with:
           targets: wasm32-unknown-unknown
 
@@ -133,34 +159,36 @@ jobs:
       # crate. No wasm-opt: the build is the one CI's import job tests, and
       # wasm-opt saves under 1% once the module is compressed in transit.
       - uses: taiki-e/install-action@v2
-        if: steps.published.outputs.exists == 'false'
+        if: steps.decide.outputs.stage == 'true'
         with:
           tool: wasm-bindgen@0.2.129
 
       - uses: actions/setup-node@v5
-        if: steps.published.outputs.exists == 'false'
+        if: steps.decide.outputs.stage == 'true'
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
-      # Trusted publishing needs npm 11.5.1 or later, whatever Node bundles.
+      # `npm stage` needs npm 11.21.3 or later, whatever Node bundles.
       - name: Update npm
-        if: steps.published.outputs.exists == 'false'
-        run: npm install -g npm@^11.5.1
+        if: steps.decide.outputs.stage == 'true'
+        run: npm install -g npm@^11.21.3
 
-      # The tests run on the module being published, so a version that fails
+      # The tests run on the module being staged, so a version that fails
       # them never reaches npm.
       - name: Build and test
-        if: steps.published.outputs.exists == 'false'
+        if: steps.decide.outputs.stage == 'true'
         run: |
           npm ci --include=dev
           npm run build:wasm
           npm test
 
       # Trusted publishing exchanges this workflow's GitHub identity for a
-      # short-lived npm token, and attaches provenance on its own. It needs
-      # this repository and workflow registered as the package's Trusted
-      # Publisher.
-      - name: Publish
-        if: steps.published.outputs.exists == 'false'
-        run: npm publish
+      # short-lived npm token, and attaches provenance on its own. The
+      # package's Trusted Publisher must name this repository and workflow;
+      # staging needs no further permission there.
+      - name: Stage
+        if: steps.decide.outputs.stage == 'true'
+        run: |
+          npm stage publish
+          echo "::notice::@semio/import ${{ steps.version.outputs.version }} is staged; it goes public when a maintainer approves it on npmjs.com, or with npm stage approve"
