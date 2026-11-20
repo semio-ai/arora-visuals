@@ -115,6 +115,10 @@ export interface ShapeFold {
 /** One polygon of a morphed mesh, or a primitive the pass could not read. */
 export interface MorphTrianglesPart {
   mesh: number;
+  /**
+   * The name the part is reported under: its mesh's, or else that of the
+   * first node drawing the mesh, since some exporters name only the node.
+   */
   meshName: string | null;
   primitive: number;
   vertices: number;
