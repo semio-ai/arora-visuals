@@ -92,8 +92,11 @@
 //!   camera, a change for the gizmo its control's add is spawning — holds
 //!   every later command under its key behind it, so a later add is the
 //!   control left, and a change acts on the control the add before it
-//!   makes, not the one that replaces it. A change sent before its add waits
-//!   for that add, holding later changes but not the add itself.
+//!   makes, not the one that replaces it. The one reordering is a change
+//!   sent before any add makes its control: it waits for the next add under
+//!   its key that lands, acts on the control that add makes, and acts
+//!   before anything sent after that add. How a key is held is spelled out
+//!   on `Hold`, in the source.
 //! - **A remove is not held**: it cancels a waiting add and what waits behind
 //!   it, and takes away the control the add would have replaced.
 //! - **A key names one control in the view**; an add under a key in use
@@ -914,29 +917,20 @@ fn carry_out(
         controls.0.contains_key(key) || adding.contains(key) || any_loading
     };
     let mut waiting = Vec::new();
-    // Keys with a command waiting on what is already asked for: an add for
-    // its instance or camera, or a change for the gizmo its control's add is
-    // spawning. Every later command under the same key waits behind it, so
-    // they land in the order they were asked: a later add is the control
-    // left, and a change acts on the control the add before it makes, not
-    // one that replaces it.
-    let mut held: HashSet<String> = HashSet::new();
-    // Keys with a change waiting for an add not yet made, sent before it.
-    // Later changes wait behind it, keeping their order, but an add does
-    // not: the add is what the change waits for, and holding it would hold
-    // both for good.
-    let mut held_changes: HashSet<String> = HashSet::new();
+    // How each key with a command waiting holds the commands after it
+    // ([`Hold`]): what keeps a key's commands landing in the order sent.
+    let mut holds: HashMap<String, Hold> = HashMap::new();
     // Whether to draw another frame: for a command that changed something, or
     // one waiting on a gizmo spawned at the end of this pass.
     let mut again = false;
     for command in asked {
         // A remove is not held: it cancels the waiting add and what waits
         // behind it, and takes away the control the add would have replaced.
-        let key = command.key();
-        let behind = match command {
-            ControlCommand::Remove { .. } => false,
-            ControlCommand::Add { .. } => held.contains(key),
-            _ => held.contains(key) || held_changes.contains(key),
+        let behind = match (holds.get(command.key()), &command) {
+            (_, ControlCommand::Remove { .. }) | (None, _) => false,
+            (Some(Hold::All), _) => true,
+            (Some(Hold::ForAdd), ControlCommand::Add { .. }) => false,
+            (Some(Hold::ForAdd), _) => true,
         };
         if behind {
             waiting.push(command);
@@ -957,7 +951,8 @@ fn carry_out(
                         Some((_, found)) if !found.bindings.indexed => {
                             defer(
                                 &mut waiting,
-                                &mut held,
+                                &mut holds,
+                                Hold::All,
                                 ControlCommand::Add { key, control },
                             );
                             continue;
@@ -966,7 +961,8 @@ fn carry_out(
                         None if coming(name) => {
                             defer(
                                 &mut waiting,
-                                &mut held,
+                                &mut holds,
+                                Hold::All,
                                 ControlCommand::Add { key, control },
                             );
                             continue;
@@ -986,7 +982,8 @@ fn carry_out(
                             log::debug!("no control camera yet; {key:?} waits for one");
                             defer(
                                 &mut waiting,
-                                &mut held,
+                                &mut holds,
+                                Hold::All,
                                 ControlCommand::Add { key, control },
                             );
                             continue;
@@ -1067,6 +1064,11 @@ fn carry_out(
                         Placed::new(gizmo, Some(target), goal, camera)
                     }
                 };
+                // Changes waiting for an add are this control's now, and act
+                // on it before anything sent after it under the key.
+                if let Some(hold) = holds.get_mut(&key) {
+                    *hold = Hold::All;
+                }
                 controls.0.insert(key, placed);
             }
             ControlCommand::Remove { key } => {
@@ -1078,8 +1080,7 @@ fn carry_out(
                 // arrived would bring back a control the driver has since
                 // removed.
                 waiting.retain(|waiting| waiting.key() != key);
-                held.remove(&key);
-                held_changes.remove(&key);
+                holds.remove(&key);
             }
             ControlCommand::Show { key, visible } => {
                 if let Some(placed) = controls.0.get_mut(&key) {
@@ -1100,7 +1101,8 @@ fn carry_out(
                     // add, as any change does.
                     defer(
                         &mut waiting,
-                        &mut held_changes,
+                        &mut holds,
+                        Hold::ForAdd,
                         ControlCommand::Show { key, visible },
                     );
                 } else {
@@ -1126,7 +1128,8 @@ fn carry_out(
                         again |= placed;
                         defer(
                             &mut waiting,
-                            if placed { &mut held } else { &mut held_changes },
+                            &mut holds,
+                            if placed { Hold::All } else { Hold::ForAdd },
                             ControlCommand::SetPose { key, pose, scale },
                         );
                     } else {
@@ -1180,7 +1183,8 @@ fn carry_out(
                         again |= placed;
                         defer(
                             &mut waiting,
-                            if placed { &mut held } else { &mut held_changes },
+                            &mut holds,
+                            if placed { Hold::All } else { Hold::ForAdd },
                             ControlCommand::Configure {
                                 key,
                                 color,
@@ -1266,7 +1270,8 @@ fn carry_out(
                         again |= placed;
                         defer(
                             &mut waiting,
-                            if placed { &mut held } else { &mut held_changes },
+                            &mut holds,
+                            if placed { Hold::All } else { Hold::ForAdd },
                             ControlCommand::Highlight { key, handle, on },
                         );
                     } else {
@@ -1307,10 +1312,44 @@ fn carry_out(
     }
 }
 
-/// Puts `command` off to a later pass, and holds every later command under
-/// its key behind it.
-fn defer(waiting: &mut Vec<ControlCommand>, held: &mut HashSet<String>, command: ControlCommand) {
-    held.insert(command.key().to_string());
+/// How a key's later commands wait behind one of its commands that waits.
+///
+/// Commands under a key take effect in the order sent, with one reordering
+/// that is the point of waiting at all: a change sent before its control's
+/// add acts on the control that add makes. So a key is held one of two ways,
+/// and moves only toward holding more until a remove frees it:
+///
+/// - no hold → [`ForAdd`](Hold::ForAdd), when a change waits for an add not
+///   yet made;
+/// - no hold or `ForAdd` → [`All`](Hold::All), when an add waits (for its
+///   instance or camera), when a change waits for the gizmo its control's
+///   add is spawning, and when the add a `ForAdd` key waits for lands.
+///
+/// The last is what keeps a change sent before an add ahead of what was sent
+/// after that add: once the add lands, the changes waiting are its
+/// control's, and everything later, a replacing add included, waits behind
+/// them for the pass that applies them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    /// Changes wait for an add: later changes wait behind them, and an add
+    /// goes ahead, being what they wait for.
+    ForAdd,
+    /// Every later command waits.
+    All,
+}
+
+/// Puts `command` off to a later pass, holding the commands after it under
+/// its key as `hold` says, and never less than they already are.
+fn defer(
+    waiting: &mut Vec<ControlCommand>,
+    holds: &mut HashMap<String, Hold>,
+    hold: Hold,
+    command: ControlCommand,
+) {
+    let held = holds.entry(command.key().to_string()).or_insert(hold);
+    if hold == Hold::All {
+        *held = Hold::All;
+    }
     waiting.push(command);
 }
 
@@ -3075,6 +3114,68 @@ mod tests {
         .to_world(&y_up());
         let goal = app.world().get::<Transform>(gizmo.target).unwrap();
         assert!(goal.translation.abs_diff_eq(wanted.translation, 1e-5));
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+    }
+
+    /// Changes sent before an add belong to that add's control, and act on it
+    /// before anything sent after the add: a pose sent between two adds
+    /// moves the first control's target, and the second replaces it after.
+    #[test]
+    fn changes_sent_before_an_add_act_on_its_control_before_what_follows() {
+        let (mut app, _) = scene();
+        let camera = camera(app.world_mut());
+        let a = app
+            .world_mut()
+            .spawn((instance("a", camera), Transform::default()))
+            .id();
+        let b = app
+            .world_mut()
+            .spawn((instance("b", camera), Transform::default()))
+            .id();
+        let whole = |instance: &str| Control::Transform {
+            target: Target::Instance {
+                instance: instance.into(),
+            },
+            modes: None,
+            local: false,
+            colors: None,
+        };
+        let to = Pose {
+            position: [5.0, 0.0, 0.0],
+            rotation: no_turn(),
+        };
+        queue(
+            &mut app,
+            [
+                ControlCommand::Show {
+                    key: "k".into(),
+                    visible: false,
+                },
+                add("k", whole("a")),
+                ControlCommand::SetPose {
+                    key: "k".into(),
+                    pose: to,
+                    scale: None,
+                },
+                add("k", whole("b")),
+            ],
+        );
+        app.update();
+        let at = |entity: Entity| *app.world().get::<Transform>(entity).unwrap();
+        assert!(
+            at(a)
+                .translation
+                .abs_diff_eq(to.to_world(&y_up()).translation, 1e-5),
+            "the pose landed on a's control's target: {:?}",
+            at(a).translation
+        );
+        assert_eq!(at(b), Transform::default(), "and not on b's");
+        let gizmo = only::<TransformGizmo>(&mut app).expect("b's control");
+        assert_eq!(app.world().get::<TransformGizmo>(gizmo).unwrap().target, b);
+        assert!(
+            app.world().get::<HiddenByDriver>(gizmo).is_none(),
+            "the hide was a's control's"
+        );
         assert!(app.world().resource::<ControlCommands>().0.is_empty());
     }
 
