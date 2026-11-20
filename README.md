@@ -188,9 +188,12 @@ publishes whenever the manifest names a version crates.io does not have yet.
 Until step 1, that workflow publishes nothing and says so in its run.
 
 `arora-import` is not published to crates.io; it ships as `@semio/import` on
-npm. npm's trusted publishing cannot create a package either, so its first
-version is a person's too: from `main`, `npm run build:wasm` and then
-`npm publish` in `packages/import`.
+npm, and the same release workflow publishes it once npm trusts it: on
+npmjs.com, under the package's Settings → Trusted Publisher, choose GitHub
+Actions with the organization `semio-ai`, the repository `arora-visuals` and
+the workflow `release.yml`. A release is then a bump of `version` in
+`packages/import/package.json` on `main`. Its first version was a person's,
+since npm's trusted publishing cannot create a package either.
 
 ## Consumers
 
