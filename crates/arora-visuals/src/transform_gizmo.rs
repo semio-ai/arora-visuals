@@ -1342,6 +1342,34 @@ impl HandleFinder<'_, '_> {
     }
 }
 
+/// Where `entity` stands in the world as the transforms say now. Its
+/// `GlobalTransform` lags a transform written earlier in the frame — a parent
+/// a host moved this frame — until propagation in `PostUpdate`, so the chain
+/// is composed here, falling back to the propagated transform of an ancestor
+/// with none of its own.
+///
+/// A drag's local transform is taken against the parent as this says, and a
+/// control reports the drag in the world against the same parent, so what is
+/// applied, what is reported and what a driver writes back all agree.
+pub(crate) fn current_global(
+    mut entity: Entity,
+    transform_of: impl Fn(Entity) -> Option<Transform>,
+    parents: &Query<&ChildOf>,
+    globals: &Query<&GlobalTransform>,
+) -> Option<bevy::math::Affine3A> {
+    let mut affine = bevy::math::Affine3A::IDENTITY;
+    loop {
+        let Some(transform) = transform_of(entity) else {
+            return globals.get(entity).ok().map(|g| g.affine() * affine);
+        };
+        affine = transform.compute_affine() * affine;
+        match parents.get(entity) {
+            Ok(parent) => entity = parent.parent(),
+            Err(_) => return Some(affine),
+        }
+    }
+}
+
 /// Finds the handle under the pointer, and takes, drags and lets go of
 /// handles with the left button — for transform and joint gizmos alike, so
 /// whichever handle of either is nearest the pointer is the one taken.
@@ -1422,11 +1450,26 @@ fn drive(
                 pointer.readings = readings(&drag, &moved);
                 let local = match moved {
                     Moved::World(global) => {
+                        // Against the parent as it stands now, not as last
+                        // propagated: a parent moved this frame would put the
+                        // target somewhere other than where it was dragged.
+                        let parent = parents
+                            .get(gizmo.target)
+                            .ok()
+                            .and_then(|child_of| {
+                                current_global(
+                                    child_of.parent(),
+                                    |entity| locals.get(entity).ok().copied(),
+                                    &parents,
+                                    &globals,
+                                )
+                            })
+                            .map_or(GlobalTransform::IDENTITY, GlobalTransform::from);
                         // Moving and turning leave the scale as it was; taking
                         // it back out of the world would only add rounding.
                         Transform {
                             scale: drag.start_local.scale,
-                            ..global.reparented_to(&parent_of(gizmo.target))
+                            ..global.reparented_to(&parent)
                         }
                     }
                     Moved::Stretch(stretch) => Transform {
@@ -2107,6 +2150,69 @@ mod tests {
             .release(MouseButton::Left);
         app.update();
         assert!(!app.world().resource::<GizmoPointer>().owns_button());
+    }
+
+    /// A target whose parent moved this frame, not yet propagated, is moved
+    /// where it was dragged: its local transform is taken against the parent
+    /// as it now stands, so the parent's move is not added to the drag.
+    #[test]
+    fn a_drag_is_taken_against_the_parent_as_it_now_stands() {
+        #[derive(Resource, Default)]
+        struct Dragged(Vec<Transform>);
+
+        let (mut app, window, gizmo) = driving(|world, target, camera| {
+            // Propagated at the origin, standing ten metres along X now.
+            let parent = world
+                .spawn((
+                    Transform::from_xyz(10.0, 0.0, 0.0),
+                    GlobalTransform::IDENTITY,
+                ))
+                .id();
+            world.entity_mut(target).insert(ChildOf(parent));
+            world
+                .spawn(TransformGizmo::new(target, camera))
+                .insert(Facing(Vec3::ONE))
+                .id()
+        });
+        app.init_resource::<Dragged>().add_observer(
+            |drag: On<GizmoDrag>, mut dragged: ResMut<Dragged>| dragged.0.push(drag.transform),
+        );
+        let point_at = |app: &mut App, at: Vec2| {
+            let mut cursor = app.world_mut().get_mut::<Window>(window).unwrap();
+            cursor.set_cursor_position(Some(at));
+            app.update();
+        };
+        let spot = (0..200)
+            .map(|x| Vec2::new(200.0 + x as f32, 200.0))
+            .find(|&at| {
+                point_at(&mut app, at);
+                app.world()
+                    .resource::<GizmoPointer>()
+                    .hovered
+                    .is_some_and(|(_, handle)| !matches!(handle, GizmoHandle::Ring(_)))
+            })
+            .expect("a handle on the row through the target");
+        app.world_mut().resource_mut::<PressedScene>().0 = true;
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        point_at(&mut app, spot + Vec2::new(6.0, -4.0));
+
+        let target = app.world().get::<TransformGizmo>(gizmo).unwrap().target;
+        let moved = *app.world().resource::<Dragged>().0.last().unwrap();
+        // Dragged a little way from the origin, where the target was drawn:
+        // under a parent ten metres along X, that is about ten metres back.
+        let world = Vec3::new(10.0, 0.0, 0.0) + moved.translation;
+        assert!(world.length() < 1.0, "landed at {world} in the world");
+        assert_eq!(
+            app.world().get::<Transform>(target).unwrap().translation,
+            moved.translation,
+            "and applied as reported"
+        );
     }
 
     #[test]

@@ -91,6 +91,20 @@ struct Message {
     submitted: bool,
 }
 
+/// An instance made ready, for a host to tell its page: whether it was seen
+/// drawn whole, or given up on after [`GIVE_UP_FRAMES`] frames and made ready
+/// as it draws. Readiness alone cannot say which, and a host reporting load
+/// times or waiting on a first frame needs to.
+#[derive(bevy::prelude::Message, Clone, Debug, PartialEq, Eq)]
+pub struct InstanceReady {
+    pub instance: Entity,
+    /// Its [`EntityInstance::id`].
+    pub id: String,
+    /// Whether the GPU finished a frame drawing every mesh of it its camera
+    /// sees; false when it was given up on.
+    pub drawn: bool,
+}
+
 /// The render world's reports, read by the main world. Unbounded, as it
 /// carries at most three messages per warming camera.
 #[derive(Resource)]
@@ -131,7 +145,8 @@ impl Plugin for DrawnPlugin {
             return;
         }
         let (sender, receiver) = channel();
-        app.insert_resource(Reports(Mutex::new(receiver)));
+        app.insert_resource(Reports(Mutex::new(receiver)))
+            .add_message::<InstanceReady>();
         if let Some(render_app) = app.get_sub_app_mut(RenderApp) {
             render_app
                 .insert_resource(ReportSender(sender))
@@ -251,28 +266,40 @@ fn settled(state: &CachedPipelineState) -> bool {
 
 /// Make ready the instances the render world reports drawn, or given up on:
 /// each one's camera moves above the clear, where it draws in its place from
-/// the next frame on. An instance superseded meanwhile stays under the clear
-/// until it is retired.
+/// the next frame on, and an [`InstanceReady`] says which. An instance
+/// superseded meanwhile stays under the clear until it is retired.
+#[allow(clippy::too_many_arguments)]
 pub fn ready_drawn_instances(
     reports: Res<Reports>,
     mut cameras: Query<(&ViewOf, &mut Camera), With<Warming>>,
     mut instances: Query<(&mut EntityInstance, Has<Superseded>)>,
     names: Query<&Name>,
     parents: Query<&ChildOf>,
+    mut ready: MessageWriter<InstanceReady>,
     mut commands: Commands,
 ) {
     let Ok(reports) = reports.0.lock() else {
         return;
     };
+    // Cameras made ready in this run. `Warming` comes off through commands,
+    // which land only after it, so a second terminal report for the same
+    // camera — the GPU's drawn and the timeout's give-up can both arrive
+    // before one drain — would still find it warming. The first says what
+    // the instance became; the rest are about a transition already made.
+    let mut made_ready = std::collections::HashSet::new();
     for message in reports.try_iter() {
+        if made_ready.contains(&message.camera) {
+            continue;
+        }
         let Ok((&ViewOf(instance), mut placed)) = cameras.get_mut(message.camera) else {
             continue;
         };
-        let Ok((mut instance, superseded)) = instances.get_mut(instance) else {
+        let entity = instance;
+        let Ok((mut instance, superseded)) = instances.get_mut(entity) else {
             continue;
         };
-        match message.report {
-            Report::Drawn => {}
+        let drawn = match message.report {
+            Report::Drawn => true,
             Report::Held => {
                 log::warn!(
                     "{}: not drawn after {HELD_FRAMES} frames: {}",
@@ -281,18 +308,27 @@ pub fn ready_drawn_instances(
                 );
                 continue;
             }
-            Report::GaveUp => log::warn!(
-                "{}: ready without being drawn whole after {GIVE_UP_FRAMES} frames: {}",
-                instance.id,
-                holding(&message, &names, &parents)
-            ),
-        }
+            Report::GaveUp => {
+                log::warn!(
+                    "{}: ready without being drawn whole after {GIVE_UP_FRAMES} frames: {}",
+                    instance.id,
+                    holding(&message, &names, &parents)
+                );
+                false
+            }
+        };
         if superseded {
             continue;
         }
         placed.order = instance.draw_order;
         instance.ready = true;
         commands.entity(message.camera).remove::<Warming>();
+        made_ready.insert(message.camera);
+        ready.write(InstanceReady {
+            instance: entity,
+            id: instance.id.clone(),
+            drawn,
+        });
         log::info!("{}: ready", instance.id);
     }
 }
@@ -318,4 +354,73 @@ fn holding(message: &Message, names: &Query<&Name>, parents: &Query<&ChildOf>) -
         "meshes without a compiled pipeline or not queued: {}",
         meshes.join(", ")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binding::SceneBindings;
+
+    /// An instance made ready says whether it was seen drawn or given up on,
+    /// once, and a superseded one says nothing. Two terminal reports for one
+    /// camera in one frame — drawn, and the timeout racing it — make it
+    /// ready once, as the first said.
+    #[test]
+    fn a_ready_instance_says_whether_it_was_drawn() {
+        let mut app = App::new();
+        let (sender, receiver) = channel();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Reports(Mutex::new(receiver)))
+            .add_message::<InstanceReady>()
+            .add_systems(Update, ready_drawn_instances);
+        let mut spawn = |id: &str, superseded: bool| {
+            let world = app.world_mut();
+            let camera = world.spawn((Camera::default(), Warming)).id();
+            let mut instance = world.spawn(EntityInstance {
+                id: id.into(),
+                asset_path: String::new(),
+                meta: Default::default(),
+                bindings: SceneBindings::default(),
+                camera,
+                draw_order: 0,
+                ready: false,
+            });
+            if superseded {
+                instance.insert(Superseded);
+            }
+            let instance = instance.id();
+            world.entity_mut(camera).insert(ViewOf(instance));
+            camera
+        };
+        let drawn = spawn("drawn", false);
+        let gave_up = spawn("gave-up", false);
+        let gone = spawn("superseded", true);
+        for (camera, report) in [
+            (drawn, Report::Drawn),
+            (gave_up, Report::GaveUp),
+            (gone, Report::Drawn),
+            (drawn, Report::GaveUp),
+        ] {
+            sender
+                .send(Message {
+                    camera,
+                    report,
+                    meshes: Vec::new(),
+                    seen: true,
+                    submitted: true,
+                })
+                .unwrap();
+        }
+        app.update();
+
+        let messages = app.world().resource::<Messages<InstanceReady>>();
+        let said: Vec<(String, bool)> = messages
+            .iter_current_update_messages()
+            .map(|ready| (ready.id.clone(), ready.drawn))
+            .collect();
+        assert_eq!(
+            said,
+            vec![("drawn".to_string(), true), ("gave-up".to_string(), false)]
+        );
+    }
 }
