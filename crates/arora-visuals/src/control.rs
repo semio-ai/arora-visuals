@@ -24,10 +24,17 @@
 //! **Poses are in the driver's frame: Z up, metres, quaternions as
 //! `[x, y, z, w]`.** A world's own axes are its host's: a Z-up world is
 //! already the driver's frame, and a Y-up one is a quarter turn from it. The
-//! host says which by the [`DriverFrame`] resource, the turn from its world to
-//! the driver's frame, identity unless it inserts one. [`Pose`] converts at
-//! this boundary, and the transform control's handles are labelled from the
-//! same turn, so a driver never sees the world's own axes.
+//! host says which by a [`DriverFrame`], the turn from its world to the
+//! driver's frame.
+//!
+//! **The frame belongs to a view, not to the app.** Two hosts can share one
+//! app — a Y-up robot scene and a Z-up face on its screen — so one app-wide
+//! frame would turn one of them wrongly. A host puts [`DriverFrame`] on the
+//! camera its controls are used through (below), and a control speaks in the
+//! frame of its camera. The [`DefaultDriverFrame`] resource, identity unless
+//! a host inserts one, is the frame of a camera that carries none. [`Pose`]
+//! converts at this boundary, and a transform control's handles are labelled
+//! from the same turn, so a driver never sees the world's own axes.
 //!
 //! # What is still to come: [`Loading`]
 //!
@@ -36,13 +43,21 @@
 //! which, so it says: it puts [`Loading`] on the entity it is loading an
 //! instance into until that entity carries its [`EntityInstance`].
 //!
+//! An instance that is there but not yet indexed
+//! ([`SceneBindings::indexed`](crate::binding::SceneBindings::indexed)) is
+//! still to come as well: until it is, an element it lacks cannot be told
+//! from one not yet joined, so a control on it waits rather than being
+//! refused. A host that spawns an instance and indexes it later needs no
+//! [`Loading`] for that gap.
+//!
 //! # Which camera a control is used through: [`ControlCamera`]
 //!
 //! A control on an instance is used through that instance's own
 //! [`camera`](EntityInstance::camera), so a face drawn by a camera of its own
 //! has its controls sized and picked through that camera. A goal is on no
 //! instance; it is used through the camera the host marks [`ControlCamera`],
-//! and a goal added while no camera is marked waits for one.
+//! and a goal added while no camera is marked waits for one. The camera also
+//! decides which [`DriverFrame`] the control's poses are in.
 //!
 //! # Joint controls: [`JointRequest`]
 //!
@@ -69,17 +84,21 @@
 //!
 //! # The rules
 //!
-//! - **Commands under one key act in the order they were sent.** An add that
-//!   waits for its instance holds every later command under its key behind
-//!   it, so a later add is the control left, and a change acts on the control
-//!   the add makes, not the one it replaces.
+//! - **Commands under one key act in the order they were sent.** A command
+//!   that waits on what is already asked for — an add for its instance or
+//!   camera, a change for the gizmo its control's add is spawning — holds
+//!   every later command under its key behind it, so a later add is the
+//!   control left, and a change acts on the control the add before it
+//!   makes, not the one that replaces it. A change sent before its add waits
+//!   for that add, holding later changes but not the add itself.
 //! - **A remove is not held**: it cancels a waiting add and what waits behind
 //!   it, and takes away the control the add would have replaced.
 //! - **A key names one control in the view**; an add under a key in use
 //!   replaces its control.
-//! - A change for a key waits for its control's gizmo, which an add spawns at
-//!   the end of its pass, or for an add still to come. A change for a key
-//!   nothing will add is dropped, so it does not ask for frames for good.
+//! - A change for a key — a show, a pose, a configure, a highlight — waits for
+//!   its control's gizmo, which an add spawns at the end of its pass, or for
+//!   an add still to come. A change for a key nothing will add is dropped, so
+//!   it does not ask for frames for good.
 //! - Commands are carried out in two passes a frame, the gizmos an add spawns
 //!   being there for the second, so a change sent with its control's add
 //!   takes hold the frame the control first shows.
@@ -119,8 +138,11 @@ fn no_turn() -> [f32; 4] {
 /// level. Identity, the default, is a world that is Z up already.
 ///
 /// The host's to say, because the world's axes are its own; this crate holds
-/// no up-axis of its own.
-#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+/// no up-axis of its own. It is said per view, on the camera the controls
+/// are used through, because two hosts sharing an app can draw worlds that
+/// stand different ways up. A camera without one speaks in
+/// [`DefaultDriverFrame`] ([module docs](self#the-drivers-frame-driverframe)).
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct DriverFrame(pub Quat);
 
 impl Default for DriverFrame {
@@ -128,6 +150,12 @@ impl Default for DriverFrame {
         Self(Quat::IDENTITY)
     }
 }
+
+/// The [`DriverFrame`] of a camera that carries none: identity, a Z-up world,
+/// unless a host inserts another. A host that is alone in its app can say its
+/// frame once here rather than on each camera.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+pub struct DefaultDriverFrame(pub DriverFrame);
 
 impl DriverFrame {
     /// The frame of a world that is Bevy's own Y up: a quarter turn about X
@@ -141,6 +169,12 @@ impl DriverFrame {
     pub fn axes(&self) -> [Dir3; 3] {
         let back = self.0.inverse();
         [Vec3::X, Vec3::Y, Vec3::Z].map(|axis| Dir3::new(back * axis).unwrap_or(Dir3::Z))
+    }
+
+    /// The frame a control used through `camera` speaks in: the camera's own,
+    /// or the app's default when it carries none.
+    fn of(camera: Entity, frames: &Query<&DriverFrame>, fallback: &DefaultDriverFrame) -> Self {
+        frames.get(camera).copied().unwrap_or(fallback.0)
     }
 }
 
@@ -463,6 +497,8 @@ struct Placed {
     target: Option<Entity>,
     /// A goal the control brought with it, which goes when it goes.
     goal: Option<Entity>,
+    /// The camera it is used through, whose frame its poses are in.
+    camera: Entity,
     /// The opacity the host asked for, which the gizmo's fades toward.
     opacity: f32,
     /// The fade toward `opacity` under way, if one is.
@@ -475,11 +511,12 @@ struct Placed {
 }
 
 impl Placed {
-    fn new(gizmo: Entity, target: Option<Entity>, goal: Option<Entity>) -> Self {
+    fn new(gizmo: Entity, target: Option<Entity>, goal: Option<Entity>, camera: Entity) -> Self {
         Self {
             gizmo,
             target,
             goal,
+            camera,
             opacity: 1.0,
             fade: None,
             shown: false,
@@ -538,7 +575,7 @@ impl Plugin for ControlsPlugin {
             .init_resource::<ControlEvents>()
             .init_resource::<ControlPresses>()
             .init_resource::<Controls>()
-            .init_resource::<DriverFrame>()
+            .init_resource::<DefaultDriverFrame>()
             .add_message::<RequestRedraw>()
             // Twice, the gizmos an add spawns being there for the second: a
             // change sent with its control's add then takes hold the frame
@@ -758,7 +795,8 @@ type Placeable = Or<(With<TransformGizmo>, With<JointGizmo>, With<JointRequest>)
 fn carry_out(
     mut pending: ResMut<ControlCommands>,
     mut controls: ResMut<Controls>,
-    frame: Res<DriverFrame>,
+    app_frame: Res<DefaultDriverFrame>,
+    frames: Query<&DriverFrame>,
     mut commands: Commands,
     cameras: Query<Entity, With<ControlCamera>>,
     instances: Query<(Entity, &EntityInstance, Has<Superseded>)>,
@@ -779,8 +817,9 @@ fn carry_out(
     if pending.0.is_empty() {
         return;
     }
-    // The instance under a host's id, once it is there. One being replaced
-    // gives way to its successor, which is the one a control should stay on.
+    // The instance under a host's id, if one is there, indexed or not. One
+    // being replaced gives way to its successor, which is the one a control
+    // should stay on.
     let instance = |name: &str| {
         instances
             .iter()
@@ -788,8 +827,9 @@ fn carry_out(
             .min_by_key(|(_, _, superseded)| *superseded)
             .map(|(entity, instance, _)| (entity, instance))
     };
-    // Whether an instance not there yet is on its way: what a control on it
-    // waits for.
+    // Whether an instance not ready to be addressed is on its way: loading,
+    // or there but not yet indexed, so its elements cannot be told from ones
+    // it lacks. What a control on it waits for.
     let coming = |name: &str| loading.iter().any(|loading| loading.instance == name);
     let asked = std::mem::take(&mut pending.0);
     // Keys an add is coming for, in this batch or waiting from an earlier one.
@@ -806,43 +846,69 @@ fn carry_out(
     // its add is. Anything else is for a key nothing will add, such as one
     // whose control went with its instance, and waiting would hold it, and
     // the frames it asks for, for good.
-    let any_loading = !loading.is_empty();
+    let any_loading = !loading.is_empty()
+        || instances
+            .iter()
+            .any(|(_, instance, _)| !instance.bindings.indexed);
     let worth_waiting = |key: &str, controls: &Controls| {
         controls.0.contains_key(key) || adding.contains(key) || any_loading
     };
     let mut waiting = Vec::new();
-    // Keys whose add waits for its instance or camera. Every later command
-    // under the same key waits behind it, so they land in the order they
-    // were asked: a later add is the control left, and a change acts on the
-    // control the add makes, not the one it replaces.
+    // Keys with a command waiting on what is already asked for: an add for
+    // its instance or camera, or a change for the gizmo its control's add is
+    // spawning. Every later command under the same key waits behind it, so
+    // they land in the order they were asked: a later add is the control
+    // left, and a change acts on the control the add before it makes, not
+    // one that replaces it.
     let mut held: HashSet<String> = HashSet::new();
+    // Keys with a change waiting for an add not yet made, sent before it.
+    // Later changes wait behind it, keeping their order, but an add does
+    // not: the add is what the change waits for, and holding it would hold
+    // both for good.
+    let mut held_changes: HashSet<String> = HashSet::new();
     // Whether to draw another frame: for a command that changed something, or
     // one waiting on a gizmo spawned at the end of this pass.
     let mut again = false;
     for command in asked {
         // A remove is not held: it cancels the waiting add and what waits
         // behind it, and takes away the control the add would have replaced.
-        if held.contains(command.key()) && !matches!(command, ControlCommand::Remove { .. }) {
+        let key = command.key();
+        let behind = match command {
+            ControlCommand::Remove { .. } => false,
+            ControlCommand::Add { .. } => held.contains(key),
+            _ => held.contains(key) || held_changes.contains(key),
+        };
+        if behind {
             waiting.push(command);
             continue;
         }
-        again |= !matches!(
+        again |= matches!(
             command,
-            ControlCommand::Configure { .. }
-                | ControlCommand::Highlight { .. }
-                | ControlCommand::SetPose { .. }
+            ControlCommand::Add { .. } | ControlCommand::Remove { .. }
         );
         match command {
             ControlCommand::Add { key, control } => {
-                // A control on an instance waits for it while it is loading;
-                // one on an instance nothing is loading is dropped.
+                // A control on an instance waits for it while it is loading
+                // or not yet indexed; one on an instance nothing is loading
+                // is dropped.
                 let on = match control.instance() {
                     None => None,
                     Some(name) => match instance(name) {
+                        Some((_, found)) if !found.bindings.indexed => {
+                            defer(
+                                &mut waiting,
+                                &mut held,
+                                ControlCommand::Add { key, control },
+                            );
+                            continue;
+                        }
                         Some(found) => Some(found),
                         None if coming(name) => {
-                            held.insert(key.clone());
-                            waiting.push(ControlCommand::Add { key, control });
+                            defer(
+                                &mut waiting,
+                                &mut held,
+                                ControlCommand::Add { key, control },
+                            );
                             continue;
                         }
                         None => {
@@ -858,12 +924,16 @@ fn carry_out(
                         Some(camera) => camera,
                         None => {
                             log::debug!("no control camera yet; {key:?} waits for one");
-                            held.insert(key.clone());
-                            waiting.push(ControlCommand::Add { key, control });
+                            defer(
+                                &mut waiting,
+                                &mut held,
+                                ControlCommand::Add { key, control },
+                            );
                             continue;
                         }
                     },
                 };
+                let frame = DriverFrame::of(camera, &frames, &app_frame);
                 if let Some(old) = controls.0.remove(&key) {
                     despawn(&mut commands, old);
                 }
@@ -879,7 +949,7 @@ fn carry_out(
                             key: key.clone(),
                             colour: color.as_deref().and_then(colour),
                         };
-                        Placed::new(commands.spawn(request).id(), None, None)
+                        Placed::new(commands.spawn(request).id(), None, None, camera)
                     }
                     Control::Transform {
                         target,
@@ -934,7 +1004,7 @@ fn carry_out(
                                 ..base
                             })
                             .id();
-                        Placed::new(gizmo, Some(target), goal)
+                        Placed::new(gizmo, Some(target), goal, camera)
                     }
                 };
                 controls.0.insert(key, placed);
@@ -949,9 +1019,11 @@ fn carry_out(
                 // removed.
                 waiting.retain(|waiting| waiting.key() != key);
                 held.remove(&key);
+                held_changes.remove(&key);
             }
-            ControlCommand::Show { key, visible } => match controls.0.get_mut(&key) {
-                Some(placed) => {
+            ControlCommand::Show { key, visible } => {
+                if let Some(placed) = controls.0.get_mut(&key) {
+                    again = true;
                     let mut gizmo = commands.entity(placed.gizmo);
                     if visible {
                         gizmo
@@ -963,22 +1035,40 @@ fn carry_out(
                         // the fade reads whether it shows afresh each frame.
                         placed.shown = false;
                     }
+                } else if worth_waiting(&key, &controls) {
+                    // Shown or hidden before it was added, it waits for the
+                    // add, as any change does.
+                    defer(
+                        &mut waiting,
+                        &mut held_changes,
+                        ControlCommand::Show { key, visible },
+                    );
+                } else {
+                    log::debug!("no control {key:?} to show or hide");
                 }
-                // Shown or hidden before it was added: the add is waiting
-                // too, so this waits behind it.
-                None => waiting.push(ControlCommand::Show { key, visible }),
-            },
+            }
             ControlCommand::SetPose { key, pose, scale } => {
-                let target = controls.0.get(&key).and_then(|p| p.target);
+                let placed = controls.0.get(&key);
+                let target = placed.and_then(|p| p.target);
+                let frame = placed.map(|p| DriverFrame::of(p.camera, &frames, &app_frame));
                 // A goal added in this pass is spawned at the end of it, so it
                 // has no transform yet; the pose waits for the second pass, as
                 // one set before the add would.
-                let Some(target) = target.filter(|t| transforms.contains(*t)) else {
+                let (Some(target), Some(frame)) =
+                    (target.filter(|t| transforms.contains(*t)), frame)
+                else {
                     if target.is_none() && controls.0.contains_key(&key) {
                         log::warn!("{key:?} is a joint control; write its value instead");
                     } else if worth_waiting(&key, &controls) {
-                        again |= controls.0.contains_key(&key);
-                        waiting.push(ControlCommand::SetPose { key, pose, scale });
+                        // Behind the gizmo its add is spawning, or behind
+                        // an add still to come.
+                        let placed = controls.0.contains_key(&key);
+                        again |= placed;
+                        defer(
+                            &mut waiting,
+                            if placed { &mut held } else { &mut held_changes },
+                            ControlCommand::SetPose { key, pose, scale },
+                        );
                     } else {
                         log::debug!("no control {key:?} to pose");
                     }
@@ -1024,15 +1114,22 @@ fn carry_out(
                 });
                 let (Some(gizmo), true) = (gizmo, spawned) else {
                     if worth_waiting(&key, &controls) {
-                        again |= controls.0.contains_key(&key);
-                        waiting.push(ControlCommand::Configure {
-                            key,
-                            color,
-                            colors,
-                            local,
-                            opacity,
-                            interactive,
-                        });
+                        // Behind the gizmo its add is spawning, or behind
+                        // an add still to come.
+                        let placed = controls.0.contains_key(&key);
+                        again |= placed;
+                        defer(
+                            &mut waiting,
+                            if placed { &mut held } else { &mut held_changes },
+                            ControlCommand::Configure {
+                                key,
+                                color,
+                                colors,
+                                local,
+                                opacity,
+                                interactive,
+                            },
+                        );
                     } else {
                         log::debug!("no control {key:?} to configure");
                     }
@@ -1103,8 +1200,15 @@ fn carry_out(
                 });
                 let (Some(gizmo), true) = (gizmo, spawned) else {
                     if worth_waiting(&key, &controls) {
-                        again |= controls.0.contains_key(&key);
-                        waiting.push(ControlCommand::Highlight { key, handle, on });
+                        // Behind the gizmo its add is spawning, or behind
+                        // an add still to come.
+                        let placed = controls.0.contains_key(&key);
+                        again |= placed;
+                        defer(
+                            &mut waiting,
+                            if placed { &mut held } else { &mut held_changes },
+                            ControlCommand::Highlight { key, handle, on },
+                        );
                     } else {
                         log::debug!("no control {key:?} to highlight");
                     }
@@ -1134,6 +1238,13 @@ fn carry_out(
     }
 }
 
+/// Puts `command` off to a later pass, and holds every later command under
+/// its key behind it.
+fn defer(waiting: &mut Vec<ControlCommand>, held: &mut HashSet<String>, command: ControlCommand) {
+    held.insert(command.key().to_string());
+    waiting.push(command);
+}
+
 fn despawn(commands: &mut Commands, placed: Placed) {
     commands.entity(placed.gizmo).despawn();
     if let Some(goal) = placed.goal {
@@ -1146,7 +1257,8 @@ fn report_transform_drag(
     gizmos: Query<&TransformGizmo>,
     parents: Query<&ChildOf>,
     globals: Query<&GlobalTransform>,
-    frame: Res<DriverFrame>,
+    app_frame: Res<DefaultDriverFrame>,
+    frames: Query<&DriverFrame>,
     mut events: ResMut<ControlEvents>,
 ) {
     let Ok(gizmo) = gizmos.get(drag.entity) else {
@@ -1168,7 +1280,10 @@ fn report_transform_drag(
         key: gizmo.key.clone(),
         phase: drag.phase.into(),
         value: None,
-        pose: Some(Pose::from_world(&world, &frame)),
+        pose: Some(Pose::from_world(
+            &world,
+            &DriverFrame::of(gizmo.camera, &frames, &app_frame),
+        )),
         scale: Some(drag.transform.scale.to_array()),
     });
 }
@@ -1281,7 +1396,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins)
             .add_plugins(ControlsPlugin)
-            .insert_resource(y_up());
+            .insert_resource(DefaultDriverFrame(y_up()));
         app
     }
 
@@ -1311,7 +1426,10 @@ mod tests {
             id: id.into(),
             asset_path: String::new(),
             meta: Default::default(),
-            bindings: SceneBindings::default(),
+            bindings: SceneBindings {
+                indexed: true,
+                ..Default::default()
+            },
             camera,
             draw_order: 0,
             ready: true,
@@ -1623,20 +1741,22 @@ mod tests {
         let gizmo = only::<JointGizmo>(&mut app).unwrap();
         // What taking a robot away does to the controls on it.
         app.world_mut().despawn(gizmo);
-        send(
-            &mut app,
-            ControlCommand::Show {
-                key: TILT.into(),
-                visible: false,
-            },
-        );
-        // Neither shown on a dead entity nor applied: it waits, as for a
-        // control not yet added, until the driver adds the key again.
-        assert_eq!(
-            app.world().resource::<ControlCommands>().0.len(),
-            1,
-            "the show waits for an add"
-        );
+        let hide = || ControlCommand::Show {
+            key: TILT.into(),
+            visible: false,
+        };
+        // Not shown on a dead entity: the key is free, and with nothing to
+        // add it, the show goes.
+        send(&mut app, hide());
+        assert_eq!(app.world().resource::<Controls>().keys().count(), 0);
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+
+        // A show sent before the add that comes for the key again waits for
+        // it, and reaches the control it makes.
+        queue(&mut app, [hide(), add(TILT, joint_on(ROBOT))]);
+        app.update();
+        let gizmo = only::<JointGizmo>(&mut app).expect("added again");
+        assert!(app.world().get::<HiddenByDriver>(gizmo).is_some());
     }
 
     #[test]
@@ -2652,6 +2772,236 @@ mod tests {
             .map(|command| (command.key(), matches!(command, ControlCommand::Add { .. })))
             .collect();
         assert_eq!(left, [("b", true), ("b", false), ("a", true), ("a", false)]);
+    }
+
+    /// Two worlds standing different ways up share one app, each drawn by a
+    /// camera carrying its own frame: one driver pose lands where each
+    /// world's own frame puts it, each control's handles are labelled for
+    /// its world, and a drag is reported back in the driver's frame from
+    /// either. A camera with no frame of its own speaks in the app's.
+    #[test]
+    fn each_view_speaks_in_its_own_camera_s_frame() {
+        let mut app = bare();
+        let y_up_camera = app.world_mut().spawn(y_up()).id();
+        let z_up_camera = app
+            .world_mut()
+            .spawn((DriverFrame::default(), ControlCamera))
+            .id();
+        let plain_camera = app.world_mut().spawn_empty().id();
+        let robot = app
+            .world_mut()
+            .spawn((instance("robot", y_up_camera), Transform::default()))
+            .id();
+        let face = app
+            .world_mut()
+            .spawn((instance("face", z_up_camera), Transform::default()))
+            .id();
+        let plain = app
+            .world_mut()
+            .spawn((instance("plain", plain_camera), Transform::default()))
+            .id();
+        let whole = |instance: &str| Control::Transform {
+            target: Target::Instance {
+                instance: instance.into(),
+            },
+            modes: None,
+            local: false,
+            colors: None,
+        };
+        let pose = Pose {
+            position: [1.0, 2.0, 3.0],
+            rotation: no_turn(),
+        };
+        let set = |key: &str| ControlCommand::SetPose {
+            key: key.into(),
+            pose,
+            scale: None,
+        };
+        queue(
+            &mut app,
+            [
+                add("robot", whole("robot")),
+                add("face", whole("face")),
+                add("plain", whole("plain")),
+                add("goal", goal_at([1.0, 2.0, 3.0])),
+                set("robot"),
+                set("face"),
+                set("plain"),
+            ],
+        );
+        app.update();
+        let at =
+            |app: &App, entity: Entity| app.world().get::<Transform>(entity).unwrap().translation;
+        assert!(at(&app, robot).abs_diff_eq(Vec3::new(1.0, 3.0, -2.0), 1e-5));
+        assert!(at(&app, face).abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), 1e-5));
+        assert!(
+            at(&app, plain).abs_diff_eq(Vec3::new(1.0, 3.0, -2.0), 1e-5),
+            "a camera with no frame speaks in the app's"
+        );
+
+        let controls = app.world().resource::<Controls>();
+        let gizmo = |key: &str| controls.gizmo(key).unwrap();
+        let (robot_gizmo, face_gizmo, goal_gizmo) = (gizmo("robot"), gizmo("face"), gizmo("goal"));
+        let axes = |entity: Entity| app.world().get::<TransformGizmo>(entity).unwrap().axes;
+        assert_eq!(axes(robot_gizmo), TransformGizmo::Z_UP);
+        assert_eq!(axes(face_gizmo), [Dir3::X, Dir3::Y, Dir3::Z]);
+        let goal = app
+            .world()
+            .get::<TransformGizmo>(goal_gizmo)
+            .unwrap()
+            .target;
+        assert!(
+            at(&app, goal).abs_diff_eq(Vec3::new(1.0, 2.0, 3.0), 1e-5),
+            "a goal is in its control camera's frame"
+        );
+
+        // A drag one unit up each world's own up.
+        for (gizmo, target, up) in [(robot_gizmo, robot, Vec3::Y), (face_gizmo, face, Vec3::Z)] {
+            let transform = Transform::from_translation(at(&app, target) + up);
+            app.world_mut().trigger(GizmoDrag {
+                entity: gizmo,
+                target,
+                handle: GizmoHandle::Arrow(2),
+                phase: DragPhase::End,
+                transform,
+            });
+        }
+        for event in events(&mut app) {
+            let position = Vec3::from(event.pose.unwrap().position);
+            assert!(
+                position.abs_diff_eq(Vec3::new(1.0, 2.0, 4.0), 1e-5),
+                "{}: {position}",
+                event.key
+            );
+        }
+    }
+
+    /// An instance that is there but not yet indexed is still to come: an
+    /// add on it waits, holding what follows under its key, and lands once
+    /// it is indexed; an element it then turns out not to have is refused.
+    #[test]
+    fn a_control_on_an_instance_not_yet_indexed_waits_for_it() {
+        let (mut app, _) = scene();
+        let camera = camera(app.world_mut());
+        let mut unindexed = instance("face", camera);
+        unindexed.bindings.indexed = false;
+        let face = app
+            .world_mut()
+            .spawn((unindexed, Transform::default()))
+            .id();
+        let on = |target: Target| Control::Transform {
+            target,
+            modes: None,
+            local: false,
+            colors: None,
+        };
+        let element = |id: &str| Target::Element {
+            instance: "face".into(),
+            id: id.into(),
+        };
+        queue(
+            &mut app,
+            [
+                add("eye", on(element("eye"))),
+                configure("eye", None, Some(false)),
+                add(
+                    "whole",
+                    on(Target::Instance {
+                        instance: "face".into(),
+                    }),
+                ),
+                add("none", on(element("no such element"))),
+            ],
+        );
+        app.update();
+        assert!(only::<TransformGizmo>(&mut app).is_none(), "nothing yet");
+        assert_eq!(app.world().resource::<ControlCommands>().0.len(), 4);
+
+        let node = app.world_mut().spawn(Transform::default()).id();
+        {
+            let mut face = app.world_mut().get_mut::<EntityInstance>(face).unwrap();
+            face.bindings.elements.insert(
+                "eye".into(),
+                ElementTargets {
+                    node,
+                    mesh: None,
+                    morph: None,
+                },
+            );
+            face.bindings.indexed = true;
+        }
+        app.update();
+        let controls = app.world().resource::<Controls>();
+        let (eye, whole) = (
+            controls.gizmo("eye").expect("the element's control"),
+            controls.gizmo("whole").expect("the instance's control"),
+        );
+        assert!(
+            controls.gizmo("none").is_none(),
+            "an unknown element is refused"
+        );
+        let eye = app.world().get::<TransformGizmo>(eye).unwrap();
+        assert_eq!((eye.target, eye.interactive), (node, false));
+        assert_eq!(
+            app.world().get::<TransformGizmo>(whole).unwrap().target,
+            face
+        );
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+    }
+
+    /// A change waiting for the gizmo its add spawns holds what follows
+    /// under its key: a later add replaces the control the change was for,
+    /// and is left as it was added.
+    #[test]
+    fn a_waiting_change_holds_a_later_add_behind_it() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        queue(
+            &mut app,
+            [
+                add("k", goal_at([0.0, 0.0, 1.0])),
+                configure("k", None, Some(false)),
+                add("k", goal_at([0.0, 0.0, 2.0])),
+            ],
+        );
+        app.update();
+        app.update();
+        let gizmo = only::<TransformGizmo>(&mut app).unwrap();
+        let gizmo = app.world().get::<TransformGizmo>(gizmo).unwrap();
+        assert!(gizmo.interactive, "the later add is left as added");
+        let goal = app.world().get::<Transform>(gizmo.target).unwrap();
+        let wanted = Pose {
+            position: [0.0, 0.0, 2.0],
+            rotation: no_turn(),
+        }
+        .to_world(&y_up());
+        assert!(goal.translation.abs_diff_eq(wanted.translation, 1e-5));
+    }
+
+    /// A show for a key nothing will add is dropped, rather than waiting,
+    /// and asking for a frame, for good.
+    #[test]
+    fn a_show_for_a_key_nothing_will_add_is_dropped() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        app.update();
+        frames_asked(&mut app);
+        send(
+            &mut app,
+            ControlCommand::Show {
+                key: "nobody".into(),
+                visible: false,
+            },
+        );
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+        assert_eq!(
+            frames_asked(&mut app),
+            0,
+            "a dropped show asks for no frame"
+        );
+        app.update();
+        app.update();
+        assert_eq!(frames_asked(&mut app), 0, "the view can idle");
     }
 
     /// The JSON a host sends for a fade and an inert control reads as meant.
