@@ -69,9 +69,12 @@
 //! 1. The add spawns an entity carrying a [`JointRequest`], placed under its
 //!    key like any other control. Keys, order, removal, showing, configuring
 //!    and events all act on that entity as on any other control's.
-//! 2. In [`ControlSystems::Joints`], the host's resolver puts a
-//!    [`JointGizmo`] on each request entity it can resolve, built from its rig
-//!    and the request's [`camera`](JointRequest::camera).
+//! 2. In [`ControlSystems::Joints`], in the [`ControlPass`] schedule — added
+//!    with `app.add_systems(ControlPass, resolver.in_set(ControlSystems::Joints))`
+//!    — the host's resolver puts a [`JointGizmo`] on each request entity it
+//!    can resolve, built from its rig and the request's
+//!    [`camera`](JointRequest::camera). It runs after every pass, so a joint
+//!    added in any pass is resolved before the next.
 //! 3. Then this module finishes it: names it by its key, makes it report
 //!    rather than move, and gives it the colour the add asked for. A request
 //!    nothing resolved is dropped, and said in the log — which is all a host
@@ -99,9 +102,13 @@
 //!   its control's gizmo, which an add spawns at the end of its pass, or for
 //!   an add still to come. A change for a key nothing will add is dropped, so
 //!   it does not ask for frames for good.
-//! - Commands are carried out in two passes a frame, the gizmos an add spawns
-//!   being there for the second, so a change sent with its control's add
-//!   takes hold the frame the control first shows.
+//! - **A change sent with its control's add takes hold the frame the control
+//!   first shows**, however many replacements the batch chains under its
+//!   key. Commands are carried out in passes, each [`ControlPass`], and the
+//!   gizmos a pass spawns are there for the next; a frame runs another pass
+//!   while the last took something off the queue and left a change for a
+//!   control now placed, up to a small limit past which the rest waits for
+//!   the next frame and the log says so.
 //! - A control whose gizmo went with its instance is forgotten, and its key is
 //!   free again.
 
@@ -387,7 +394,8 @@ pub struct ControlCamera;
 /// A joint control waiting for its host to resolve it
 /// ([module docs](self#joint-controls-jointrequest)).
 ///
-/// The host's resolver, in [`ControlSystems::Joints`], puts a [`JointGizmo`]
+/// The host's resolver, in [`ControlSystems::Joints`] of [`ControlPass`],
+/// puts a [`JointGizmo`]
 /// on the entity carrying this, built from its rig for `joint` on `instance`
 /// and used through `camera`, standing where the joint stands now, in the
 /// joint's own colour. It leaves the key, whether the gizmo moves the body,
@@ -540,21 +548,45 @@ pub const FADE_SECS: f32 = 0.2;
 /// The controls' systems, for another system to order itself against.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ControlSystems {
-    /// Everything that carries out commands: both passes, and
-    /// [`Joints`](Self::Joints) between them.
+    /// In `Update`: carrying out commands, every pass of [`ControlPass`] the
+    /// frame takes.
     Commands,
-    /// Where a host resolves joint requests: after the first pass has spawned
-    /// them, before they are finished for the second.
+    /// In [`ControlPass`]: where a host resolves joint requests, after the
+    /// pass has spawned them and before they are finished for the next.
     Joints,
-    /// The fade toward the opacity each control was asked for.
+    /// In `Update`: the fade toward the opacity each control was asked for.
     Fade,
 }
 
-/// The two passes, either side of the joints.
+/// One pass over the commands waiting: carry them out, let the host resolve
+/// the joint requests the pass spawned ([`ControlSystems::Joints`]), and
+/// finish them. Run from `Update`, in [`ControlSystems::Commands`], as many
+/// times a frame as the commands need ([module docs](self#the-rules)).
+///
+/// A schedule of its own because a pass is repeated: a host's joint
+/// resolver goes here, so it runs between every two passes, rather than in
+/// `Update`, where it would run once.
+#[derive(bevy::ecs::schedule::ScheduleLabel, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ControlPass;
+
+/// The most passes a frame takes. Each pass a batch needs beyond the first
+/// is one more replacement chained under a key in it, so a host reaching
+/// this is sending something stranger than a driver would; what is left
+/// waits for the next frame, and the log says so.
+const MOST_PASSES: usize = 8;
+
+/// A pass, either side of the joints.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 enum Pass {
-    First,
-    Second,
+    CarryOut,
+    Finish,
+}
+
+/// What the last pass found: whether another would carry out more of what
+/// is waiting.
+#[derive(Resource, Default)]
+struct PassOutcome {
+    again: bool,
 }
 
 /// Commands, events and presses for every host's controls
@@ -576,22 +608,32 @@ impl Plugin for ControlsPlugin {
             .init_resource::<ControlPresses>()
             .init_resource::<Controls>()
             .init_resource::<DefaultDriverFrame>()
-            .add_message::<RequestRedraw>()
-            // Twice, the gizmos an add spawns being there for the second: a
-            // change sent with its control's add then takes hold the frame
-            // the control first shows, rather than one frame later, live and
-            // at full strength in between. Both before the gizmos' own drag
-            // handling, so a left press in the frame a control is made inert
-            // does not take it. A press with another button is reported in
-            // `PreUpdate`, before either pass, so one in that frame can still
-            // reach the host: a press and a change arriving between the same
-            // two frames have no order to keep.
+            .init_resource::<PassOutcome>()
+            .add_message::<RequestRedraw>();
+        // Small and run several times a frame, so on one thread: the cost of
+        // handing a few systems to a pool would outweigh the work. It applies
+        // the commands its systems leave as it ends, so a pass's spawns are
+        // there for the next.
+        let mut pass = Schedule::new(ControlPass);
+        pass.set_executor(bevy::ecs::schedule::SingleThreadedExecutor::new());
+        app.add_schedule(pass)
             .configure_sets(
-                Update,
-                (Pass::First, ControlSystems::Joints, Pass::Second)
-                    .chain()
-                    .in_set(ControlSystems::Commands),
+                ControlPass,
+                (Pass::CarryOut, ControlSystems::Joints, Pass::Finish).chain(),
             )
+            .add_systems(
+                ControlPass,
+                (
+                    carry_out.in_set(Pass::CarryOut),
+                    finish_joints.in_set(Pass::Finish),
+                ),
+            )
+            // Before the gizmos' own drag handling, so a left press in the
+            // frame a control is made inert does not take it. A press with
+            // another button is reported in `PreUpdate`, before any pass, so
+            // one in that frame can still reach the host: a press and a
+            // change arriving between the same two frames have no order to
+            // keep.
             .configure_sets(
                 Update,
                 (ControlSystems::Commands, ControlSystems::Fade)
@@ -601,8 +643,7 @@ impl Plugin for ControlsPlugin {
             .add_systems(
                 Update,
                 (
-                    carry_out.in_set(Pass::First),
-                    (finish_joints, carry_out).chain().in_set(Pass::Second),
+                    run_passes.in_set(ControlSystems::Commands),
                     // After the commands, so a control added this frame is
                     // hidden in it, and before the fade reads whether a
                     // control shows.
@@ -616,6 +657,22 @@ impl Plugin for ControlsPlugin {
             .add_observer(report_joint_drag)
             .add_observer(report_press);
     }
+}
+
+/// Runs [`ControlPass`] until a pass leaves nothing that another would carry
+/// out, at most [`MOST_PASSES`] times. The commands a pass leaves land when
+/// it ends, so the gizmos it spawned are there for the next.
+fn run_passes(world: &mut World) {
+    for _ in 0..MOST_PASSES {
+        world.run_schedule(ControlPass);
+        if !world.resource::<PassOutcome>().again {
+            return;
+        }
+    }
+    log::warn!(
+        "control commands still waiting on gizmos after {MOST_PASSES} passes; \
+         the rest wait for the next frame"
+    );
 }
 
 /// Where `entity` stands in the world as the transforms say now. Its
@@ -808,7 +865,9 @@ fn carry_out(
     mut transform_gizmos: Query<&mut TransformGizmo>,
     mut joint_gizmos: Query<&mut JointGizmo>,
     mut redraw: MessageWriter<RequestRedraw>,
+    mut outcome: ResMut<PassOutcome>,
 ) {
+    outcome.again = false;
     // A control whose gizmo is gone went with the instance it was on, or was
     // a joint its host could not resolve; its key is free again.
     controls
@@ -832,6 +891,7 @@ fn carry_out(
     // it lacks. What a control on it waits for.
     let coming = |name: &str| loading.iter().any(|loading| loading.instance == name);
     let asked = std::mem::take(&mut pending.0);
+    let asked_count = asked.len();
     // Keys an add is coming for, in this batch or waiting from an earlier one.
     let adding: HashSet<String> = asked
         .iter()
@@ -1052,7 +1112,7 @@ fn carry_out(
                 let target = placed.and_then(|p| p.target);
                 let frame = placed.map(|p| DriverFrame::of(p.camera, &frames, &app_frame));
                 // A goal added in this pass is spawned at the end of it, so it
-                // has no transform yet; the pose waits for the second pass, as
+                // has no transform yet; the pose waits for the next pass, as
                 // one set before the add would.
                 let (Some(target), Some(frame)) =
                     (target.filter(|t| transforms.contains(*t)), frame)
@@ -1106,8 +1166,8 @@ fn carry_out(
             } => {
                 // A control added in this pass is spawned at the end of it,
                 // and a joint control resolved between the passes, so its
-                // gizmo is not there yet; the change waits for the second
-                // pass, as one made before the add would.
+                // gizmo is not there yet; the change waits for the next pass,
+                // as one made before the add would.
                 let gizmo = controls.0.get(&key).map(|placed| placed.gizmo);
                 let spawned = gizmo.is_some_and(|gizmo| {
                     transform_gizmos.contains(gizmo) || joint_gizmos.contains(gizmo)
@@ -1232,6 +1292,15 @@ fn carry_out(
             }
         }
     }
+    // Another pass, if this one took something off the queue and left a
+    // change for a control now placed: its gizmo, spawned or resolved as
+    // this pass ends, is there for the next. That covers a change sent with
+    // its add, before or after it. What waits on anything else — an
+    // instance, a camera, an add not yet sent — another pass cannot help.
+    let on_spawn = waiting.iter().any(|command| {
+        !matches!(command, ControlCommand::Add { .. }) && controls.0.contains_key(command.key())
+    });
+    outcome.again = on_spawn && waiting.len() < asked_count;
     pending.0 = waiting;
     if again {
         redraw.write(RequestRedraw);
@@ -1405,7 +1474,7 @@ mod tests {
     /// `robot` puts it there.
     fn scene() -> (App, Entity) {
         let mut app = bare();
-        app.add_systems(Update, resolve_joints.in_set(ControlSystems::Joints));
+        app.add_systems(ControlPass, resolve_joints.in_set(ControlSystems::Joints));
         app.world_mut().spawn(ControlCamera);
         app.world_mut().spawn(Loading {
             instance: ROBOT.into(),
@@ -2469,7 +2538,7 @@ mod tests {
     }
 
     /// An instance that arrives through commands before the passes leaves
-    /// both passes to a control waiting on it: a change sent with its add
+    /// every pass to a control waiting on it: a change sent with its add
     /// holds from the control's first frame.
     #[test]
     fn a_control_waiting_on_its_robot_first_shows_as_asked() {
@@ -2661,7 +2730,7 @@ mod tests {
     #[test]
     fn a_later_add_outlasts_a_goal_waiting_for_a_camera() {
         let mut app = bare();
-        app.add_systems(Update, resolve_joints.in_set(ControlSystems::Joints));
+        app.add_systems(ControlPass, resolve_joints.in_set(ControlSystems::Joints));
         let own = app.world_mut().spawn_empty().id();
         let body = app.world_mut().spawn(Transform::default()).id();
         app.world_mut().spawn((rig(body), instance(ROBOT, own)));
@@ -2976,6 +3045,102 @@ mod tests {
         }
         .to_world(&y_up());
         assert!(goal.translation.abs_diff_eq(wanted.translation, 1e-5));
+    }
+
+    /// Changes sent with their adds hold from each control's first frame
+    /// however many replacements a batch chains under one key: the control
+    /// left draws its first frame dimmed and inert as asked, not at full
+    /// strength fading down.
+    #[test]
+    fn a_change_holds_from_the_first_frame_through_chained_replacements() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        queue(
+            &mut app,
+            [
+                add("k", goal_at([0.0, 0.0, 1.0])),
+                configure("k", None, Some(true)),
+                add("k", goal_at([0.0, 0.0, 2.0])),
+                configure("k", Some(0.25), Some(false)),
+            ],
+        );
+        app.update();
+        let gizmo = only::<TransformGizmo>(&mut app).expect("the later control");
+        let gizmo = app.world().get::<TransformGizmo>(gizmo).unwrap();
+        assert_eq!((gizmo.opacity, gizmo.interactive), (0.25, false));
+        let wanted = Pose {
+            position: [0.0, 0.0, 2.0],
+            rotation: no_turn(),
+        }
+        .to_world(&y_up());
+        let goal = app.world().get::<Transform>(gizmo.target).unwrap();
+        assert!(goal.translation.abs_diff_eq(wanted.translation, 1e-5));
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+    }
+
+    /// A batch chaining more replacements under a key than a frame's passes
+    /// carry out stops at the limit rather than running on, and the rest
+    /// lands, in order, in the frames after.
+    #[test]
+    fn a_chain_longer_than_a_frame_s_passes_finishes_in_the_next() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        let links = MOST_PASSES + 3;
+        queue(
+            &mut app,
+            (0..links).flat_map(|link| {
+                [
+                    add("k", goal_at([0.0, 0.0, link as f32])),
+                    configure("k", Some(0.25), Some(link.is_multiple_of(2))),
+                ]
+            }),
+        );
+        app.update();
+        assert!(
+            !app.world().resource::<ControlCommands>().0.is_empty(),
+            "the rest waits for the next frame"
+        );
+        app.update();
+        app.update();
+        assert!(app.world().resource::<ControlCommands>().0.is_empty());
+        let gizmo = only::<TransformGizmo>(&mut app).unwrap();
+        let gizmo = app.world().get::<TransformGizmo>(gizmo).unwrap();
+        assert_eq!(
+            (gizmo.opacity, gizmo.interactive),
+            (0.25, (links - 1).is_multiple_of(2))
+        );
+        let goal = app.world().get::<Transform>(gizmo.target).unwrap();
+        let last = Pose {
+            position: [0.0, 0.0, (links - 1) as f32],
+            rotation: no_turn(),
+        }
+        .to_world(&y_up());
+        assert!(goal.translation.abs_diff_eq(last.translation, 1e-5));
+    }
+
+    /// A joint control added in a later pass of a frame is resolved by its
+    /// host before the changes sent with it apply, in the same frame.
+    #[test]
+    fn a_joint_added_in_a_later_pass_is_resolved_in_the_frame() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        queue(
+            &mut app,
+            [
+                add("k", goal_at([0.0, 0.0, 1.0])),
+                configure("k", None, Some(true)),
+                add("k", joint_on(ROBOT)),
+                configure("k", Some(0.25), Some(false)),
+            ],
+        );
+        app.update();
+        assert!(only::<TransformGizmo>(&mut app).is_none(), "replaced");
+        let joint = only::<JointGizmo>(&mut app).expect("resolved in the frame");
+        let joint = app.world().get::<JointGizmo>(joint).unwrap();
+        assert_eq!(
+            (joint.key.as_str(), joint.opacity, joint.interactive),
+            ("k", 0.25, false)
+        );
     }
 
     /// A show for a key nothing will add is dropped, rather than waiting,
