@@ -135,7 +135,8 @@ impl Report {
 /// not read.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Part {
-    /// The mesh's index in the document and its name, when it has one.
+    /// The mesh's index in the document, and the name its parts are reported
+    /// under: the mesh's own, or else that of the first node drawing it.
     pub mesh: usize,
     pub mesh_name: Option<String>,
     pub primitive: usize,
@@ -283,7 +284,7 @@ pub(crate) fn optimize(json: &Value, bin: &mut [u8], mode: Mode) -> Report {
     let reader_ranges = Document { json, bin: &*bin }.reader_ranges();
     let meshes = json.get("meshes").and_then(Value::as_array);
     for (m, mesh) in meshes.into_iter().flatten().enumerate() {
-        let mesh_name = mesh.get("name").and_then(Value::as_str).map(str::to_owned);
+        let mesh_name = part_name(json, m, mesh);
         let target_names: Vec<String> = mesh
             .pointer("/extras/targetNames")
             .and_then(Value::as_array)
@@ -341,6 +342,27 @@ pub(crate) fn optimize(json: &Value, bin: &mut [u8], mode: Mode) -> Report {
         }
     }
     report
+}
+
+/// What mesh `m`'s parts are reported under: the mesh's name, or when it has
+/// none, the name of the first node that draws it. Exporters differ in which
+/// of the two carries the author's name (Blender names both, three.js only
+/// the node), and a report naming parts "mesh 5" cannot be read against the
+/// model.
+fn part_name(json: &Value, m: usize, mesh: &Value) -> Option<String> {
+    let named = |v: &Value| {
+        v.get("name")
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned)
+    };
+    named(mesh).or_else(|| {
+        json.get("nodes")
+            .and_then(Value::as_array)?
+            .iter()
+            .filter(|node| node.get("mesh").and_then(Value::as_u64) == Some(m as u64))
+            .find_map(named)
+    })
 }
 
 /// The default weights mesh `m` is shown with when nothing drives it, each

@@ -969,3 +969,41 @@ fn a_flat_part_is_reported_flat() {
     let optimized = optimize_morph_triangles(&build(&[spec]).bytes, Mode::Safe).unwrap();
     assert!(optimized.report.parts[0].flat);
 }
+
+#[test]
+fn a_part_is_named_by_its_mesh_or_else_by_the_node_drawing_it() {
+    let name = |edit: fn(&mut serde_json::Value)| {
+        let bytes = with_json(&build(&[mouth(6)]).bytes, edit);
+        optimize_morph_triangles(&bytes, Mode::Safe)
+            .unwrap()
+            .report
+            .parts[0]
+            .mesh_name
+            .clone()
+    };
+    assert_eq!(
+        name(|doc| doc["nodes"][0]["name"] = json!("face")),
+        Some("mouth".into())
+    );
+    assert_eq!(
+        name(|doc| {
+            doc["meshes"][0].as_object_mut().unwrap().remove("name");
+            doc["nodes"][0]["name"] = json!("face");
+        }),
+        Some("face".into())
+    );
+    assert_eq!(
+        name(|doc| {
+            doc["meshes"][0]["name"] = json!("");
+            doc["nodes"][0]["name"] = json!("face");
+        }),
+        Some("face".into())
+    );
+    assert_eq!(
+        name(|doc| {
+            doc["meshes"][0].as_object_mut().unwrap().remove("name");
+            doc["nodes"][0].as_object_mut().unwrap().remove("name");
+        }),
+        None
+    );
+}
