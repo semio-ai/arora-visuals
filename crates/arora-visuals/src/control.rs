@@ -471,6 +471,27 @@ impl ControlCommands {
     /// control's and stays, as does a remove, which is never held: what
     /// follows a remove is not the forgotten add's.
     pub fn forget_instance(&mut self, instance: &str, controls: &Controls) {
+        self.forget_adds(controls, |control| control.instance() == Some(instance));
+    }
+
+    /// Drops the goal adds waiting for the view named `view`, for a view a
+    /// host has taken away before they were placed, with every change that is
+    /// theirs, by the rule [`forget_instance`](Self::forget_instance) gives.
+    /// A goal already placed through it goes with its camera.
+    pub fn forget_view(&mut self, view: &str, controls: &Controls) {
+        self.forget_adds(controls, |control| {
+            matches!(
+                control,
+                Control::Transform {
+                    target: Target::Goal { view: Some(named), .. },
+                    ..
+                } if named == view
+            )
+        });
+    }
+
+    /// Drops the adds `forgotten` picks, with every change that is theirs.
+    fn forget_adds(&mut self, controls: &Controls, forgotten: impl Fn(&Control) -> bool) {
         /// One key's commands, as far as the walk has read them.
         struct Run {
             /// Changes since the key's last remove with no control before
@@ -492,7 +513,7 @@ impl ControlCommands {
                 dropping: false,
             });
             match command {
-                ControlCommand::Add { control, .. } if control.instance() == Some(instance) => {
+                ControlCommand::Add { control, .. } if forgotten(control) => {
                     keep[at] = false;
                     for loose in run.loose.drain(..) {
                         keep[loose] = false;
@@ -4229,6 +4250,31 @@ mod tests {
                 ("j", "show")
             ]
         );
+    }
+
+    /// Forgetting a view takes the goal adds that name it, with their
+    /// changes, and leaves a goal on another view and adds on instances.
+    #[test]
+    fn forgetting_a_view_takes_the_goals_waiting_for_it() {
+        let goal_on = |view: &str| {
+            let mut control = goal_at([0.0, 0.0, 1.0]);
+            if let Control::Transform {
+                target: Target::Goal { view: named, .. },
+                ..
+            } = &mut control
+            {
+                *named = Some(view.into());
+            }
+            control
+        };
+        let mut commands = ControlCommands(vec![
+            add("g", goal_on("face-a")),
+            show("g", false),
+            add("h", goal_on("face-b")),
+            add("k", joint_on("robot-1")),
+        ]);
+        commands.forget_view("face-a", &Controls::default());
+        assert_eq!(left(&commands), [("h", "add"), ("k", "add on robot-1")]);
     }
 
     /// A remove is never held, so one behind a forgotten add stays, and ends
