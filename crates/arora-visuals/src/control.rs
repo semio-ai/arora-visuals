@@ -584,7 +584,7 @@ impl From<DragPhase> for Phase {
 
 /// A drag on a control: what it asks its target to become. Nothing has moved;
 /// the driver writes the change if it wants it.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlEvent {
     pub key: String,
@@ -615,7 +615,7 @@ pub enum PressButton {
 /// A press with a button other than the primary on a control, which is the
 /// host's to act on (to open a menu for it, say). It moves nothing, and turns
 /// and pans no view.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlPress {
     pub key: String,
