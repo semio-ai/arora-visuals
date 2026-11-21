@@ -72,6 +72,17 @@
 //! view the driver meant. The camera also decides which [`DriverFrame`] the
 //! control's poses are in.
 //!
+//! # How big a control is: [`ControlSize`]
+//!
+//! A control's size is one of its properties: an add or a `configure` may
+//! give it (`size`), in pixels on screen or metres in the world. A control
+//! given none takes its view's: the [`ControlSize`] on the camera it is used
+//! through, which a host sets where its world is not robot-sized — a face
+//! authored tens of units across, say — so that every driver's controls are
+//! sized for it without each knowing the world's units. With neither, a
+//! transform control is [`GIZMO_SIZE`](crate::transform_gizmo::GIZMO_SIZE)
+//! and a joint control what its host resolved it at.
+//!
 //! # Joint controls: [`JointRequest`]
 //!
 //! What a joint is — which body it moves, about which axis, between which
@@ -179,8 +190,8 @@ use crate::ghost::Ghost;
 use crate::instance::{EntityInstance, Loading, Superseded};
 use crate::joint_gizmo::{JointDrag, JointGizmo};
 use crate::transform_gizmo::{
-    current_global, DragPhase, GizmoDrag, GizmoHandle, GizmoPress, GizmoSpace, TransformGizmo,
-    TransformGizmoSystems, TransformModes,
+    current_global, DragPhase, GizmoDrag, GizmoHandle, GizmoPress, GizmoSize, GizmoSpace,
+    TransformGizmo, TransformGizmoSystems, TransformModes,
 };
 
 /// A pose as a driver sees it: Z up, in metres, with the rotation as a
@@ -330,6 +341,9 @@ pub enum Control {
         /// A CSS hex colour; the joint's own when absent.
         #[serde(default)]
         color: Option<String>,
+        /// Its size; its view's when absent ([`ControlSize`]).
+        #[serde(default)]
+        size: Option<GizmoSize>,
     },
     Transform {
         target: Target,
@@ -343,6 +357,9 @@ pub enum Control {
         /// absent.
         #[serde(default)]
         colors: Option<[String; 3]>,
+        /// Its size; its view's when absent ([`ControlSize`]).
+        #[serde(default)]
+        size: Option<GizmoSize>,
     },
 }
 
@@ -382,7 +399,7 @@ pub enum ControlCommand {
     },
     /// Changes how a control looks or works, in place: a joint control's
     /// `color`, a transform control's `colors` and whether it is `local`, and
-    /// for either its `opacity` and whether it is `interactive`. What is
+    /// for either its `size`, its `opacity` and whether it is `interactive`. What is
     /// absent stays as it is, and what the control's kind does not take is
     /// ignored, so one command can recolour controls of both kinds.
     ///
@@ -405,6 +422,9 @@ pub enum ControlCommand {
         opacity: Option<f32>,
         #[serde(default)]
         interactive: Option<bool>,
+        /// Its size from now on, in place of its view's ([`ControlSize`]).
+        #[serde(default)]
+        size: Option<GizmoSize>,
     },
     /// Draws a control as the one under the pointer is drawn, or stops: a
     /// host pointing at it from elsewhere. `handle` names one handle of a
@@ -563,6 +583,15 @@ pub struct JointRequest {
     colour: Option<Color>,
 }
 
+/// The size of the controls used through this camera that are given none of
+/// their own ([module docs](self#how-big-a-control-is-controlsize)). A kind
+/// left `None` keeps its own default.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ControlSize {
+    pub transform: Option<GizmoSize>,
+    pub joint: Option<GizmoSize>,
+}
+
 /// Where a drag is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -666,6 +695,8 @@ struct Placed {
     resolving: bool,
     /// The opacity the host asked for, which the gizmo's fades toward.
     opacity: f32,
+    /// The size its driver gave it, over its view's.
+    size: Option<GizmoSize>,
     /// The fade toward `opacity` under way, if one is.
     fade: Option<Fade>,
     /// Whether its gizmo shows: drawn, and hidden neither by the host nor by
@@ -692,6 +723,7 @@ impl Placed {
             interactive: true,
             resolving: false,
             opacity: 1.0,
+            size: None,
             fade: None,
             shown: false,
         }
@@ -818,6 +850,11 @@ impl Plugin for ControlsPlugin {
                 Update,
                 (
                     run_passes.in_set(ControlSystems::Commands),
+                    // After the commands, so a control added or resized this
+                    // frame is drawn at its size in it.
+                    size_controls
+                        .after(ControlSystems::Commands)
+                        .before(hide_ghosted),
                     // After the commands, so a control added this frame is
                     // hidden in it, and before the fade reads whether a
                     // control shows.
@@ -834,6 +871,32 @@ impl Plugin for ControlsPlugin {
             .add_observer(report_transform_drag)
             .add_observer(report_joint_drag)
             .add_observer(report_press);
+    }
+}
+
+/// Sizes each control's gizmo: the size its driver gave it, else its view's
+/// ([`ControlSize`]). One given neither keeps the size it has.
+fn size_controls(
+    controls: Res<Controls>,
+    views: Query<&ControlSize>,
+    mut transform_gizmos: Query<&mut TransformGizmo>,
+    mut joint_gizmos: Query<&mut JointGizmo>,
+) {
+    for placed in controls.0.values() {
+        let view = views.get(placed.camera).ok();
+        if let Ok(gizmo) = transform_gizmos.get_mut(placed.gizmo) {
+            if let Some(size) = placed.size.or(view.and_then(|view| view.transform)) {
+                gizmo
+                    .map_unchanged(|gizmo| &mut gizmo.size)
+                    .set_if_neq(size);
+            }
+        } else if let Ok(gizmo) = joint_gizmos.get_mut(placed.gizmo) {
+            if let Some(size) = placed.size.or(view.and_then(|view| view.joint)) {
+                gizmo
+                    .map_unchanged(|gizmo| &mut gizmo.size)
+                    .set_if_neq(size);
+            }
+        }
     }
 }
 
@@ -1340,7 +1403,9 @@ fn carry_out(
                 again = true;
                 let root = on.map(|(root, _)| root);
                 let placed = match control {
-                    Control::Joint { joint, color, .. } => {
+                    Control::Joint {
+                        joint, color, size, ..
+                    } => {
                         let Some(root) = root else {
                             continue;
                         };
@@ -1353,6 +1418,7 @@ fn carry_out(
                         };
                         Placed {
                             resolving: true,
+                            size,
                             ..Placed::new(
                                 commands.spawn(request).id(),
                                 None,
@@ -1367,6 +1433,7 @@ fn carry_out(
                         modes,
                         local,
                         colors,
+                        size,
                     } => {
                         let (target, goal) = match (target, asked) {
                             (Some(target), _) => (target, None),
@@ -1404,7 +1471,10 @@ fn carry_out(
                                 ..base
                             })
                             .id();
-                        Placed::new(gizmo, Some(target), goal, camera, root)
+                        Placed {
+                            size,
+                            ..Placed::new(gizmo, Some(target), goal, camera, root)
+                        }
                     }
                 };
                 // Changes waiting for an add are this control's now, and act
@@ -1527,6 +1597,7 @@ fn carry_out(
                 local,
                 opacity,
                 interactive,
+                size,
             } => {
                 // A control added in this pass is spawned at the end of it,
                 // and a joint control resolved between the passes, so its
@@ -1553,6 +1624,7 @@ fn carry_out(
                                 local,
                                 opacity,
                                 interactive,
+                                size,
                             },
                         );
                     } else {
@@ -1580,13 +1652,18 @@ fn carry_out(
                         });
                     }
                 }
+                // Kept on the control and put on its gizmo by
+                // `size_controls`, over its view's.
+                if let (Some(size), Some(placed)) = (size, controls.0.get_mut(&key)) {
+                    placed.size = Some(size);
+                }
                 // Kept on the control, which a hidden gizmo's `interactive`
                 // is not: it comes back when the control shows again.
                 if let (Some(interactive), Some(placed)) = (interactive, controls.0.get_mut(&key)) {
                     placed.interactive = interactive;
                 }
                 // Neither kind's own: one command may carry these for both.
-                let common = opacity.is_some() || interactive.is_some();
+                let common = opacity.is_some() || interactive.is_some() || size.is_some();
                 if let Ok(mut gizmo) = transform_gizmos.get_mut(gizmo) {
                     if let Some(opacity) = at_once {
                         gizmo.opacity = opacity;
@@ -2020,6 +2097,7 @@ mod tests {
             instance: instance.into(),
             joint: TILT.into(),
             color: None,
+            size: None,
         }
     }
 
@@ -2223,6 +2301,7 @@ mod tests {
                     instance: ROBOT.into(),
                     joint: "nothing drives this".into(),
                     color: None,
+                    size: None,
                 },
             ),
         );
@@ -2254,6 +2333,7 @@ mod tests {
                     instance: ROBOT.into(),
                     joint: TILT.into(),
                     color: Some("#ff0000".into()),
+                    size: None,
                 },
             ),
         );
@@ -2328,6 +2408,7 @@ mod tests {
                     modes: None,
                     local: false,
                     colors: None,
+                    size: None,
                 },
             ),
         );
@@ -2419,7 +2500,80 @@ mod tests {
             modes: None,
             local: false,
             colors: None,
+            size: None,
         }
+    }
+
+    /// A control given no size takes its view's, one given a size keeps it
+    /// over its view's, and a `configure` resizes it; a joint control takes
+    /// its view's joint size.
+    #[test]
+    fn a_control_takes_its_views_size_unless_given_its_own() {
+        let (mut app, body) = scene();
+        let view = camera(app.world_mut());
+        app.world_mut().entity_mut(view).insert(ControlSize {
+            transform: Some(GizmoSize::Pixels(80.0)),
+            joint: Some(GizmoSize::World(0.5)),
+        });
+        robot(&mut app, body);
+        let whole = |size: Option<GizmoSize>| Control::Transform {
+            target: Target::Instance {
+                instance: ROBOT.into(),
+            },
+            modes: None,
+            local: false,
+            colors: None,
+            size,
+        };
+        send(&mut app, add("viewed", whole(None)));
+        send(&mut app, add("own", whole(Some(GizmoSize::World(1.0)))));
+        send(&mut app, add("joint", joint_on(ROBOT)));
+        let size_of = |app: &App, key: &str| {
+            let gizmo = app.world().resource::<Controls>().gizmo(key).unwrap();
+            app.world()
+                .get::<TransformGizmo>(gizmo)
+                .map(|gizmo| gizmo.size)
+                .or_else(|| app.world().get::<JointGizmo>(gizmo).map(|gizmo| gizmo.size))
+                .unwrap()
+        };
+        assert_eq!(size_of(&app, "viewed"), GizmoSize::Pixels(80.0));
+        assert_eq!(size_of(&app, "own"), GizmoSize::World(1.0));
+        assert_eq!(size_of(&app, "joint"), GizmoSize::World(0.5));
+
+        send(
+            &mut app,
+            ControlCommand::Configure {
+                key: "viewed".into(),
+                color: None,
+                colors: None,
+                local: None,
+                opacity: None,
+                interactive: None,
+                size: Some(GizmoSize::Pixels(40.0)),
+            },
+        );
+        assert_eq!(size_of(&app, "viewed"), GizmoSize::Pixels(40.0));
+        // The view's size no longer reaches a control given its own.
+        app.world_mut().entity_mut(view).insert(ControlSize {
+            transform: Some(GizmoSize::Pixels(120.0)),
+            joint: None,
+        });
+        app.update();
+        assert_eq!(size_of(&app, "viewed"), GizmoSize::Pixels(40.0));
+    }
+
+    /// A driver writes a size in pixels or in metres.
+    #[test]
+    fn a_size_reads_in_pixels_or_metres() {
+        let read = |json: serde_json::Value| -> GizmoSize { serde_json::from_value(json).unwrap() };
+        assert_eq!(
+            read(serde_json::json!({ "pixels": 80 })),
+            GizmoSize::Pixels(80.0)
+        );
+        assert_eq!(
+            read(serde_json::json!({ "metres": 0.25 })),
+            GizmoSize::World(0.25)
+        );
     }
 
     fn goal_at(position: [f32; 3]) -> Control {
@@ -2434,6 +2588,7 @@ mod tests {
             modes: None,
             local: false,
             colors: None,
+            size: None,
         }
     }
 
@@ -2586,6 +2741,7 @@ mod tests {
                 local: Some(true),
                 opacity: None,
                 interactive: None,
+                size: None,
             },
         );
         let configured = app.world().get::<TransformGizmo>(gizmo).unwrap();
@@ -2603,6 +2759,7 @@ mod tests {
                 local: None,
                 opacity: None,
                 interactive: None,
+                size: None,
             },
         );
         assert_eq!(
@@ -2678,6 +2835,7 @@ mod tests {
                     local: Some(true),
                     opacity: None,
                     interactive: None,
+                    size: None,
                 },
             ],
         );
@@ -2715,6 +2873,7 @@ mod tests {
                 local: None,
                 opacity: None,
                 interactive: None,
+                size: None,
             },
         );
         send(
@@ -2765,6 +2924,7 @@ mod tests {
             local: None,
             opacity,
             interactive,
+            size: None,
         }
     }
 
@@ -3172,6 +3332,7 @@ mod tests {
                     modes: None,
                     local: false,
                     colors: None,
+                    size: None,
                 },
             ),
         );
@@ -3265,6 +3426,7 @@ mod tests {
             modes: Some(vec![Mode::Rotate]),
             local: true,
             colors: None,
+            size: None,
         };
         send(&mut app, add("head", on("head")));
         send(&mut app, add("none", on("no such element")));
@@ -3297,6 +3459,7 @@ mod tests {
                     modes: None,
                     local: false,
                     colors: None,
+                    size: None,
                 },
             ),
         );
@@ -3365,6 +3528,7 @@ mod tests {
             modes: None,
             local: false,
             colors: None,
+            size: None,
         };
         let pose = Pose {
             position: [1.0, 2.0, 3.0],
@@ -3452,6 +3616,7 @@ mod tests {
             modes: None,
             local: false,
             colors: None,
+            size: None,
         };
         let element = |id: &str| Target::Element {
             instance: "face".into(),
@@ -3591,6 +3756,7 @@ mod tests {
             modes: None,
             local: false,
             colors: None,
+            size: None,
         };
         send(&mut app, add("k", whole("face")));
         let old = only::<TransformGizmo>(&mut app).expect("on the face");
@@ -3644,6 +3810,7 @@ mod tests {
             modes: None,
             local: false,
             colors: None,
+            size: None,
         };
         let to = Pose {
             position: [5.0, 0.0, 0.0],
@@ -4134,6 +4301,7 @@ mod tests {
             instance: ROBOT.into(),
             joint: "nothing drives this".into(),
             color: None,
+            size: None,
         };
         let no_element = Control::Transform {
             target: Target::Element {
@@ -4143,6 +4311,7 @@ mod tests {
             modes: None,
             local: false,
             colors: None,
+            size: None,
         };
         queue(
             &mut app,
@@ -4194,6 +4363,7 @@ mod tests {
                 instance: ROBOT.into(),
                 joint: "nothing drives this".into(),
                 color: None,
+                size: None,
             },
         ));
         batch.push(configure("k", Some(0.25), Some(false)));
@@ -4237,6 +4407,7 @@ mod tests {
                     instance: ROBOT.into(),
                     joint: "nothing drives this".into(),
                     color: None,
+                    size: None,
                 },
             ),
         );
@@ -4428,6 +4599,7 @@ mod tests {
             modes: None,
             local: false,
             colors: None,
+            size: None,
         };
         let mut app = bare();
         app.world_mut().spawn(ControlCamera);
@@ -4497,6 +4669,7 @@ mod tests {
                     modes: None,
                     local: false,
                     colors: None,
+                    size: None,
                 },
             ),
         );

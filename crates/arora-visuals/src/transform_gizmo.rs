@@ -129,12 +129,16 @@ pub enum GizmoSpace {
 /// or length. Every gizmo takes one, and the two kinds are a gizmo's whole
 /// sizing choice: this is drei `PivotControls`' `fixed` and `scale` as one
 /// value, so a size can never be read in the other kind's unit.
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// A driver writes one as `{ "pixels": 80 }` or `{ "metres": 0.25 }`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum GizmoSize {
     /// The same on screen however near or far, in logical pixels.
     Pixels(f32),
     /// Fixed in the world, in metres, so it shrinks with distance as what it
     /// moves does.
+    #[serde(rename = "metres")]
     World(f32),
 }
 
