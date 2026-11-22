@@ -360,6 +360,11 @@ pub enum Control {
         /// Its size; its view's when absent ([`ControlSize`]).
         #[serde(default)]
         size: Option<GizmoSize>,
+        /// Turn each arrow to the side of its axis facing the camera; on the
+        /// positive side when absent
+        /// ([`TransformGizmo::face_viewer`]).
+        #[serde(default, rename = "faceViewer")]
+        face_viewer: bool,
     },
 }
 
@@ -398,7 +403,8 @@ pub enum ControlCommand {
         scale: Option<[f32; 3]>,
     },
     /// Changes how a control looks or works, in place: a joint control's
-    /// `color`, a transform control's `colors` and whether it is `local`, and
+    /// `color`, a transform control's `colors`, whether it is `local` and
+    /// whether it `faceViewer`s, and
     /// for either its `size`, its `opacity` and whether it is `interactive`. What is
     /// absent stays as it is, and what the control's kind does not take is
     /// ignored, so one command can recolour controls of both kinds.
@@ -425,6 +431,8 @@ pub enum ControlCommand {
         /// Its size from now on, in place of its view's ([`ControlSize`]).
         #[serde(default)]
         size: Option<GizmoSize>,
+        #[serde(default, rename = "faceViewer")]
+        face_viewer: Option<bool>,
     },
     /// Draws a control as the one under the pointer is drawn, or stops: a
     /// host pointing at it from elsewhere. `handle` names one handle of a
@@ -1472,6 +1480,7 @@ fn carry_out(
                         local,
                         colors,
                         size,
+                        face_viewer,
                     } => {
                         let (target, goal) = match (target, asked) {
                             (Some(target), _) => (target, None),
@@ -1506,6 +1515,7 @@ fn carry_out(
                                 // Labelled as the driver names the axes.
                                 axes: frame.axes(),
                                 apply: false,
+                                face_viewer,
                                 ..base
                             })
                             .id();
@@ -1637,6 +1647,7 @@ fn carry_out(
                 opacity,
                 interactive,
                 size,
+                face_viewer,
             } => {
                 // A control added in this pass is spawned at the end of it,
                 // and a joint control resolved between the passes, so its
@@ -1664,6 +1675,7 @@ fn carry_out(
                                 opacity,
                                 interactive,
                                 size,
+                                face_viewer,
                             },
                         );
                     } else {
@@ -1720,7 +1732,15 @@ fn carry_out(
                             GizmoSpace::World
                         };
                     }
-                    if color.is_some() && colors.is_none() && local.is_none() && !common {
+                    if let Some(face_viewer) = face_viewer {
+                        gizmo.face_viewer = face_viewer;
+                    }
+                    if color.is_some()
+                        && colors.is_none()
+                        && local.is_none()
+                        && face_viewer.is_none()
+                        && !common
+                    {
                         log::warn!("{key:?} is a transform control; give it colors");
                     }
                 } else if let Ok(mut gizmo) = joint_gizmos.get_mut(gizmo) {
@@ -1733,7 +1753,10 @@ fn carry_out(
                     if let Some(colour) = color.as_deref().and_then(colour) {
                         gizmo.colour = colour;
                     }
-                    if color.is_none() && (colors.is_some() || local.is_some()) && !common {
+                    if color.is_none()
+                        && (colors.is_some() || local.is_some() || face_viewer.is_some())
+                        && !common
+                    {
                         log::warn!("{key:?} is a joint control; give it a color");
                     }
                 }
@@ -2448,6 +2471,7 @@ mod tests {
                     local: false,
                     colors: None,
                     size: None,
+                    face_viewer: false,
                 },
             ),
         );
@@ -2540,6 +2564,7 @@ mod tests {
             local: false,
             colors: None,
             size: None,
+            face_viewer: false,
         }
     }
 
@@ -2563,6 +2588,7 @@ mod tests {
             local: false,
             colors: None,
             size,
+            face_viewer: false,
         };
         send(&mut app, add("viewed", whole(None)));
         send(&mut app, add("own", whole(Some(GizmoSize::World(1.0)))));
@@ -2589,6 +2615,7 @@ mod tests {
                 opacity: None,
                 interactive: None,
                 size: Some(GizmoSize::Pixels(40.0)),
+                face_viewer: None,
             },
         );
         assert_eq!(size_of(&app, "viewed"), GizmoSize::Pixels(40.0));
@@ -2652,6 +2679,7 @@ mod tests {
             local: false,
             colors: None,
             size: None,
+            face_viewer: false,
         }
     }
 
@@ -2778,6 +2806,53 @@ mod tests {
         Srgba::hex("#ff0000").unwrap().into()
     }
 
+    /// A transform control keeps its arrows on the positive side unless
+    /// added or configured to face the viewer, and a configure can turn
+    /// that back off.
+    #[test]
+    fn a_transform_control_faces_the_viewer_only_when_asked() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        let gizmo = add_goal(&mut app, "goal", None);
+        let facing = |app: &App| {
+            app.world()
+                .get::<TransformGizmo>(gizmo)
+                .unwrap()
+                .face_viewer
+        };
+        assert!(!facing(&app), "positive by default");
+        let configure = |face_viewer| ControlCommand::Configure {
+            key: "goal".into(),
+            color: None,
+            colors: None,
+            local: None,
+            opacity: None,
+            interactive: None,
+            size: None,
+            face_viewer,
+        };
+        send(&mut app, configure(Some(true)));
+        assert!(facing(&app));
+        send(&mut app, configure(None));
+        assert!(facing(&app), "an absent setting changes nothing");
+        send(&mut app, configure(Some(false)));
+        assert!(!facing(&app));
+
+        let mut control = goal_at([0.0, 0.0, 1.0]);
+        if let Control::Transform { face_viewer, .. } = &mut control {
+            *face_viewer = true;
+        }
+        send(&mut app, add("facing", control));
+        let added = app.world().resource::<Controls>().0["facing"].gizmo;
+        assert!(
+            app.world()
+                .get::<TransformGizmo>(added)
+                .unwrap()
+                .face_viewer,
+            "asked on its add"
+        );
+    }
+
     /// A control takes the host's colours when added, and changes them, and
     /// a transform control its axes, when configured; a bad colour changes
     /// nothing.
@@ -2805,6 +2880,7 @@ mod tests {
                 opacity: None,
                 interactive: None,
                 size: None,
+                face_viewer: None,
             },
         );
         let configured = app.world().get::<TransformGizmo>(gizmo).unwrap();
@@ -2823,6 +2899,7 @@ mod tests {
                 opacity: None,
                 interactive: None,
                 size: None,
+                face_viewer: None,
             },
         );
         assert_eq!(
@@ -2899,6 +2976,7 @@ mod tests {
                     opacity: None,
                     interactive: None,
                     size: None,
+                    face_viewer: None,
                 },
             ],
         );
@@ -2937,6 +3015,7 @@ mod tests {
                 opacity: None,
                 interactive: None,
                 size: None,
+                face_viewer: None,
             },
         );
         send(
@@ -2988,6 +3067,7 @@ mod tests {
             opacity,
             interactive,
             size: None,
+            face_viewer: None,
         }
     }
 
@@ -3396,6 +3476,7 @@ mod tests {
                     local: false,
                     colors: None,
                     size: None,
+                    face_viewer: false,
                 },
             ),
         );
@@ -3490,6 +3571,7 @@ mod tests {
             local: true,
             colors: None,
             size: None,
+            face_viewer: false,
         };
         send(&mut app, add("head", on("head")));
         send(&mut app, add("none", on("no such element")));
@@ -3523,6 +3605,7 @@ mod tests {
                     local: false,
                     colors: None,
                     size: None,
+                    face_viewer: false,
                 },
             ),
         );
@@ -3592,6 +3675,7 @@ mod tests {
             local: false,
             colors: None,
             size: None,
+            face_viewer: false,
         };
         let pose = Pose {
             position: [1.0, 2.0, 3.0],
@@ -3680,6 +3764,7 @@ mod tests {
             local: false,
             colors: None,
             size: None,
+            face_viewer: false,
         };
         let element = |id: &str| Target::Element {
             instance: "face".into(),
@@ -3820,6 +3905,7 @@ mod tests {
             local: false,
             colors: None,
             size: None,
+            face_viewer: false,
         };
         send(&mut app, add("k", whole("face")));
         let old = only::<TransformGizmo>(&mut app).expect("on the face");
@@ -3874,6 +3960,7 @@ mod tests {
             local: false,
             colors: None,
             size: None,
+            face_viewer: false,
         };
         let to = Pose {
             position: [5.0, 0.0, 0.0],
@@ -4101,6 +4188,27 @@ mod tests {
             ControlCommand::Highlight {
                 handle: None,
                 on: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            read(serde_json::json!({ "op": "configure", "key": "k", "faceViewer": true })),
+            ControlCommand::Configure {
+                face_viewer: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(
+            read(serde_json::json!({
+                "op": "add",
+                "key": "k",
+                "control": { "kind": "transform", "target": { "kind": "goal", "pose": { "position": [0, 0, 0] } }, "faceViewer": true },
+            })),
+            ControlCommand::Add {
+                control: Control::Transform {
+                    face_viewer: true,
+                    ..
+                },
                 ..
             }
         ));
@@ -4400,6 +4508,7 @@ mod tests {
             local: false,
             colors: None,
             size: None,
+            face_viewer: false,
         };
         queue(
             &mut app,
@@ -4688,6 +4797,7 @@ mod tests {
             local: false,
             colors: None,
             size: None,
+            face_viewer: false,
         };
         let mut app = bare();
         app.world_mut().spawn(ControlCamera);
@@ -4758,6 +4868,7 @@ mod tests {
                     local: false,
                     colors: None,
                     size: None,
+                    face_viewer: false,
                 },
             ),
         );
