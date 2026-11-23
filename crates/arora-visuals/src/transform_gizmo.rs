@@ -11,13 +11,16 @@
 //! along each axis and a square in each plane to move, a ring about each axis
 //! to turn, and a ball beyond each arrow to scale.
 //!
-//! **The moving and scaling handles stay on the side facing the viewer.** Each
-//! arrow points along its axis or against it, whichever way is toward the
-//! camera, and the squares and balls go with the arrows. Otherwise, as the
-//! view comes round, an arrow ends up behind the rings and the centre, and
-//! taking it means reaching through them. An arrow seen nearly end-on keeps
-//! the side it had until the view is clearly past it, so it does not flicker
-//! between the two, and nothing changes side while a drag is under way. A host that wants one mode
+//! **Each arrow points the positive way along its axis, unless the gizmo is
+//! told to face the viewer.** An arrow that always points to +X reads as the
+//! axis's direction, which is what a driver writing poses back is reasoning
+//! in. With [`TransformGizmo::face_viewer`] set, each arrow instead points
+//! along its axis or against it, whichever way is toward the camera, and the
+//! squares and balls go with the arrows, so that as the view comes round no
+//! arrow ends up behind the rings and the centre, where taking it means
+//! reaching through them. An arrow seen nearly end-on keeps the side it had
+//! until the view is clearly past it, so it does not flicker between the two,
+//! and nothing changes side while a drag is under way. A host that wants one mode
 //! at a time sets [`TransformGizmo::only`] — from whatever key it binds — and
 //! the others hide, so the choice of keys is the host's.
 //!
@@ -196,6 +199,10 @@ pub struct TransformGizmo {
     /// and the scene; a drag in hand when it goes off ends. A host's
     /// [`highlight`](Self::highlight) still shows.
     pub interactive: bool,
+    /// Turn each axis's arrow, square and ball to whichever side of the
+    /// origin faces the camera, rather than keeping them on the positive
+    /// side ([module docs](self)).
+    pub face_viewer: bool,
 }
 
 impl TransformGizmo {
@@ -221,6 +228,7 @@ impl TransformGizmo {
             highlight: Vec::new(),
             opacity: 1.0,
             interactive: true,
+            face_viewer: false,
         }
     }
 
@@ -1036,6 +1044,16 @@ pub(crate) fn unit_size(
     }
 }
 
+/// The side of each axis a gizmo's handles go on: the positive side, or with
+/// `face_viewer` the side toward the eye.
+fn sides(face_viewer: bool, previous: Vec3, axes: Quat, origin: Vec3, eye: Vec3) -> Vec3 {
+    if face_viewer {
+        facing_toward(previous, axes, origin, eye)
+    } else {
+        Vec3::ONE
+    }
+}
+
 /// Which side of each axis faces the viewer, keeping `previous` for an axis
 /// too near side-on to say.
 fn facing_toward(previous: Vec3, axes: Quat, origin: Vec3, eye: Vec3) -> Vec3 {
@@ -1809,7 +1827,13 @@ fn place_parts(
         // the pointer took it.
         let held = pointer.dragging.is_some_and(|(gizmo, _)| gizmo == entity);
         if !held {
-            let toward = facing_toward(facing.0, place.axes, place.origin, camera.1.translation());
+            let toward = sides(
+                gizmo.face_viewer,
+                facing.0,
+                place.axes,
+                place.origin,
+                camera.1.translation(),
+            );
             if toward != facing.0 {
                 facing.0 = toward;
             }
@@ -2604,6 +2628,21 @@ mod tests {
         assert_eq!(toward, Vec3::new(-1.0, 1.0, 1.0));
         let kept = facing_toward(Vec3::NEG_ONE, Quat::IDENTITY, Vec3::ZERO, eye);
         assert_eq!(kept, Vec3::new(-1.0, 1.0, -1.0));
+    }
+
+    /// Unless told to face the viewer, every handle stays on its axis's
+    /// positive side, whichever side the eye is on and whatever it had.
+    #[test]
+    fn handles_stay_positive_unless_told_to_face_the_viewer() {
+        let eye = Vec3::new(-5.0, -5.0, -5.0);
+        assert_eq!(
+            sides(false, Vec3::NEG_ONE, Quat::IDENTITY, Vec3::ZERO, eye),
+            Vec3::ONE
+        );
+        assert_eq!(
+            sides(true, Vec3::ONE, Quat::IDENTITY, Vec3::ZERO, eye),
+            Vec3::NEG_ONE
+        );
     }
 
     /// A facing handle reaches the way it faces; a ring does not face.
