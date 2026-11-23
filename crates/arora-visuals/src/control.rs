@@ -697,6 +697,11 @@ struct Placed {
     opacity: f32,
     /// The size its driver gave it, over its view's.
     size: Option<GizmoSize>,
+    /// The size its gizmo was made at — [`GIZMO_SIZE`](crate::transform_gizmo::GIZMO_SIZE) for a transform
+    /// control, what its host resolved a joint control at — which it returns
+    /// to when neither its driver nor its view gives one, so a view's size
+    /// taken away does not stay behind on it. `None` until it is known.
+    made_at: Option<GizmoSize>,
     /// The fade toward `opacity` under way, if one is.
     fade: Option<Fade>,
     /// Whether its gizmo shows: drawn, and hidden neither by the host nor by
@@ -724,6 +729,7 @@ impl Placed {
             resolving: false,
             opacity: 1.0,
             size: None,
+            made_at: None,
             fade: None,
             shown: false,
         }
@@ -875,7 +881,9 @@ impl Plugin for ControlsPlugin {
 }
 
 /// Sizes each control's gizmo: the size its driver gave it, else its view's
-/// ([`ControlSize`]). One given neither keeps the size it has.
+/// ([`ControlSize`]), else the size it was made at. A joint control is sized
+/// only once its host has resolved it, in the passes before this, so the size
+/// it was made at is the host's rather than its view's.
 fn size_controls(
     controls: Res<Controls>,
     views: Query<&ControlSize>,
@@ -885,13 +893,21 @@ fn size_controls(
     for placed in controls.0.values() {
         let view = views.get(placed.camera).ok();
         if let Ok(gizmo) = transform_gizmos.get_mut(placed.gizmo) {
-            if let Some(size) = placed.size.or(view.and_then(|view| view.transform)) {
+            if let Some(size) = placed
+                .size
+                .or(view.and_then(|view| view.transform))
+                .or(placed.made_at)
+            {
                 gizmo
                     .map_unchanged(|gizmo| &mut gizmo.size)
                     .set_if_neq(size);
             }
         } else if let Ok(gizmo) = joint_gizmos.get_mut(placed.gizmo) {
-            if let Some(size) = placed.size.or(view.and_then(|view| view.joint)) {
+            if let Some(size) = placed
+                .size
+                .or(view.and_then(|view| view.joint))
+                .or(placed.made_at)
+            {
                 gizmo
                     .map_unchanged(|gizmo| &mut gizmo.size)
                     .set_if_neq(size);
@@ -1143,6 +1159,7 @@ fn finish_joints(
                 commands.entity(entity).remove::<JointRequest>();
                 if let Some(placed) = controls.0.get_mut(key) {
                     placed.resolving = false;
+                    placed.made_at = Some(gizmo.size);
                 }
                 if let Some(old) = replaced.0.remove(key) {
                     despawn(&mut commands, old);
@@ -1473,6 +1490,7 @@ fn carry_out(
                             .id();
                         Placed {
                             size,
+                            made_at: Some(base.size),
                             ..Placed::new(gizmo, Some(target), goal, camera, root)
                         }
                     }
@@ -2560,6 +2578,30 @@ mod tests {
         });
         app.update();
         assert_eq!(size_of(&app, "viewed"), GizmoSize::Pixels(40.0));
+
+        // A view's size taken away goes back to the size each was made at.
+        let joint_made_at = app.world().resource::<Controls>().0["joint"]
+            .made_at
+            .expect("a resolved joint control knows the size it was made at");
+        assert_ne!(
+            joint_made_at,
+            GizmoSize::World(0.5),
+            "the host's, not the view's"
+        );
+        send(&mut app, add("viewed-again", whole(None)));
+        assert_eq!(size_of(&app, "viewed-again"), GizmoSize::Pixels(120.0));
+        app.world_mut().entity_mut(view).remove::<ControlSize>();
+        app.update();
+        assert_eq!(
+            size_of(&app, "viewed-again"),
+            crate::transform_gizmo::GIZMO_SIZE
+        );
+        assert_eq!(size_of(&app, "joint"), joint_made_at);
+        assert_eq!(
+            size_of(&app, "viewed"),
+            GizmoSize::Pixels(40.0),
+            "its own stays"
+        );
     }
 
     /// A driver writes a size in pixels or in metres.
