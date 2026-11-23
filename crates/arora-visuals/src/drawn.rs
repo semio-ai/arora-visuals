@@ -264,14 +264,22 @@ fn settled(state: &CachedPipelineState) -> bool {
     }
 }
 
+/// What the render world said of a superseded instance's camera: whether it
+/// was seen drawn. Kept until the instance is current again — its successor
+/// failed — or goes, since the render world reports a camera once and will
+/// not say it again.
+#[derive(Component, Clone, Copy, Debug)]
+pub struct Verdict(bool);
+
 /// Make ready the instances the render world reports drawn, or given up on:
 /// each one's camera moves above the clear, where it draws in its place from
 /// the next frame on, and an [`InstanceReady`] says which. An instance
-/// superseded meanwhile stays under the clear until it is retired.
+/// superseded meanwhile stays under the clear, keeping what was said of it:
+/// retired, it never draws; made current again, it is made ready by that.
 #[allow(clippy::too_many_arguments)]
 pub fn ready_drawn_instances(
     reports: Res<Reports>,
-    mut cameras: Query<(&ViewOf, &mut Camera), With<Warming>>,
+    mut cameras: Query<(Entity, &ViewOf, &mut Camera, Option<&Verdict>), With<Warming>>,
     mut instances: Query<(&mut EntityInstance, Has<Superseded>)>,
     names: Query<&Name>,
     parents: Query<&ChildOf>,
@@ -287,13 +295,37 @@ pub fn ready_drawn_instances(
     // before one drain — would still find it warming. The first says what
     // the instance became; the rest are about a transition already made.
     let mut made_ready = std::collections::HashSet::new();
+    // A superseded instance made current again, by what was said of it.
+    for (camera, &ViewOf(entity), mut placed, verdict) in &mut cameras {
+        let Some(&Verdict(drawn)) = verdict else {
+            continue;
+        };
+        let Ok((mut instance, false)) = instances.get_mut(entity) else {
+            continue;
+        };
+        make_ready(
+            camera,
+            entity,
+            &mut placed,
+            &mut instance,
+            drawn,
+            &mut ready,
+            &mut commands,
+        );
+        made_ready.insert(camera);
+    }
     for message in reports.try_iter() {
         if made_ready.contains(&message.camera) {
             continue;
         }
-        let Ok((&ViewOf(instance), mut placed)) = cameras.get_mut(message.camera) else {
+        let Ok((_, &ViewOf(instance), mut placed, verdict)) = cameras.get_mut(message.camera)
+        else {
             continue;
         };
+        // Already said: the render world's first word stands.
+        if verdict.is_some() {
+            continue;
+        }
         let entity = instance;
         let Ok((mut instance, superseded)) = instances.get_mut(entity) else {
             continue;
@@ -317,20 +349,42 @@ pub fn ready_drawn_instances(
                 false
             }
         };
+        made_ready.insert(message.camera);
         if superseded {
+            commands.entity(message.camera).insert(Verdict(drawn));
             continue;
         }
-        placed.order = instance.draw_order;
-        instance.ready = true;
-        commands.entity(message.camera).remove::<Warming>();
-        made_ready.insert(message.camera);
-        ready.write(InstanceReady {
-            instance: entity,
-            id: instance.id.clone(),
+        make_ready(
+            message.camera,
+            entity,
+            &mut placed,
+            &mut instance,
             drawn,
-        });
-        log::info!("{}: ready", instance.id);
+            &mut ready,
+            &mut commands,
+        );
     }
+}
+
+/// Moves `instance`'s camera above the clear and says it is ready.
+fn make_ready(
+    camera: Entity,
+    entity: Entity,
+    placed: &mut Camera,
+    instance: &mut EntityInstance,
+    drawn: bool,
+    ready: &mut MessageWriter<InstanceReady>,
+    commands: &mut Commands,
+) {
+    placed.order = instance.draw_order;
+    instance.ready = true;
+    commands.entity(camera).remove::<(Warming, Verdict)>();
+    ready.write(InstanceReady {
+        instance: entity,
+        id: instance.id.clone(),
+        drawn,
+    });
+    log::info!("{}: ready", instance.id);
 }
 
 /// What kept an instance from being drawn, in words: the meshes, by the name
@@ -422,5 +476,35 @@ mod tests {
             said,
             vec![("drawn".to_string(), true), ("gave-up".to_string(), false)]
         );
+
+        // Its successor failed: the superseded instance is current again,
+        // and ready by what was said of it while it was not.
+        // A give-up racing the drawn report lands a frame later; the first
+        // word stands.
+        sender
+            .send(Message {
+                camera: gone,
+                report: Report::GaveUp,
+                meshes: Vec::new(),
+                seen: true,
+                submitted: true,
+            })
+            .unwrap();
+        app.update();
+        let instance = app.world().get::<ViewOf>(gone).unwrap().0;
+        app.world_mut().entity_mut(instance).remove::<Superseded>();
+        let mut cursor = app
+            .world()
+            .resource::<Messages<InstanceReady>>()
+            .get_cursor_current();
+        app.update();
+        let messages = app.world().resource::<Messages<InstanceReady>>();
+        let said: Vec<(String, bool)> = cursor
+            .read(messages)
+            .map(|ready| (ready.id.clone(), ready.drawn))
+            .collect();
+        assert_eq!(said, vec![("superseded".to_string(), true)]);
+        assert!(app.world().get::<EntityInstance>(instance).unwrap().ready);
+        assert!(app.world().get::<Warming>(gone).is_none());
     }
 }
