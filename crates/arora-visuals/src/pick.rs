@@ -309,13 +309,19 @@ fn note_held_presses(pressed: Res<Pressed>, mut before: ResMut<HeldBefore>) {
 /// Decides the releases Bevy sent nowhere, because the pointer was over
 /// nothing the frame before ([module docs](self)).
 ///
-/// The pointer's inputs this frame are replayed in order from the press it
-/// held before them, so each release pairs with the press that came before
-/// it: the presses' observers have all run by now, and what they left holds
-/// only the last. The window is what the pointer is over for every input of
-/// the frame, as it is for the presses' observers: a press counts and a
-/// release decides only over it, and a release anywhere else lets its press
-/// go, as one released onto a panel is let go.
+/// The inputs this frame of a pointer that let go are replayed in order from
+/// the press it held before them, so each release pairs with the press that
+/// came before it: the presses' observers have all run by now, and what they
+/// left holds only the last. A pointer that only pressed is left as its
+/// press's observer left it, which saw what was under it already.
+///
+/// The window is what the pointer is over for every input of the frame, as
+/// it is for the presses' observers: a press counts and a release decides
+/// only over it, and a release anywhere else lets its press go, as one
+/// released onto a panel is let go. A press is placed by where it was, too:
+/// one outside every view is no press, though the pointer is over a view by
+/// the frame's end, so a gesture begun outside the scene never ends in a
+/// pick.
 #[allow(clippy::too_many_arguments)]
 fn release_reaching_nothing(
     mut inputs: MessageReader<PointerInput>,
@@ -329,19 +335,28 @@ fn release_reaching_nothing(
     before: Res<HeldBefore>,
     mut pressed: ResMut<Pressed>,
     mut picks: MessageWriter<Picked>,
+    #[cfg(test)] mut replays: Option<ResMut<tests::Replays>>,
 ) {
     let (Some(hovered), Some(previously)) = (hovered, previously) else {
         return;
     };
+    let inputs: Vec<&PointerInput> = inputs.read().collect();
+    // The pointers that let go onto nothing: a release Bevy sent somewhere
+    // was decided there, or let go by `forget_unreleased_press`.
+    let reaching_nothing: HashSet<PointerId> = inputs
+        .iter()
+        .filter(|input| matches!(input.action, PointerAction::Release(PointerButton::Primary)))
+        .map(|input| input.pointer_id)
+        .filter(|pointer| previously.get(pointer).is_none_or(|over| over.is_empty()))
+        .collect();
+    #[cfg(test)]
+    if let Some(replays) = replays.as_mut() {
+        replays.0 += reaching_nothing.len();
+    }
     let mut replayed: HashMap<PointerId, Option<Press>> = HashMap::new();
-    for input in inputs.read() {
+    for input in inputs {
         let pointer = input.pointer_id;
-        // A release Bevy sent somewhere was decided there, or let go by
-        // `forget_unreleased_press`.
-        if previously
-            .get(&pointer)
-            .is_some_and(|over| !over.is_empty())
-        {
+        if !reaching_nothing.contains(&pointer) {
             continue;
         }
         let over_window = hovered
@@ -352,18 +367,18 @@ fn release_reaching_nothing(
                 if !over_window {
                     continue;
                 }
-                let press = Press {
+                let found = under(
+                    input.location.position,
+                    &input.location.target,
+                    &instances,
+                    &views,
+                    &elements,
+                );
+                let press = found.topmost.map(|_| Press {
                     position: input.location.position,
-                    under: under(
-                        input.location.position,
-                        &input.location.target,
-                        &instances,
-                        &views,
-                        &elements,
-                    )
-                    .all,
-                };
-                replayed.insert(pointer, Some(press));
+                    under: found.all,
+                });
+                replayed.insert(pointer, press);
             }
             PointerAction::Release(PointerButton::Primary) => {
                 let held = replayed
@@ -1067,6 +1082,40 @@ mod tests {
         );
     }
 
+    /// How many pointers `release_reaching_nothing` has replayed.
+    #[derive(Resource, Default)]
+    pub(super) struct Replays(pub usize);
+
+    /// A pointer that only presses in the frame it arrives is left to its
+    /// press's observer, which has found what is under it already: only a
+    /// pointer that lets go onto nothing is replayed.
+    #[test]
+    fn only_a_pointer_that_lets_go_is_replayed() {
+        let press = || PointerAction::Press(PointerButton::Primary);
+        let release = || PointerAction::Release(PointerButton::Primary);
+
+        let (mut app, window) = picking_app();
+        app.init_resource::<Replays>();
+        assert_eq!(
+            in_one_frame(&mut app, window, &[(200.0, moved()), (200.0, press())]),
+            0
+        );
+        assert_eq!(app.world().resource::<Replays>().0, 0, "a press alone");
+        assert!(
+            app.world()
+                .resource::<Pressed>()
+                .0
+                .contains_key(&PointerId::Mouse),
+            "held, as its observer left it"
+        );
+        assert_eq!(in_one_frame(&mut app, window, &[(200.0, release())]), 1);
+        assert_eq!(
+            app.world().resource::<Replays>().0,
+            0,
+            "a release Bevy sent to the window"
+        );
+    }
+
     /// Something drawn over the scene, under the mouse while it holds an
     /// entity: a panel, as a picking backend reports one.
     #[derive(Resource, Default)]
@@ -1156,6 +1205,26 @@ mod tests {
             0,
             "no press left to pick with"
         );
+
+        // A press over a panel in a frame replayed from over nothing is no
+        // press, though the panel is over a view.
+        let (mut app, window, panel) = with_panel();
+        app.world_mut().resource_mut::<Panel>().0 = Some(panel);
+        assert_eq!(
+            in_one_frame(
+                &mut app,
+                window,
+                &[(200.0, moved()), (200.0, release()), (200.0, press())]
+            ),
+            0
+        );
+        app.world_mut().resource_mut::<Panel>().0 = None;
+        assert_eq!(in_one_frame(&mut app, window, &[(600.0, moved())]), 0);
+        assert_eq!(
+            in_one_frame(&mut app, window, &[(200.0, moved()), (200.0, release())]),
+            0,
+            "pressed over the panel"
+        );
     }
 
     /// A release in a frame replayed from over nothing pairs with the press
@@ -1198,6 +1267,22 @@ mod tests {
             in_one_frame(&mut app, window, &[(399.5, moved()), (399.5, release())]),
             0,
             "pressed outside every view"
+        );
+
+        let (mut app, window) = picking_app();
+        assert_eq!(
+            in_one_frame(
+                &mut app,
+                window,
+                &[
+                    (401.0, moved()),
+                    (401.0, press()),
+                    (399.5, moved()),
+                    (399.5, release())
+                ]
+            ),
+            0,
+            "pressed outside every view, let go over one, in the frame it arrives"
         );
     }
 
