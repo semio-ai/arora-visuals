@@ -432,13 +432,19 @@ fn key_for(
     }
 }
 
-/// Ghosts every mesh beneath a [`Ghost`] that is not yet ghosted.
+/// Ghosts every mesh beneath a [`Ghost`] that is not yet ghosted, under the
+/// ghost nearest above it. A mesh under nested ghosts is reached from each of
+/// them, and only the nearest may claim it: [`rekey`] looks for the nearest
+/// again only when the hierarchy or the set of ghosts changes, so a mesh
+/// whose material arrives in a quiet frame would otherwise keep whichever
+/// ghost happened to be visited last.
 #[allow(clippy::too_many_arguments)]
 fn ghost_meshes(
     mut commands: Commands,
     roots: Query<(Entity, Option<&GhostStyle>), With<Ghost>>,
     has_style: Query<(), With<GhostStyle>>,
     children: Query<&Children>,
+    parents: Query<&ChildOf>,
     meshes: Query<(&MeshMaterial3d<StandardMaterial>, Has<NotShadowCaster>), Without<GhostOf>>,
     standard: Res<Assets<StandardMaterial>>,
     look: Res<GhostLook>,
@@ -453,6 +459,12 @@ fn ghost_meshes(
             let Some(original) = standard.get(&material.0) else {
                 continue;
             };
+            let nearest = std::iter::once(entity)
+                .chain(parents.iter_ancestors(entity))
+                .find(|ancestor| roots.contains(*ancestor));
+            if nearest != Some(root) {
+                continue;
+            }
             let key = key_for(&material.0, root, &has_style);
             let ghost = shared(&mut materials, &mut ghosts, key, original, &look, style);
             commands
@@ -1134,6 +1146,48 @@ mod tests {
             0.1,
             "the nearer ghost's"
         );
+    }
+
+    /// A mesh under nested ghosts whose material arrives only after both
+    /// ghosts are settled takes the inner ghost's style, whichever ghost is
+    /// visited last.
+    #[test]
+    fn a_late_material_under_nested_ghosts_takes_the_nearest_style() {
+        for outer_last in [false, true] {
+            let mut app = app();
+            let late = app
+                .world()
+                .resource::<Assets<StandardMaterial>>()
+                .reserve_handle();
+            let faint = GhostStyle {
+                opacity: 0.2,
+                ..default()
+            };
+            let outer = app.world_mut().spawn((Ghost, GhostStyle::default())).id();
+            let inner = app.world_mut().spawn((Ghost, faint, ChildOf(outer))).id();
+            let mesh = app
+                .world_mut()
+                .spawn((MeshMaterial3d(late.clone()), ChildOf(inner)))
+                .id();
+            // Ghosts are visited archetype by archetype, and a component
+            // given last moves its ghost into the newest one, so the ghost
+            // named here is the one visited last.
+            let last = if outer_last { outer } else { inner };
+            app.world_mut().entity_mut(last).insert(Name::new("last"));
+            app.update();
+            app.update();
+            assert!(app.world().get::<GhostOf>(mesh).is_none(), "not loaded yet");
+
+            app.world_mut()
+                .resource_mut::<Assets<StandardMaterial>>()
+                .insert(late.id(), StandardMaterial::default())
+                .unwrap();
+            app.update();
+            app.update();
+            let of = app.world().get::<GhostOf>(mesh).expect("ghosted");
+            assert_eq!(of.root, inner, "outer visited last: {outer_last}");
+            assert_eq!(ghost_of(&app, mesh).ghost.opacity, 0.2);
+        }
     }
 
     /// A ghost that tests depth asks for a pipeline that does.
