@@ -44,11 +44,11 @@
 //! converts at this boundary, and a transform control's handles are labelled
 //! from the same turn, so a driver never sees the world's own axes.
 //!
-//! # What is still to come: [`Loading`]
+//! # What is still to come: [`Loading`](crate::instance::Loading)
 //!
 //! A control on an instance that is still loading waits for it, and one on an
 //! instance nothing is loading is refused. Only the host knows which is
-//! which, so it says: it puts [`Loading`] on the entity it is loading an
+//! which, so it says: it puts [`Loading`](crate::instance::Loading) on the entity it is loading an
 //! instance into until that entity carries its [`EntityInstance`].
 //!
 //! An instance that is there but not yet indexed
@@ -56,7 +56,7 @@
 //! still to come as well: until it is, an element it lacks cannot be told
 //! from one not yet joined, so a control on it waits rather than being
 //! refused. A host that spawns an instance and indexes it later needs no
-//! [`Loading`] for that gap.
+//! [`Loading`](crate::instance::Loading) for that gap.
 //!
 //! # Which camera a control is used through: [`ControlCamera`]
 //!
@@ -187,7 +187,7 @@ use bevy::window::RequestRedraw;
 use serde::{Deserialize, Serialize};
 
 use crate::ghost::Ghost;
-use crate::instance::{EntityInstance, Loading, Superseded};
+use crate::instance::{EntityInstance, InstanceIndex, InstanceSystems};
 use crate::joint_gizmo::{JointDrag, JointGizmo};
 use crate::transform_gizmo::{
     current_global, DragPhase, GizmoDrag, GizmoHandle, GizmoPress, GizmoSize, GizmoSpace,
@@ -843,6 +843,7 @@ impl Plugin for ControlsPlugin {
         if !crate::installed::first_install::<Self>(app) {
             return;
         }
+        app.add_plugins(crate::instance::InstancePlugin);
         app.init_resource::<ControlCommands>()
             .init_resource::<ControlEvents>()
             .init_resource::<ControlPresses>()
@@ -880,6 +881,15 @@ impl Plugin for ControlsPlugin {
                 (ControlSystems::Commands, ControlSystems::Fade)
                     .chain()
                     .before(TransformGizmoSystems),
+            )
+            // On indexed instances, and before values are applied, so a
+            // driver's write-back of a drag lands in the frame it is sent.
+            .configure_sets(
+                Update,
+                ControlSystems::Commands
+                    .after(InstanceSystems::Index)
+                    .after(crate::instance::tag_elements)
+                    .before(InstanceSystems::Apply),
             )
             .add_systems(
                 Update,
@@ -1227,8 +1237,8 @@ fn carry_out(
     frames: Query<&DriverFrame>,
     mut commands: Commands,
     cameras: Query<GoalCamera, GoalCameras>,
-    instances: Query<(Entity, &EntityInstance, Has<Superseded>)>,
-    loading: Query<&Loading>,
+    instances: Query<&EntityInstance>,
+    index: Res<InstanceIndex>,
     parents: Query<&ChildOf>,
     globals: Query<&GlobalTransform>,
     mut transforms: Query<&mut Transform>,
@@ -1251,16 +1261,16 @@ fn carry_out(
     // being replaced gives way to its successor, which is the one a control
     // should stay on.
     let instance = |name: &str| {
+        let entity = index.get(name)?;
         instances
-            .iter()
-            .filter(|(_, instance, _)| instance.id == name)
-            .min_by_key(|(_, _, superseded)| *superseded)
-            .map(|(entity, instance, _)| (entity, instance))
+            .get(entity)
+            .ok()
+            .map(|instance| (entity, instance))
     };
     // Whether an instance not ready to be addressed is on its way: loading,
     // or there but not yet indexed, so its elements cannot be told from ones
     // it lacks. What a control on it waits for.
-    let coming = |name: &str| loading.iter().any(|loading| loading.instance == name);
+    let coming = |name: &str| index.is_loading(name);
     let asked = std::mem::take(&mut pending.0);
     let asked_count = asked.len();
     // Keys an add is coming for, in this batch or waiting from an earlier one.
@@ -1277,10 +1287,8 @@ fn carry_out(
     // its add is. Anything else is for a key nothing will add, such as one
     // whose control went with its instance, and waiting would hold it, and
     // the frames it asks for, for good.
-    let any_loading = !loading.is_empty()
-        || instances
-            .iter()
-            .any(|(_, instance, _)| !instance.bindings.indexed);
+    let any_loading =
+        index.any_loading() || instances.iter().any(|instance| !instance.bindings.indexed);
     let worth_waiting = |key: &str, controls: &Controls| {
         controls.0.contains_key(key) || adding.contains(key) || any_loading
     };
@@ -2034,6 +2042,7 @@ mod tests {
 
     use super::*;
     use crate::binding::{ElementTargets, SceneBindings};
+    use crate::instance::{Loading, Superseded};
     use crate::joint_gizmo::JointMotion;
 
     const TILT: &str = "tilt-value";
@@ -3224,6 +3233,48 @@ mod tests {
         assert_eq!(app.world().resource::<Seen>().0, [true]);
         send(&mut app, configure("goal", None, Some(false)));
         assert_eq!(app.world().resource::<Seen>().0, [true, false]);
+    }
+
+    /// A host's systems in each [`InstanceSystems`] stage run in the stages'
+    /// order, with control commands after indexing and before values are
+    /// applied, and none of it ambiguous.
+    #[test]
+    fn control_commands_run_between_indexing_and_applying() {
+        use bevy::ecs::schedule::{LogLevel, ScheduleBuildSettings};
+
+        #[derive(Resource, Default)]
+        struct Order(Vec<&'static str>);
+
+        let mut app = bare();
+        app.init_resource::<Order>();
+        for (name, set) in [
+            ("derive", InstanceSystems::Derive),
+            ("apply", InstanceSystems::Apply),
+            ("index", InstanceSystems::Index),
+            ("intake", InstanceSystems::Intake),
+        ] {
+            app.add_systems(
+                Update,
+                (move |mut order: ResMut<Order>| order.0.push(name)).in_set(set),
+            );
+        }
+        app.add_systems(
+            Update,
+            (|mut order: ResMut<Order>| order.0.push("commands"))
+                .in_set(ControlSystems::Commands)
+                .after(run_passes),
+        );
+        app.edit_schedule(Update, |schedule| {
+            schedule.set_build_settings(ScheduleBuildSettings {
+                ambiguity_detection: LogLevel::Error,
+                ..default()
+            });
+        });
+        app.update();
+        assert_eq!(
+            app.world().resource::<Order>().0,
+            ["intake", "index", "commands", "apply", "derive"]
+        );
     }
 
     /// Hidden part way through a fade and then given another opacity, a
