@@ -161,6 +161,10 @@ impl SolidMaterialReadOnlyItem<'_, '_> {
     }
 }
 
+/// The meshes that have a material of their own, solid or ghosted: the filter
+/// a [`SolidMaterial`] query takes, which would otherwise match every entity.
+pub type HasSolidMaterial = Or<(With<MeshMaterial3d<StandardMaterial>>, With<GhostOf>)>;
+
 /// How far a ghost's colour is from its wash toward the element's: Studio's.
 pub const GHOST_TINT: f32 = 0.5;
 
