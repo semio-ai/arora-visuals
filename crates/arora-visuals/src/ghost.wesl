@@ -38,6 +38,21 @@ struct Ghost {
 // An image's opacity on a ghost.
 const IMAGE_OPACITY: f32 = 0.6;
 
+// Below this opacity a depth-tested ghost draws nothing, so that only the
+// surface it visibly draws writes depth: a nearly clear fragment, face-on to
+// the camera, would otherwise hide what is drawn behind it after it.
+const DEPTH_ALPHA: f32 = 0.05;
+
+// The fragment's colour, discarding one a depth-tested ghost barely draws.
+fn shown(colour: vec4<f32>) -> vec4<f32> {
+    @if(GHOST_DEPTH_TESTED) {
+        if colour.a < DEPTH_ALPHA {
+            discard;
+        }
+    }
+    return colour;
+}
+
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var base = ghost.colour.rgb;
@@ -47,7 +62,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         @if(VERTEX_UVS_A) {
             sampled = textureSample(image_texture, image_sampler, in.uv).rgb;
         }
-        return vec4(mix(ghost.wash.rgb, base * sampled, ghost.tint), IMAGE_OPACITY * faded);
+        return shown(vec4(mix(ghost.wash.rgb, base * sampled, ghost.tint), IMAGE_OPACITY * faded));
     }
     // From the camera to the fragment, and the surface's outward normal: the
     // dot is -1 looking straight at the surface and 0 along its edge.
@@ -57,5 +72,5 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // Studio's mix runs past its end at the very rim, which the clamp keeps an
     // opacity.
     let alpha = clamp(mix(0.01, 0.25, rim) * ghost.rim, 0.0, 1.0) * faded;
-    return vec4(mix(ghost.wash.rgb, base, ghost.tint), alpha);
+    return shown(vec4(mix(ghost.wash.rgb, base, ghost.tint), alpha));
 }

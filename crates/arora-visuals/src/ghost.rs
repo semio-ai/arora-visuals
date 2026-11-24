@@ -62,7 +62,13 @@ pub struct Ghost;
 
 /// How one [`Ghost`] shows, beside it on the same entity; what it leaves
 /// unset comes from [`GhostLook`]. Changing it changes the ghost from the next
-/// frame, so a host animates a ghost by writing it.
+/// frame, so a host animates a ghost by writing it. A mesh beneath more than
+/// one [`Ghost`] takes the style of the nearest, as it stands now.
+///
+/// Changing it rewrites the ghost materials made from it, and Bevy treats a
+/// changed material as one whose meshes need their pipelines chosen again:
+/// animating a ghost each frame costs that lookup for each of its meshes
+/// each frame, on top of the uniform upload.
 #[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct GhostStyle {
     /// The colour every element is drawn in, in place of its own. Its alpha
@@ -240,9 +246,16 @@ impl GhostMaterial {
         look: &GhostLook,
         style: Option<&GhostStyle>,
     ) -> Self {
-        let colour = style
-            .and_then(|style| style.colour)
-            .unwrap_or(material.base_color);
+        // An element whose material draws opaque is drawn whole whatever its
+        // colour's alpha says — glTF keeps baseColorFactor's alpha on an
+        // OPAQUE material, and CAD exports often leave it at nought — so its
+        // ghost takes it as fully there too. Only a material that blends
+        // fades its ghost.
+        let own = match material.alpha_mode {
+            AlphaMode::Opaque | AlphaMode::Mask(_) => material.base_color.with_alpha(1.0),
+            _ => material.base_color,
+        };
+        let colour = style.and_then(|style| style.colour).unwrap_or(own);
         Self {
             ghost: GhostUniform {
                 colour: LinearRgba::from(colour).to_vec4(),
@@ -276,28 +289,41 @@ impl Material for GhostMaterial {
         AlphaMode::Blend
     }
 
-    /// Over everything unless the ghost tests depth ([`GhostDepth`]). A
-    /// ghost that tests depth also writes it, so of the poses of a trace the
-    /// nearer hide the farther where they overlap rather than all showing
-    /// through one another.
     fn specialize(
         _pipeline: &MaterialPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         _layout: &MeshVertexBufferLayoutRef,
         key: MaterialPipelineKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
-        if let Some(depth) = descriptor.depth_stencil.as_mut() {
-            match key.bind_group_data.depth {
-                GhostDepth::OverEverything => {
-                    depth.depth_compare = Some(CompareFunction::Always);
-                    depth.depth_write_enabled = Some(false);
-                }
-                GhostDepth::Tested => {
-                    depth.depth_write_enabled = Some(true);
+        specialize_depth(key.bind_group_data.depth, descriptor);
+        Ok(())
+    }
+}
+
+/// Over everything unless the ghost tests depth ([`GhostDepth`]).
+///
+/// A ghost that tests depth also writes it, so of the poses of a trace the
+/// nearer hide the farther where they overlap rather than all showing through
+/// one another. Only what it visibly draws writes depth: the shader discards
+/// its nearly clear fragments (`GHOST_DEPTH_TESTED` in `ghost.wesl`), which
+/// would otherwise hide what is drawn behind them after them — another
+/// ghost, a faded element, a control — behind a surface nobody can see. The
+/// depth it writes is read by nothing else: the outline draws its own mask,
+/// and the floor's waterline reads the prepass, which a ghost is not in.
+fn specialize_depth(depth: GhostDepth, descriptor: &mut RenderPipelineDescriptor) {
+    if let Some(state) = descriptor.depth_stencil.as_mut() {
+        match depth {
+            GhostDepth::OverEverything => {
+                state.depth_compare = Some(CompareFunction::Always);
+                state.depth_write_enabled = Some(false);
+            }
+            GhostDepth::Tested => {
+                state.depth_write_enabled = Some(true);
+                if let Some(fragment) = descriptor.fragment.as_mut() {
+                    fragment.shader_defs.push("GHOST_DEPTH_TESTED".into());
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -449,19 +475,39 @@ fn adopt_new_originals(
 }
 
 /// Moves each ghosted mesh to the shared material its original and its
-/// ghost's style now call for: an original swapped by a writer, or a style
-/// added to or taken from its ghost.
+/// ghost's style now call for: an original swapped by a writer, a style added
+/// to or taken from its ghost, or a nearer ghost above it — the mesh moved
+/// under another, or a ghost put on between it and the one it was under.
+/// Which ghost is nearest is looked for again only in a frame in which an
+/// entity was reparented or a ghost put on or taken off, so a frame with
+/// neither walks no ancestors.
 #[allow(clippy::too_many_arguments)]
 fn rekey(
-    mut ghosted: Query<(&mut GhostOf, &mut MeshMaterial3d<GhostMaterial>)>,
+    mut ghosted: Query<(Entity, &mut GhostOf, &mut MeshMaterial3d<GhostMaterial>)>,
     has_style: Query<(), With<GhostStyle>>,
     styles: Query<&GhostStyle>,
+    roots: Query<(), With<Ghost>>,
+    parents: Query<&ChildOf>,
+    reparented: Query<(), Changed<ChildOf>>,
+    added: Query<(), Added<Ghost>>,
+    mut removed: RemovedComponents<Ghost>,
     standard: Res<Assets<StandardMaterial>>,
     look: Res<GhostLook>,
     mut materials: ResMut<GhostMaterials>,
     mut ghosts: ResMut<Assets<GhostMaterial>>,
 ) {
-    for (mut of, mut handle) in &mut ghosted {
+    let regather = !reparented.is_empty() || !added.is_empty() || removed.read().count() > 0;
+    for (entity, mut of, mut handle) in &mut ghosted {
+        if regather {
+            let nearest = std::iter::once(entity)
+                .chain(parents.iter_ancestors(entity))
+                .find(|ancestor| roots.contains(*ancestor));
+            if let Some(nearest) = nearest {
+                if nearest != of.root {
+                    of.root = nearest;
+                }
+            }
+        }
         let wanted = key_for(&of.original, of.root, &has_style);
         if wanted == of.key {
             continue;
@@ -865,6 +911,193 @@ mod tests {
         app.update();
         app.update();
         assert_eq!(app.world().resource::<GhostMaterials>().len(), 1);
+    }
+
+    /// An opaque material's colour alpha is not an opacity: its element is
+    /// drawn whole, so its ghost is too. A blended one fades its ghost.
+    #[test]
+    fn only_a_blended_materials_alpha_fades_its_ghost() {
+        let look = GhostLook::default();
+        let clear = Color::srgba(1.0, 0.0, 0.0, 0.0);
+        for mode in [AlphaMode::Opaque, AlphaMode::Mask(0.5)] {
+            let opaque = GhostMaterial::of(
+                &StandardMaterial {
+                    base_color: clear,
+                    alpha_mode: mode,
+                    ..default()
+                },
+                &look,
+            );
+            assert_eq!(opaque.ghost.colour.w, 1.0, "{mode:?}");
+        }
+        let blended = GhostMaterial::of(
+            &StandardMaterial {
+                base_color: clear.with_alpha(0.25),
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            },
+            &look,
+        );
+        assert_eq!(blended.ghost.colour.w, 0.25);
+    }
+
+    /// A style's wash replaces the look's, and its opacity is held between
+    /// nought and one.
+    #[test]
+    fn a_styles_wash_and_opacity_are_taken_and_held() {
+        let material = StandardMaterial::default();
+        let look = GhostLook::default();
+        let washed = GhostMaterial::styled(
+            &material,
+            &look,
+            Some(&GhostStyle {
+                wash: Some(Color::BLACK),
+                opacity: 2.0,
+                ..default()
+            }),
+        );
+        assert_eq!(washed.ghost.wash, LinearRgba::BLACK.to_vec4());
+        assert_eq!(washed.ghost.opacity, 1.0);
+        let below = GhostMaterial::styled(
+            &material,
+            &look,
+            Some(&GhostStyle {
+                opacity: -1.0,
+                ..default()
+            }),
+        );
+        assert_eq!(below.ghost.opacity, 0.0);
+    }
+
+    /// A ghost's depth, changed on its style, changes its material.
+    #[test]
+    fn a_ghost_follows_a_change_of_depth() {
+        let mut app = app();
+        let original = material(&mut app, Color::WHITE);
+        let root = app.world_mut().spawn((Ghost, GhostStyle::default())).id();
+        let mesh = app
+            .world_mut()
+            .spawn((MeshMaterial3d(original), ChildOf(root)))
+            .id();
+        app.update();
+        assert_eq!(ghost_of(&app, mesh).depth, GhostDepth::OverEverything);
+        app.world_mut().get_mut::<GhostStyle>(root).unwrap().depth = GhostDepth::Tested;
+        app.update();
+        assert_eq!(ghost_of(&app, mesh).depth, GhostDepth::Tested);
+    }
+
+    /// A ghost follows its original's image as it changes, one image for
+    /// another included.
+    #[test]
+    fn a_ghost_follows_its_originals_image() {
+        let mut app = app();
+        app.init_resource::<Assets<Image>>();
+        let original = material(&mut app, Color::WHITE);
+        let root = app.world_mut().spawn(Ghost).id();
+        let mesh = app
+            .world_mut()
+            .spawn((MeshMaterial3d(original.clone()), ChildOf(root)))
+            .id();
+        app.update();
+        assert_eq!(ghost_of(&app, mesh).image, None);
+        let show = |app: &mut App| {
+            let image = app
+                .world_mut()
+                .resource_mut::<Assets<Image>>()
+                .add(Image::default());
+            app.world_mut()
+                .resource_mut::<Assets<StandardMaterial>>()
+                .get_mut(&original)
+                .unwrap()
+                .base_color_texture = Some(image.clone());
+            app.update();
+            image
+        };
+        let first = show(&mut app);
+        assert_eq!(ghost_of(&app, mesh).image, Some(first));
+        assert_eq!(ghost_of(&app, mesh).ghost.image, 1.0);
+        let second = show(&mut app);
+        assert_eq!(ghost_of(&app, mesh).image, Some(second), "the new image");
+    }
+
+    /// A depth-tested ghost's pipeline tests and writes depth, and draws only
+    /// what it visibly draws; the default draws over everything and writes
+    /// none.
+    #[test]
+    fn a_tested_ghost_writes_depth_only_where_it_draws() {
+        use bevy::render::render_resource::{DepthStencilState, FragmentState, TextureFormat};
+        let descriptor = || RenderPipelineDescriptor {
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::GreaterEqual),
+                stencil: default(),
+                bias: default(),
+            }),
+            fragment: Some(FragmentState::default()),
+            ..default()
+        };
+        let mut tested = descriptor();
+        specialize_depth(GhostDepth::Tested, &mut tested);
+        let state = tested.depth_stencil.unwrap();
+        assert_eq!(state.depth_write_enabled, Some(true));
+        assert_eq!(state.depth_compare, Some(CompareFunction::GreaterEqual));
+        assert!(tested
+            .fragment
+            .unwrap()
+            .shader_defs
+            .contains(&"GHOST_DEPTH_TESTED".into()));
+
+        let mut over = descriptor();
+        specialize_depth(GhostDepth::OverEverything, &mut over);
+        let state = over.depth_stencil.unwrap();
+        assert_eq!(state.depth_write_enabled, Some(false));
+        assert_eq!(state.depth_compare, Some(CompareFunction::Always));
+        assert!(over.fragment.unwrap().shader_defs.is_empty());
+    }
+
+    /// A mesh moved under another ghost takes that ghost's style, and a ghost
+    /// put on nearer above it is the one it takes.
+    #[test]
+    fn a_mesh_takes_the_style_of_the_nearest_ghost_above_it() {
+        let mut app = app();
+        let original = material(&mut app, Color::WHITE);
+        let faint = GhostStyle {
+            opacity: 0.2,
+            ..default()
+        };
+        let first = app.world_mut().spawn((Ghost, GhostStyle::default())).id();
+        let second = app.world_mut().spawn((Ghost, faint)).id();
+        let mesh = app
+            .world_mut()
+            .spawn((MeshMaterial3d(original), ChildOf(first)))
+            .id();
+        app.update();
+        assert_eq!(ghost_of(&app, mesh).ghost.opacity, 1.0);
+
+        app.world_mut().entity_mut(mesh).insert(ChildOf(second));
+        app.update();
+        assert_eq!(
+            ghost_of(&app, mesh).ghost.opacity,
+            0.2,
+            "moved under the faint one"
+        );
+
+        let fainter = GhostStyle {
+            opacity: 0.1,
+            ..default()
+        };
+        let between = app
+            .world_mut()
+            .spawn((Ghost, fainter, ChildOf(second)))
+            .id();
+        app.world_mut().entity_mut(mesh).insert(ChildOf(between));
+        app.update();
+        assert_eq!(
+            ghost_of(&app, mesh).ghost.opacity,
+            0.1,
+            "the nearer ghost's"
+        );
     }
 
     /// A ghost that tests depth asks for a pipeline that does.
