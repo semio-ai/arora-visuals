@@ -52,6 +52,13 @@ use crate::view_layer::{
     give_layers, keep_joined, only, without_masks, ViewLayerPlugin, ViewLayers, WantsViewLayers,
 };
 
+/// The mask's format. It is an sRGB one because Bevy gives a camera drawing
+/// into a plain `Rgba8Unorm` target main textures that also need an sRGB view
+/// of themselves, which WebGL2 cannot make: the mask camera's frame would fail
+/// there, and the view's with it. Only the mask's alpha is read, and sRGB
+/// encoding leaves alpha as it is.
+const MASK_FORMAT: TextureFormat = TextureFormat::Rgba8UnormSrgb;
+
 /// Outline this camera's view of the selection.
 #[derive(Component, Clone, Copy, Debug)]
 pub struct OutlineView {
@@ -249,12 +256,7 @@ fn attach_outline(
 ) {
     for (view, camera, settings, given) in &views {
         // Resized to the view as soon as the view knows its size.
-        let mask = images.add(Image::new_target_texture(
-            1,
-            1,
-            TextureFormat::Rgba8Unorm,
-            None,
-        ));
+        let mask = images.add(Image::new_target_texture(1, 1, MASK_FORMAT, None));
         let material = materials.add(OutlineMaterial {
             outline: uniform(settings, None, 1.0),
             mask: mask.clone(),
@@ -615,6 +617,34 @@ mod tests {
         assert_eq!(
             app.world().get::<RenderLayers>(mask_camera),
             Some(&RenderLayers::layer(given.mask)),
+        );
+    }
+
+    /// The mask is a target WebGL2 can draw into: one whose main textures
+    /// need no second view format.
+    #[test]
+    fn the_mask_is_a_target_webgl2_can_draw() {
+        let mut app = outline_app();
+        let view = app
+            .world_mut()
+            .spawn((Camera::default(), OutlineView::default()))
+            .id();
+        app.update();
+        let mask = app
+            .world()
+            .get::<OutlineParts>(view)
+            .expect("outlined")
+            .mask
+            .clone();
+        let image = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&mask)
+            .expect("the mask");
+        assert!(
+            image.texture_descriptor.format.is_srgb(),
+            "{:?} gives the mask camera main textures with an sRGB view format",
+            image.texture_descriptor.format
         );
     }
 
