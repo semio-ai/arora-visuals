@@ -21,7 +21,7 @@ use bevy_ecs::lifecycle::HookContext;
 use bevy_ecs::query::Changed;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::schedule::SystemSet;
-use bevy_ecs::system::{Commands, Query};
+use bevy_ecs::system::{Commands, Query, ResMut};
 use bevy_ecs::world::{DeferredWorld, World};
 
 use crate::binding::SceneBindings;
@@ -122,11 +122,23 @@ pub struct Loading {
 /// An id can name two entities while a reload is under way: the instance
 /// showing and its replacement. The one not [`Superseded`] is the instance
 /// the id addresses.
+///
+/// **Each entity is filed under the id it was indexed with**, recorded beside
+/// it, and taken out under that id, so an id edited in place — through a
+/// mutable [`EntityInstance`] or [`Loading`], which fires no hook — can never
+/// make a removal erase another entity's entry. [`reindex_renamed`] moves an
+/// entity edited that way to its new id, before the frame's
+/// [`InstanceSystems::Intake`]; until it runs, the entity is found under the
+/// id it was indexed with.
 #[derive(Resource, Default, Debug)]
 pub struct InstanceIndex {
     by_id: HashMap<String, Vec<Entity>>,
     superseded: HashSet<Entity>,
     loading: HashMap<String, Vec<Entity>>,
+    /// The id each instance entity is filed under.
+    filed: HashMap<Entity, String>,
+    /// The id each loading entity is filed under.
+    filed_loading: HashMap<Entity, String>,
 }
 
 impl InstanceIndex {
@@ -164,6 +176,34 @@ impl InstanceIndex {
     /// Whether any instance is loading.
     pub fn any_loading(&self) -> bool {
         !self.loading.is_empty()
+    }
+
+    fn file_instance(&mut self, entity: Entity, id: String) {
+        if let Some(old) = self.filed.remove(&entity) {
+            Self::take(&mut self.by_id, &old, entity);
+        }
+        Self::add(&mut self.by_id, &id, entity);
+        self.filed.insert(entity, id);
+    }
+
+    fn unfile_instance(&mut self, entity: Entity) {
+        if let Some(old) = self.filed.remove(&entity) {
+            Self::take(&mut self.by_id, &old, entity);
+        }
+    }
+
+    fn file_loading(&mut self, entity: Entity, id: String) {
+        if let Some(old) = self.filed_loading.remove(&entity) {
+            Self::take(&mut self.loading, &old, entity);
+        }
+        Self::add(&mut self.loading, &id, entity);
+        self.filed_loading.insert(entity, id);
+    }
+
+    fn unfile_loading(&mut self, entity: Entity) {
+        if let Some(old) = self.filed_loading.remove(&entity) {
+            Self::take(&mut self.loading, &old, entity);
+        }
     }
 
     fn add(map: &mut HashMap<String, Vec<Entity>>, id: &str, entity: Entity) {
@@ -204,19 +244,13 @@ fn index_instance(mut world: DeferredWorld, context: HookContext) {
         return;
     };
     on_index(&mut world, move |index| {
-        InstanceIndex::add(&mut index.by_id, &id, context.entity)
+        index.file_instance(context.entity, id)
     });
 }
 
 fn unindex_instance(mut world: DeferredWorld, context: HookContext) {
-    let Some(id) = world
-        .get::<EntityInstance>(context.entity)
-        .map(|instance| instance.id.clone())
-    else {
-        return;
-    };
     on_index(&mut world, move |index| {
-        InstanceIndex::take(&mut index.by_id, &id, context.entity)
+        index.unfile_instance(context.entity)
     });
 }
 
@@ -240,20 +274,34 @@ fn index_loading(mut world: DeferredWorld, context: HookContext) {
         return;
     };
     on_index(&mut world, move |index| {
-        InstanceIndex::add(&mut index.loading, &id, context.entity)
+        index.file_loading(context.entity, id)
     });
 }
 
 fn unindex_loading(mut world: DeferredWorld, context: HookContext) {
-    let Some(id) = world
-        .get::<Loading>(context.entity)
-        .map(|loading| loading.instance.clone())
-    else {
-        return;
-    };
     on_index(&mut world, move |index| {
-        InstanceIndex::take(&mut index.loading, &id, context.entity)
+        index.unfile_loading(context.entity)
     });
+}
+
+/// Moves each instance or loading entity whose id was edited in place to the
+/// id it now carries: an edit through a mutable component fires no hook, so
+/// the index learns of it from change detection here.
+pub fn reindex_renamed(
+    mut index: ResMut<InstanceIndex>,
+    instances: Query<(Entity, &EntityInstance), Changed<EntityInstance>>,
+    loading: Query<(Entity, &Loading), Changed<Loading>>,
+) {
+    for (entity, instance) in &instances {
+        if index.filed.get(&entity) != Some(&instance.id) {
+            index.file_instance(entity, instance.id.clone());
+        }
+    }
+    for (entity, loading) in &loading {
+        if index.filed_loading.get(&entity) != Some(&loading.instance) {
+            index.file_loading(entity, loading.instance.clone());
+        }
+    }
 }
 
 /// Where each stage of a frame's work on instances runs, in `Update`, in
@@ -307,29 +355,45 @@ impl InstanceElements {
     }
 }
 
-/// Tags each indexed instance's element nodes with [`ElementNode`] and
-/// [`ElementOf`], from its [`SceneBindings`], so the two always agree: the
-/// bindings stay the index a value is applied through, and the tags are the
-/// same joins as ECS data. Runs after [`InstanceSystems::Index`], for any
-/// host's indexing.
+/// Reconciles each indexed instance's element tags — [`ElementNode`] and
+/// [`ElementOf`] — with its [`SceneBindings`] whenever the instance changes,
+/// so the two always agree: the bindings stay the index a value is applied
+/// through, and the tags are the same joins as ECS data. A node the bindings
+/// no longer name loses its tags; one whose element id changed, or that moved
+/// to this instance, is retagged. Runs after [`InstanceSystems::Index`], for
+/// any host's indexing.
 ///
-/// A node one element already tags keeps that tag; with ids taken in order, a
-/// node two elements name carries the first, the same one each time.
+/// With ids taken in order, a node two elements name carries the first, the
+/// same one each time.
 pub fn tag_elements(
     mut commands: Commands,
-    instances: Query<(Entity, &EntityInstance), Changed<EntityInstance>>,
-    tagged: Query<&ElementOf>,
+    instances: Query<(Entity, &EntityInstance, Option<&InstanceElements>), Changed<EntityInstance>>,
+    tagged: Query<(&ElementNode, &ElementOf)>,
 ) {
-    for (root, instance) in &instances {
+    for (root, instance, members) in &instances {
         if !instance.bindings.indexed {
             continue;
         }
         let mut ids: Vec<&String> = instance.bindings.elements.keys().collect();
         ids.sort();
-        let mut done = HashSet::new();
+        let mut wanted: HashMap<Entity, &String> = HashMap::new();
         for id in ids {
-            let node = instance.bindings.elements[id].node;
-            if !done.insert(node) || tagged.get(node).is_ok_and(|of| of.0 == root) {
+            wanted
+                .entry(instance.bindings.elements[id].node)
+                .or_insert(id);
+        }
+        for node in members.map(InstanceElements::nodes).unwrap_or_default() {
+            if !wanted.contains_key(node) {
+                commands
+                    .entity(*node)
+                    .try_remove::<(ElementNode, ElementOf)>();
+            }
+        }
+        for (node, id) in wanted {
+            if tagged
+                .get(node)
+                .is_ok_and(|(tag, of)| tag.id == *id && of.0 == root)
+            {
                 continue;
             }
             commands
@@ -368,9 +432,12 @@ impl bevy::app::Plugin for InstancePlugin {
             )
             .add_systems(
                 Update,
-                tag_elements
-                    .after(InstanceSystems::Index)
-                    .before(InstanceSystems::Apply),
+                (
+                    reindex_renamed.before(InstanceSystems::Intake),
+                    tag_elements
+                        .after(InstanceSystems::Index)
+                        .before(InstanceSystems::Apply),
+                ),
             );
     }
 }
@@ -421,6 +488,78 @@ mod tests {
 
         world.despawn(a);
         assert_eq!(world.resource::<InstanceIndex>().get("c"), None);
+    }
+
+    /// An id edited in place is removed under the id it was indexed with, so
+    /// a removal never erases another entity's entry; and the index moves it
+    /// to its new id once it notices the edit.
+    #[test]
+    fn an_id_edited_in_place_is_moved_and_removed_by_its_own_entry() {
+        use bevy_ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        let a = world.spawn(instance("a")).id();
+        let b = world.spawn(instance("b")).id();
+        world.get_mut::<EntityInstance>(a).unwrap().id = "b".into();
+        assert_eq!(
+            world.resource::<InstanceIndex>().get("a"),
+            Some(a),
+            "under its indexed id until noticed"
+        );
+        world.run_system_once(reindex_renamed).unwrap();
+        let index = world.resource::<InstanceIndex>();
+        assert_eq!(index.get("a"), None);
+        let mut both: Vec<_> = index.all("b").collect();
+        both.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(both, expected);
+
+        // Edited again and removed before it is noticed: its own entry goes,
+        // and the other entity under "b" stays.
+        world.get_mut::<EntityInstance>(a).unwrap().id = "c".into();
+        world.entity_mut(a).remove::<EntityInstance>();
+        let index = world.resource::<InstanceIndex>();
+        assert_eq!(index.all("b").collect::<Vec<_>>(), vec![b]);
+        assert_eq!(index.get("c"), None);
+    }
+
+    /// An app with the plugin notices an id edited in place within a frame.
+    #[cfg(feature = "view")]
+    #[test]
+    fn the_plugin_moves_an_id_edited_in_place() {
+        use bevy::prelude::*;
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, InstancePlugin));
+        let a = app.world_mut().spawn(instance("a")).id();
+        app.update();
+        app.world_mut().get_mut::<EntityInstance>(a).unwrap().id = "b".into();
+        app.update();
+        assert_eq!(app.world().resource::<InstanceIndex>().get("b"), Some(a));
+    }
+
+    /// The same holds for a loading id edited in place.
+    #[test]
+    fn a_loading_id_edited_in_place_is_moved_and_removed_by_its_own_entry() {
+        use bevy_ecs::system::RunSystemOnce;
+
+        let mut world = World::new();
+        let loading = |id: &str| Loading {
+            instance: id.into(),
+        };
+        let a = world.spawn(loading("a")).id();
+        let b = world.spawn(loading("b")).id();
+        world.get_mut::<Loading>(a).unwrap().instance = "b".into();
+        world.run_system_once(reindex_renamed).unwrap();
+        assert!(!world.resource::<InstanceIndex>().is_loading("a"));
+        world.get_mut::<Loading>(a).unwrap().instance = "c".into();
+        world.entity_mut(a).remove::<Loading>();
+        let index = world.resource::<InstanceIndex>();
+        assert!(index.is_loading("b"), "b's own entry stays");
+        assert!(!index.is_loading("c"));
+        world.entity_mut(b).remove::<Loading>();
+        assert!(!world.resource::<InstanceIndex>().any_loading());
     }
 
     #[test]
@@ -486,5 +625,59 @@ mod tests {
         let mut expected = vec![head, arm];
         expected.sort();
         assert_eq!(nodes, expected);
+
+        // The bindings change: "head" is renamed "face", "arm" is dropped and
+        // a new element "eye" takes a node of its own. The tags follow.
+        let eye = world.spawn_empty().id();
+        {
+            let mut shown = world.get_mut::<EntityInstance>(root).unwrap();
+            let elements = &mut shown.bindings.elements;
+            let head_targets = elements.remove("head").unwrap();
+            elements.insert("face".into(), head_targets);
+            elements.remove("arm");
+            elements.insert(
+                "eye".into(),
+                ElementTargets {
+                    node: eye,
+                    mesh: None,
+                    morph: None,
+                },
+            );
+        }
+        schedule.run(&mut world);
+        assert_eq!(
+            world.get::<ElementNode>(head),
+            Some(&ElementNode { id: "face".into() }),
+            "renamed"
+        );
+        assert!(world.get::<ElementNode>(arm).is_none(), "dropped");
+        assert!(world.get::<ElementOf>(arm).is_none());
+        assert_eq!(world.get::<ElementOf>(eye), Some(&ElementOf(root)));
+        let mut nodes = world
+            .get::<InstanceElements>(root)
+            .unwrap()
+            .nodes()
+            .to_vec();
+        nodes.sort();
+        let mut expected = vec![head, eye];
+        expected.sort();
+        assert_eq!(nodes, expected);
+
+        // "eye" moves to another node: the old one is untagged.
+        let other = world.spawn_empty().id();
+        world
+            .get_mut::<EntityInstance>(root)
+            .unwrap()
+            .bindings
+            .elements
+            .get_mut("eye")
+            .unwrap()
+            .node = other;
+        schedule.run(&mut world);
+        assert!(world.get::<ElementOf>(eye).is_none(), "moved off");
+        assert_eq!(
+            world.get::<ElementNode>(other),
+            Some(&ElementNode { id: "eye".into() })
+        );
     }
 }
