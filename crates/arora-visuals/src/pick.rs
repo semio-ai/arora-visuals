@@ -34,6 +34,13 @@
 //! over empty space is not a request to clear the selection. A release over a
 //! different element than any the press found picks nothing. A press or
 //! release outside every drawn rectangle belongs to no instance.
+//!
+//! **A press and its release in one frame are a click too.** Bevy sends a
+//! press to what the pointer is over this frame but a release to what it was
+//! over the frame before, so a pointer that reached the window in the frame
+//! it pressed and let go — a quick tap on a slow frame, a touch that begins
+//! and ends between frames — releases onto nothing. Such a release is decided
+//! where the pointer is now, as the window's release would have been.
 
 use bevy::camera::primitives::Aabb;
 use bevy::ecs::system::SystemParam;
@@ -43,8 +50,11 @@ use bevy::mesh::{Indices, PrimitiveTopology};
 use std::collections::{HashMap, HashSet};
 
 use bevy::picking::events::{PointerPress, PointerRelease};
+use bevy::picking::hover::HoverMap;
 use bevy::picking::mesh_picking::ray_cast::{ray_mesh_intersection, Backfaces};
+use bevy::picking::pointer::{Location, PointerAction, PointerInput};
 use bevy::picking::pointer::{PointerButton, PointerId};
+use bevy::picking::PickingSystems;
 use bevy::prelude::*;
 
 use crate::binding::ElementTargets;
@@ -101,6 +111,10 @@ impl Plugin for PickPlugin {
             .init_resource::<ReleasedElsewhere>()
             .add_observer(on_press)
             .add_observer(on_release)
+            .add_systems(
+                PreUpdate,
+                release_reaching_nothing.after(PickingSystems::Hover),
+            )
             .add_systems(PostUpdate, forget_unreleased_press);
     }
 }
@@ -263,6 +277,75 @@ fn on_release(
     let Some(press) = pressed.0.remove(&pointer) else {
         return;
     };
+    released(
+        &press,
+        &release.pointer.location(),
+        &instances,
+        &views,
+        &elements,
+        gizmos.as_deref(),
+        &mut picks,
+    );
+}
+
+/// Decides, as the window's release would have, the release of a pointer
+/// that was over nothing the frame before, so Bevy sent the release nowhere
+/// ([module docs](self)). It is the window's when the window is what the
+/// pointer is over now. A press let go over a panel is left to
+/// `forget_unreleased_press`.
+#[allow(clippy::too_many_arguments)]
+fn release_reaching_nothing(
+    mut inputs: MessageReader<PointerInput>,
+    hovered: Option<Res<HoverMap>>,
+    instances: Query<(Entity, &EntityInstance), Without<Superseded>>,
+    views: Views,
+    elements: ElementMeshes,
+    windows: Query<(), With<Window>>,
+    gizmos: Option<Res<GizmoPointer>>,
+    elsewhere: Res<ReleasedElsewhere>,
+    mut pressed: ResMut<Pressed>,
+    mut picks: MessageWriter<Picked>,
+) {
+    for input in inputs.read() {
+        if !matches!(input.action, PointerAction::Release(PointerButton::Primary))
+            || elsewhere.0.contains(&input.pointer_id)
+        {
+            continue;
+        }
+        let over_window = hovered
+            .as_ref()
+            .and_then(|hovered| hovered.get(&input.pointer_id))
+            .is_some_and(|over| over.keys().any(|entity| windows.contains(*entity)));
+        if !over_window {
+            continue;
+        }
+        // A release the window took has already decided its press.
+        let Some(press) = pressed.0.remove(&input.pointer_id) else {
+            continue;
+        };
+        released(
+            &press,
+            &input.location,
+            &instances,
+            &views,
+            &elements,
+            gizmos.as_deref(),
+            &mut picks,
+        );
+    }
+}
+
+/// Decides the window's release of `press` at `location` as a pick, a miss
+/// or nothing, and sends the pick.
+fn released(
+    press: &Press,
+    location: &Location,
+    instances: &Query<(Entity, &EntityInstance), Without<Superseded>>,
+    views: &Views,
+    elements: &ElementMeshes,
+    gizmos: Option<&GizmoPointer>,
+    picks: &mut MessageWriter<Picked>,
+) {
     // A press that took a gizmo's handle is the gizmo's, and so is its
     // release: the button is still the gizmo's as the release arrives, since
     // the gizmo lets go of it only in `Update`, after this — whether its drag
@@ -270,15 +353,9 @@ fn on_release(
     if gizmos.is_some_and(|gizmos| gizmos.owns_button()) {
         return;
     }
-    let position = release.pointer.position;
-    let found = under(
-        position,
-        &release.pointer.target,
-        &instances,
-        &views,
-        &elements,
-    );
-    let Some((instance, element_id)) = decide(&press, found, position) else {
+    let position = location.position;
+    let found = under(position, &location.target, instances, views, elements);
+    let Some((instance, element_id)) = decide(press, found, position) else {
         return;
     };
     let Ok((_, held)) = instances.get(instance) else {
@@ -797,6 +874,214 @@ mod tests {
             world.flush();
             world.resource::<Messages<Picked>>().len()
         }
+    }
+
+    /// An app picking as a host's does, through Bevy's own pointer events,
+    /// with a robot of no elements seen through a camera drawing to the
+    /// window: a click anywhere on it is a miss of that robot.
+    fn picking_app() -> (App, Entity) {
+        use bevy::camera::{ComputedCameraValues, RenderTarget, RenderTargetInfo};
+        use bevy::picking::{InteractionPlugin, PickingPlugin};
+        use bevy::window::{PrimaryWindow, WindowRef};
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, PickingPlugin, InteractionPlugin, PickPlugin))
+            .init_resource::<Assets<Mesh>>();
+        let window = app
+            .world_mut()
+            .spawn((Window::default(), PrimaryWindow))
+            .id();
+        let camera = app
+            .world_mut()
+            .spawn((
+                Camera {
+                    computed: ComputedCameraValues {
+                        target_info: Some(RenderTargetInfo {
+                            physical_size: UVec2::splat(400),
+                            scale_factor: 1.0,
+                        }),
+                        ..default()
+                    },
+                    ..default()
+                },
+                GlobalTransform::IDENTITY,
+                RenderTarget::Window(WindowRef::Entity(window)),
+            ))
+            .id();
+        app.world_mut().spawn(EntityInstance {
+            id: "robot".to_string(),
+            asset_path: String::new(),
+            meta: Default::default(),
+            bindings: Default::default(),
+            camera,
+            draw_order: 0,
+            ready: true,
+        });
+        app.world_mut().spawn(PointerId::Mouse);
+        app.update();
+        (app, window)
+    }
+
+    /// Sends the mouse's inputs, at `x` across the window, all in one frame,
+    /// and counts the picks that frame decided.
+    fn in_one_frame(app: &mut App, window: Entity, inputs: &[(f32, PointerAction)]) -> usize {
+        use bevy::camera::NormalizedRenderTarget;
+        use bevy::window::WindowRef;
+
+        let target =
+            NormalizedRenderTarget::Window(WindowRef::Entity(window).normalize(None).unwrap());
+        for (x, action) in inputs {
+            app.world_mut().write_message(PointerInput {
+                pointer_id: PointerId::Mouse,
+                location: Location {
+                    target: target.clone(),
+                    position: Vec2::new(*x, 200.0),
+                },
+                action: *action,
+            });
+        }
+        app.update();
+        app.world_mut()
+            .resource_mut::<Messages<Picked>>()
+            .drain()
+            .count()
+    }
+
+    fn moved() -> PointerAction {
+        PointerAction::Move { delta: Vec2::ONE }
+    }
+
+    /// A pointer that reaches the window, presses and lets go all in one
+    /// frame clicks: Bevy sends that release nowhere, as the pointer was
+    /// over nothing the frame before.
+    #[test]
+    fn a_press_and_release_in_the_frame_the_pointer_arrives_is_a_click() {
+        let (mut app, window) = picking_app();
+        let press = PointerAction::Press(PointerButton::Primary);
+        let release = PointerAction::Release(PointerButton::Primary);
+        assert_eq!(
+            in_one_frame(
+                &mut app,
+                window,
+                &[(200.0, moved()), (200.0, press), (200.0, release)]
+            ),
+            1
+        );
+    }
+
+    /// A click whose press and release fall in one frame, or in frames of
+    /// their own, picks once either way; one that moves past the slop over
+    /// nothing in that frame is a drag, and picks nothing.
+    #[test]
+    fn a_click_picks_once_however_its_frames_fall() {
+        let press = || PointerAction::Press(PointerButton::Primary);
+        let release = || PointerAction::Release(PointerButton::Primary);
+
+        let (mut app, window) = picking_app();
+        assert_eq!(in_one_frame(&mut app, window, &[(200.0, moved())]), 0);
+        assert_eq!(
+            in_one_frame(&mut app, window, &[(200.0, press()), (200.0, release())]),
+            1,
+            "pressed and let go in one frame, over the window the frame before"
+        );
+        assert_eq!(in_one_frame(&mut app, window, &[(200.0, press())]), 0);
+        assert_eq!(
+            in_one_frame(&mut app, window, &[(200.0, release())]),
+            1,
+            "pressed and let go in frames of their own"
+        );
+
+        let (mut app, window) = picking_app();
+        let far = 200.0 + MISS_SLOP + 10.0;
+        assert_eq!(
+            in_one_frame(
+                &mut app,
+                window,
+                &[
+                    (200.0, moved()),
+                    (200.0, press()),
+                    (far, moved()),
+                    (far, release())
+                ]
+            ),
+            0,
+            "a drag over nothing, in the frame the pointer arrives"
+        );
+    }
+
+    /// Something drawn over the scene, under the mouse while it holds an
+    /// entity: a panel, as a picking backend reports one.
+    #[derive(Resource, Default)]
+    struct Panel(Option<Entity>);
+
+    fn panel_hits(panel: Res<Panel>, mut hits: MessageWriter<bevy::picking::backend::PointerHits>) {
+        use bevy::picking::backend::{HitData, PointerHits};
+
+        if let Some(panel) = panel.0 {
+            hits.write(PointerHits::new(
+                PointerId::Mouse,
+                vec![(panel, HitData::new(panel, 0.0, None, None))],
+                1.0,
+            ));
+        }
+    }
+
+    /// A release decided where the pointer is now is the window's only when
+    /// the window is what the pointer is over, so none of these picks: a tap
+    /// over a panel the pointer reached that frame; a tap the frame after the
+    /// pointer was over a panel, whose release Bevy sent to the panel; a
+    /// press on the scene let go over a panel after the pointer was over
+    /// nothing.
+    #[test]
+    fn a_quick_tap_over_a_panel_is_not_the_scene_s() {
+        let press = || PointerAction::Press(PointerButton::Primary);
+        let release = || PointerAction::Release(PointerButton::Primary);
+        let with_panel = || {
+            let (mut app, window) = picking_app();
+            app.init_resource::<Panel>().add_systems(
+                PreUpdate,
+                panel_hits.in_set(bevy::picking::PickingSystems::Backend),
+            );
+            let panel = app.world_mut().spawn_empty().id();
+            (app, window, panel)
+        };
+
+        let (mut app, window, panel) = with_panel();
+        app.world_mut().resource_mut::<Panel>().0 = Some(panel);
+        assert_eq!(
+            in_one_frame(
+                &mut app,
+                window,
+                &[(200.0, moved()), (200.0, press()), (200.0, release())]
+            ),
+            0,
+            "over the panel now"
+        );
+
+        let (mut app, window, panel) = with_panel();
+        app.world_mut().resource_mut::<Panel>().0 = Some(panel);
+        assert_eq!(in_one_frame(&mut app, window, &[(200.0, moved())]), 0);
+        app.world_mut().resource_mut::<Panel>().0 = None;
+        assert_eq!(
+            in_one_frame(&mut app, window, &[(200.0, press()), (200.0, release())]),
+            0,
+            "over the panel the frame before, so let go there"
+        );
+
+        // Pressed on the scene, then off every view — over nothing, so the
+        // release reaches nothing — then back over a panel to let go.
+        let (mut app, window, panel) = with_panel();
+        assert_eq!(
+            in_one_frame(&mut app, window, &[(200.0, moved()), (200.0, press())]),
+            0
+        );
+        assert_eq!(in_one_frame(&mut app, window, &[(600.0, moved())]), 0);
+        app.world_mut().resource_mut::<Panel>().0 = Some(panel);
+        assert_eq!(
+            in_one_frame(&mut app, window, &[(200.0, moved()), (200.0, release())]),
+            0,
+            "let go over the panel, from over nothing"
+        );
     }
 
     /// A press is kept while it is held — by a touch too, which sets no
