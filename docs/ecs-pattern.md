@@ -137,7 +137,7 @@ events, because both serialise this crate's types. The divergences:
 | Control target | `instance`, deprecated `robot`, `element`, `goal{pose}` | `instance`, `element`, `goal{pose, view?}` | scene TS omits `goal.view`. |
 | `safeArea` | — | event + map | vizij only; scene uses `setActiveArea`. |
 | Overlay `GizmoKind` | `"Transform" \| "Joint"` | same | Capitalised, unlike every other `kind`. |
-| Joint controls | resolved (`JointRig`) | accepted, never resolved (no resolver in `ControlSystems::Joints`), dropped with a log | A driver cannot tell from the API. |
+| Joint controls | resolved (`JointRig`) | refused at the API with an error | Faces have no scene-style joints (§7). |
 
 Rule going forward: a concept both hosts have takes one name and one shape,
 defined once (serde types here, TS types generated or shared), and a
@@ -165,10 +165,10 @@ instance and instance-relative cameras are the rendering work.
 |---|---|---|
 | Render state is the value store (materials, `Transform`, `Emission` by `AssetId`) | A Studio ECS binds editors, undo and recording to values; there are none to bind to | Introduce `AnimatableValues` first as a write-through record beside the existing apply; switch readers (joint read-back, hold resolution) to it; then make apply consume only changes |
 | String-keyed per-instance resources | No change detection, no despawn cleanup, scans per lookup | Add the instance index (R1) now; move each table to a component when its code is next touched; survive-reload needs a stable root (below) |
-| Reload spawns a new root (`Superseded`) | Anything per instance either dies on reload or must live outside the entity — which is why `Selections`, `Holds`, `FaceViews`, `Placements` are resources | Keep the instance root stable across reloads and swap the scene child; readiness gates the new child, not a new root |
+| Reload spawns a new root (`Superseded`) | Anything per instance either dies on reload or must live outside the entity — which is why `Selections`, `Holds`, `FaceViews`, `Placements` are resources | The instance root is stable for the instance's life and a reload swaps its scene child (§7); readiness gates the new child, not a new root |
 | Elements are map entries | Element-level selection, inspection, relationships (mounting, attachment) need queries | Tag nodes with `Element { id }` + `ElementOf` during the existing index pass; keep `SceneBindings` as a derived index |
 | Per-instance asset loads | Model/instance split is Studio's core identity split; per-instance loads double cost and hide "same model" | Content-addressed asset paths (hash of bytes) so equal GLBs share a handle and different ones cannot collide; `Model` asset holding `AssetMeta` and joint template |
-| Duplicated index/apply in two hosts | A third consumer would be a third copy; fixes land in one | Move element join and transform/morph apply here behind `InstanceSystems`; leave material policy (PBR vs vizij's unlit `Surface`) and rig forms to hosts |
+| Duplicated index/apply in two hosts | A third consumer would be a third copy; fixes land in one | Move element join, transform/morph apply and material writes here behind `InstanceSystems`, through one material API (§7); rig forms stay with hosts |
 | No change detection on value intake | Cost grows with animatable count, not with changes; hard to record | vizij: consume `pose_updates`; scene: already event-driven, keep it; shared apply runs on `Changed<AnimatableValues>` |
 | Process-wide statics | Blocks nesting and any multi-view Studio page | Move into per-app resources behind the existing wasm entry points |
 | Ids | Already opaque strings, so Studio ids fit | Keep them opaque; never parse an instance id; add parent relation rather than path-shaped ids |
@@ -186,7 +186,7 @@ L a week or more.
 | 3 | `Element { id }` + `ElementOf` on joined nodes, written by the existing index passes; `select::covered` uses relationships | arora-visuals, scene, vizij | S–M | Low |
 | 4 | `AnimatableValues` component written through by both apply paths; arora-scene's `Emission` and joint read-back move onto it | arora-visuals, scene, vizij | M | Medium — material copy rules must not change |
 | 5 | Host API alignment: one noun for the instance map (alias `robots`/`faces` to `instances`), expose `goal.view` in scene TS, rename vizij's static-feature `setValue`, lowercase `GizmoKind`, shared TS types for control/overlay | scene, vizij | S–M | Low — additive with deprecations |
-| 6 | Shared index + transform/morph apply moved here, host rigs and material policy plugged into `Apply`/`Derive` | arora-visuals, then both hosts | L | Medium–High — vizij holds, per-axis assembly, contended keys |
+| 6 | Shared index, transform/morph apply and one material API moved here; host rigs plug into `Apply` | arora-visuals, then both hosts | L | Medium–High — vizij holds, per-axis assembly, contended keys, vizij's surfaces moving onto the common material API |
 | 7 | Content-addressed model loading and a shared `Model`; per-instance material copy-on-write only | arora-visuals, both hosts | M | Medium — asset lifetime in wasm memory |
 | 8 | Stable instance root across reload; move `Selections`, `Holds`, `FaceViews`, `Placements`, statics into components | arora-visuals, both hosts | M–L | Medium — readiness and swap ordering |
 | 9 | Per-app resources replace wasm statics | scene-wasm, vizij web | M | Medium |
@@ -197,16 +197,24 @@ Changes 1–3 are independent and can land in any order; 4 precedes 6; 8
 precedes moving survive-reload intent onto components; 9 and 11 follow 1, 2
 and 8.
 
-## 7. Open decisions
+## 7. Settled design
 
-- **Reload model.** A stable root with a swapped scene child (this note's
-  recommendation) versus two roots with `Superseded`. It decides where
-  reload-surviving intent can live.
-- **Material policy.** Whether the shared apply writes materials at all, or
-  stops at values and leaves materials to each host's `Derive` (vizij composes
-  unlit `Surface`s; the scene writes PBR materials).
-- **Value addressing at the edge.** Whether the shared layer should accept a
-  device-prefix → instance routing table as a helper, or leave it wholly to
-  hosts.
-- **Joint controls on faces.** Whether vizij resolves joints or refuses joint
-  adds at the API, rather than dropping them in a log.
+- **An instance is one long-lived Bevy entity.** It stands for the instance
+  from its first load to its unload. The loaded file's content is its child,
+  and a reload replaces that child: the old child keeps drawing until the new
+  one is ready, then goes. Per-instance state — selections, holds, views,
+  placements, values — is components on the instance entity, so it survives
+  every reload with no table keyed by the host's id. Built by change 8.
+- **One material API, in this crate.** Colour, opacity, emissive and the other
+  material features are written through one shared material path for every
+  host. Nothing assumes a host's surfaces are unlit: vizij draws unlit
+  surfaces today, and may draw lit, PBR ones later, so the shared path must
+  serve both. Change 6 carries this.
+- **Arora keys are routed by the hosts.** The shared layer addresses
+  `(instance, animatable)` and `(instance, element, feature)` only (R6); a host
+  maps a device namespace to an instance. A shared routing helper waits until
+  nesting needs one.
+- **Faces take no joint controls.** vizij refuses a joint control add at the
+  API with an error the driver hears. A face is more likely to gain a skeleton
+  with bones than scene-style joints, so joint controls are not the form a
+  face's rig control will take.
