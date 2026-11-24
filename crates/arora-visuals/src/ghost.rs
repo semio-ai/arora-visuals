@@ -26,8 +26,9 @@
 //! toward a dark colour instead, and may want the rim stronger there to hold
 //! its outline. [`GhostStyle`] beside a [`Ghost`] changes one ghost: its
 //! colour, wash, rim, opacity, and whether it tests depth — so one ghost can
-//! be faded or recoloured over time, and a trace of many ghosts can hide
-//! behind the scene and one another instead of all showing at once.
+//! be faded or recoloured over time, and the poses of a trace can hide behind
+//! the solid scene instead of all showing over it ([`GhostDepth::Tested`]
+//! says what that does not do).
 //!
 //! **Ghosts share their materials.** Every mesh showing the same original
 //! material under the same look shares one [`GhostMaterial`]: one per
@@ -104,8 +105,12 @@ pub enum GhostDepth {
     /// solid robot does, and depth would hide it inside that robot.
     #[default]
     OverEverything,
-    /// Hidden by what stands in front of it, other ghosts of this kind
-    /// included, as the poses of a trace want to be.
+    /// Hidden by the solid scene standing in front of it, as the poses of a
+    /// trace want to be. Ghosts do not hide one another: a ghost is blended,
+    /// and blended things are drawn farthest first, so a farther ghost is
+    /// already drawn when a nearer one covers it. Overlapping poses of a
+    /// trace therefore show through each other, as over-everything ghosts
+    /// do; each still hides behind solid geometry.
     Tested,
 }
 
@@ -302,27 +307,16 @@ impl Material for GhostMaterial {
 
 /// Over everything unless the ghost tests depth ([`GhostDepth`]).
 ///
-/// A ghost that tests depth also writes it, so of the poses of a trace the
-/// nearer hide the farther where they overlap rather than all showing through
-/// one another. Only what it visibly draws writes depth: the shader discards
-/// its nearly clear fragments (`GHOST_DEPTH_TESTED` in `ghost.wesl`), which
-/// would otherwise hide what is drawn behind them after them — another
-/// ghost, a faded element, a control — behind a surface nobody can see. The
-/// depth it writes is read by nothing else: the outline draws its own mask,
-/// and the floor's waterline reads the prepass, which a ghost is not in.
+/// A ghost that tests depth only tests it. Writing it would not make ghosts
+/// hide one another — blended things are drawn farthest first, so a nearer
+/// ghost's depth arrives after the farther one is drawn — and would instead
+/// hide, by the order meshes happen to sort in, whatever blended thing is
+/// drawn after it behind a nearly clear face: a faded element, a control.
 fn specialize_depth(depth: GhostDepth, descriptor: &mut RenderPipelineDescriptor) {
     if let Some(state) = descriptor.depth_stencil.as_mut() {
-        match depth {
-            GhostDepth::OverEverything => {
-                state.depth_compare = Some(CompareFunction::Always);
-                state.depth_write_enabled = Some(false);
-            }
-            GhostDepth::Tested => {
-                state.depth_write_enabled = Some(true);
-                if let Some(fragment) = descriptor.fragment.as_mut() {
-                    fragment.shader_defs.push("GHOST_DEPTH_TESTED".into());
-                }
-            }
+        state.depth_write_enabled = Some(false);
+        if depth == GhostDepth::OverEverything {
+            state.depth_compare = Some(CompareFunction::Always);
         }
     }
 }
@@ -369,9 +363,27 @@ impl Plugin for GhostPlugin {
         embedded_asset!(app, "ghost.wesl");
         app.add_plugins(MaterialPlugin::<GhostMaterial>::default())
             .init_resource::<GhostLook>()
-            .init_resource::<GhostMaterials>()
-            .add_systems(Update, ghost_systems());
+            .init_resource::<GhostMaterials>();
+        add_ghost_systems(app);
     }
+}
+
+/// Where ghosts are put on, kept and taken off each frame: late in
+/// `PostUpdate`, before the frame's asset changes are gathered, so a mesh is
+/// drawn with what its ghost now calls for in the frame it changed. A system
+/// that gives meshes their materials — a writer copying a material, a
+/// renderer composing one — runs before it, in `Update` or ordered
+/// `.before(GhostSystems)`, or a mesh it gives a material to after a ghost
+/// was put on is drawn solid beside its ghost until the next frame.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GhostSystems;
+
+fn add_ghost_systems(app: &mut App) {
+    app.configure_sets(
+        PostUpdate,
+        GhostSystems.before(bevy::asset::AssetEventSystems),
+    )
+    .add_systems(PostUpdate, ghost_systems().in_set(GhostSystems));
 }
 
 /// Ghosting's systems, in order: meshes newly beneath a ghost are ghosted, a
@@ -669,8 +681,8 @@ mod tests {
         app.init_resource::<Assets<StandardMaterial>>()
             .init_resource::<Assets<GhostMaterial>>()
             .init_resource::<GhostLook>()
-            .init_resource::<GhostMaterials>()
-            .add_systems(Update, ghost_systems());
+            .init_resource::<GhostMaterials>();
+        add_ghost_systems(&mut app);
         app
     }
 
@@ -817,6 +829,37 @@ mod tests {
             second,
             "restored to the material it was last given"
         );
+    }
+
+    /// A material given to a ghosted mesh in `PostUpdate`, by a writer
+    /// ordered before the ghost systems, is ghosted in the same frame: the
+    /// mesh is never drawn solid beside its ghost, even given one every frame.
+    #[test]
+    fn a_material_given_late_in_the_frame_is_ghosted_in_it() {
+        let mut app = app();
+        let first = material(&mut app, Color::WHITE);
+        let root = app.world_mut().spawn(Ghost).id();
+        let mesh = app
+            .world_mut()
+            .spawn((MeshMaterial3d(first.clone()), ChildOf(root)))
+            .id();
+        app.update();
+        app.add_systems(
+            PostUpdate,
+            (move |mut commands: Commands| {
+                commands.entity(mesh).insert(MeshMaterial3d(first.clone()));
+            })
+            .before(GhostSystems),
+        );
+        for _ in 0..3 {
+            app.update();
+            assert!(
+                app.world()
+                    .get::<MeshMaterial3d<StandardMaterial>>(mesh)
+                    .is_none(),
+                "never drawn solid beside its ghost"
+            );
+        }
     }
 
     /// A writer that swaps a ghosted mesh's material through
@@ -1020,16 +1063,15 @@ mod tests {
         assert_eq!(ghost_of(&app, mesh).image, Some(second), "the new image");
     }
 
-    /// A depth-tested ghost's pipeline tests and writes depth, and draws only
-    /// what it visibly draws; the default draws over everything and writes
-    /// none.
+    /// A depth-tested ghost's pipeline tests depth and writes none; the
+    /// default draws over everything and writes none.
     #[test]
-    fn a_tested_ghost_writes_depth_only_where_it_draws() {
+    fn a_tested_ghost_tests_depth_and_writes_none() {
         use bevy::render::render_resource::{DepthStencilState, FragmentState, TextureFormat};
         let descriptor = || RenderPipelineDescriptor {
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
+                depth_write_enabled: Some(true),
                 depth_compare: Some(CompareFunction::GreaterEqual),
                 stencil: default(),
                 bias: default(),
@@ -1040,20 +1082,14 @@ mod tests {
         let mut tested = descriptor();
         specialize_depth(GhostDepth::Tested, &mut tested);
         let state = tested.depth_stencil.unwrap();
-        assert_eq!(state.depth_write_enabled, Some(true));
+        assert_eq!(state.depth_write_enabled, Some(false));
         assert_eq!(state.depth_compare, Some(CompareFunction::GreaterEqual));
-        assert!(tested
-            .fragment
-            .unwrap()
-            .shader_defs
-            .contains(&"GHOST_DEPTH_TESTED".into()));
 
         let mut over = descriptor();
         specialize_depth(GhostDepth::OverEverything, &mut over);
         let state = over.depth_stencil.unwrap();
         assert_eq!(state.depth_write_enabled, Some(false));
         assert_eq!(state.depth_compare, Some(CompareFunction::Always));
-        assert!(over.fragment.unwrap().shader_defs.is_empty());
     }
 
     /// A mesh moved under another ghost takes that ghost's style, and a ghost
