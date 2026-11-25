@@ -571,14 +571,18 @@ pub(crate) fn value_of(gizmo: &JointGizmo, rest: &Transform, body: &Transform, n
             if !gizmo.is_limited() {
                 return nearest;
             }
-            // Every whole turn of `read` between the stops, or failing that,
-            // the stop nearest any of them.
-            let first = read + ((gizmo.min - read) / TAU).ceil() * TAU;
-            let fitting = std::iter::successors(Some(first), |angle| Some(angle + TAU))
-                .take_while(|angle| *angle <= gizmo.max);
-            fitting
-                .min_by(|a, b| (a - near).abs().total_cmp(&(b - near).abs()))
-                .unwrap_or_else(|| gizmo.clamp(nearest))
+            // The angles a pose could be are `read` plus whole turns; those
+            // between the stops run from turn `lowest` to `highest`, and the
+            // one nearest `near` is its own nearest turn held to that run.
+            // Worked out, not counted through, so a wide range costs no more
+            // than a narrow one.
+            let lowest = ((gizmo.min - read) / TAU).ceil();
+            let highest = ((gizmo.max - read) / TAU).floor();
+            if lowest > highest {
+                return gizmo.clamp(nearest);
+            }
+            let turn = ((near - read) / TAU).round().clamp(lowest, highest);
+            gizmo.clamp(read + turn * TAU)
         }
         JointMotion::Slide => {
             let moved = rest.rotation.inverse() * (body.translation - rest.translation);
@@ -1077,6 +1081,13 @@ mod tests {
         let body = Transform::from_rotation(Quat::from_rotation_y(2.5));
         let read = value_of(&limited, &Transform::IDENTITY, &body, -2.5);
         assert!((read - 2.5).abs() < 1e-4, "limited: {read}");
+
+        // Stops so far out that a whole turn is lost to rounding still read
+        // within them, at once.
+        let mut far = joint(JointMotion::Turn, 134_217_728.0, 134_218_752.0);
+        far.axis = Dir3::Y;
+        let read = value_of(&far, &Transform::IDENTITY, &Transform::IDENTITY, 0.0);
+        assert!((far.min..=far.max).contains(&read), "far: {read}");
 
         let mut gizmo = joint(JointMotion::Slide, -1.0, 1.0);
         gizmo.axis = Dir3::Z;
