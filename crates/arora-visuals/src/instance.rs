@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
-use bevy_ecs::lifecycle::HookContext;
+use bevy_ecs::lifecycle::{HookContext, RemovedComponents};
 use bevy_ecs::query::Changed;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::schedule::SystemSet;
@@ -355,40 +355,62 @@ impl InstanceElements {
     }
 }
 
-/// Reconciles each indexed instance's element tags — [`ElementNode`] and
+/// Reconciles each instance's element tags — [`ElementNode`] and
 /// [`ElementOf`] — with its [`SceneBindings`] whenever the instance changes,
 /// so the two always agree: the bindings stay the index a value is applied
 /// through, and the tags are the same joins as ECS data. A node the bindings
 /// no longer name loses its tags; one whose element id changed, or that moved
-/// to this instance, is retagged. Runs after [`InstanceSystems::Index`], for
-/// any host's indexing.
+/// to this instance, is retagged. An instance whose bindings are not indexed,
+/// or whose [`EntityInstance`] was taken off, names no elements, so its nodes
+/// are untagged. Runs after [`InstanceSystems::Index`], for any host's
+/// indexing.
+///
+/// Every untagging is queued before any tagging, and a node is untagged only
+/// while it is still this instance's: a node that moved from one instance to
+/// another in the same frame keeps the tags of the one it moved to, whichever
+/// instance is visited first.
 ///
 /// With ids taken in order, a node two elements name carries the first, the
 /// same one each time.
 pub fn tag_elements(
     mut commands: Commands,
-    instances: Query<(Entity, &EntityInstance, Option<&InstanceElements>), Changed<EntityInstance>>,
+    changed: Query<(Entity, &EntityInstance), Changed<EntityInstance>>,
+    mut unshown: RemovedComponents<EntityInstance>,
+    members: Query<&InstanceElements>,
     tagged: Query<(&ElementNode, &ElementOf)>,
 ) {
-    for (root, instance, members) in &instances {
-        if !instance.bindings.indexed {
+    let mut wanted_by: Vec<(Entity, HashMap<Entity, &String>)> = Vec::new();
+    for (root, instance) in &changed {
+        let mut wanted = HashMap::new();
+        if instance.bindings.indexed {
+            let mut ids: Vec<&String> = instance.bindings.elements.keys().collect();
+            ids.sort();
+            for id in ids {
+                wanted
+                    .entry(instance.bindings.elements[id].node)
+                    .or_insert(id);
+            }
+        }
+        wanted_by.push((root, wanted));
+    }
+    for root in unshown.read() {
+        if !changed.contains(root) {
+            wanted_by.push((root, HashMap::new()));
+        }
+    }
+    for (root, wanted) in &wanted_by {
+        let Ok(members) = members.get(*root) else {
             continue;
-        }
-        let mut ids: Vec<&String> = instance.bindings.elements.keys().collect();
-        ids.sort();
-        let mut wanted: HashMap<Entity, &String> = HashMap::new();
-        for id in ids {
-            wanted
-                .entry(instance.bindings.elements[id].node)
-                .or_insert(id);
-        }
-        for node in members.map(InstanceElements::nodes).unwrap_or_default() {
+        };
+        for node in members.nodes() {
             if !wanted.contains_key(node) {
                 commands
                     .entity(*node)
                     .try_remove::<(ElementNode, ElementOf)>();
             }
         }
+    }
+    for (root, wanted) in wanted_by {
         for (node, id) in wanted {
             if tagged
                 .get(node)
@@ -679,5 +701,104 @@ mod tests {
             world.get::<ElementNode>(other),
             Some(&ElementNode { id: "eye".into() })
         );
+
+        // Bindings reset to unindexed name nothing: every node is untagged.
+        world.get_mut::<EntityInstance>(root).unwrap().bindings = SceneBindings::default();
+        schedule.run(&mut world);
+        assert!(world.get::<ElementNode>(head).is_none(), "reset");
+        assert!(world.get::<ElementOf>(other).is_none());
+        assert!(world.get::<InstanceElements>(root).is_none());
+    }
+
+    fn element(node: Entity) -> crate::binding::ElementTargets {
+        crate::binding::ElementTargets {
+            node,
+            mesh: None,
+            morph: None,
+        }
+    }
+
+    fn indexed(id: &str, elements: &[(&str, Entity)]) -> EntityInstance {
+        let mut shown = instance(id);
+        shown.bindings.indexed = true;
+        for (element_id, node) in elements {
+            shown
+                .bindings
+                .elements
+                .insert((*element_id).into(), element(*node));
+        }
+        shown
+    }
+
+    /// An instance whose [`EntityInstance`] is taken off while it lives on
+    /// leaves no tags behind on its nodes.
+    #[test]
+    fn taking_an_instance_off_untags_its_elements() {
+        use bevy_ecs::schedule::Schedule;
+
+        let mut world = World::new();
+        let head = world.spawn_empty().id();
+        let root = world.spawn(indexed("a", &[("head", head)])).id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(tag_elements);
+        schedule.run(&mut world);
+        assert_eq!(world.get::<ElementOf>(head), Some(&ElementOf(root)));
+
+        world.entity_mut(root).remove::<EntityInstance>();
+        schedule.run(&mut world);
+        assert!(world.get::<ElementNode>(head).is_none());
+        assert!(world.get::<ElementOf>(head).is_none());
+        assert!(world.get::<InstanceElements>(root).is_none());
+    }
+
+    /// A node that moves from one instance's bindings to another's in one
+    /// frame ends up tagged for the one it moved to, whichever instance is
+    /// visited first.
+    #[test]
+    fn a_node_moved_between_instances_keeps_its_new_tags() {
+        use bevy_ecs::schedule::Schedule;
+
+        for giver_first in [false, true] {
+            let mut world = World::new();
+            let node = world.spawn_empty().id();
+            let spare = world.spawn_empty().id();
+            // Instances are visited in the order they were spawned, both
+            // being in one archetype.
+            let (giver, taker) = if giver_first {
+                let giver = world.spawn(indexed("a", &[("head", node)])).id();
+                (giver, world.spawn(indexed("b", &[])).id())
+            } else {
+                let taker = world.spawn(indexed("b", &[])).id();
+                (world.spawn(indexed("a", &[("head", node)])).id(), taker)
+            };
+            let mut schedule = Schedule::default();
+            schedule.add_systems(tag_elements);
+            schedule.run(&mut world);
+            assert_eq!(world.get::<ElementOf>(node), Some(&ElementOf(giver)));
+
+            world
+                .get_mut::<EntityInstance>(giver)
+                .unwrap()
+                .bindings
+                .elements
+                .insert("head".into(), element(spare));
+            world
+                .get_mut::<EntityInstance>(taker)
+                .unwrap()
+                .bindings
+                .elements
+                .insert("face".into(), element(node));
+            schedule.run(&mut world);
+            assert_eq!(
+                world.get::<ElementOf>(node),
+                Some(&ElementOf(taker)),
+                "giver visited first: {giver_first}"
+            );
+            assert_eq!(
+                world.get::<ElementNode>(node),
+                Some(&ElementNode { id: "face".into() })
+            );
+            assert_eq!(world.get::<ElementOf>(spare), Some(&ElementOf(giver)));
+        }
     }
 }
