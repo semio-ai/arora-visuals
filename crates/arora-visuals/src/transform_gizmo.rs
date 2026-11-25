@@ -317,9 +317,10 @@ pub enum DragPhase {
     /// The pointer let go: the drag is finished, at its last value.
     End,
     /// The drag was abandoned rather than finished: a host cancelled it
-    /// ([`GizmoDrags::cancel_drag`]) or its gizmo went inert with the
-    /// button still down. A gizmo that moves its target itself puts the
-    /// target back where the drag found it.
+    /// ([`GizmoDrags::cancel_drag`]), or its gizmo went inert or was hidden
+    /// — by its control, or by anything above it, such as an ancestor's
+    /// `Visibility` — with the button still down. A gizmo that moves its
+    /// target itself puts the target back where the drag found it.
     Cancel,
 }
 
@@ -462,9 +463,9 @@ impl GizmoPointer {
     }
 
     /// Whether the left button now down is a gizmo's: it took a handle, and
-    /// the drag is in hand or was ended by its gizmo going inert or being
-    /// taken away. Until it comes up, its release is not a click and no
-    /// gesture of the view's starts from it.
+    /// the drag is in hand or was ended by its gizmo going inert, being
+    /// hidden or being taken away. Until it comes up, its release is not a
+    /// click and no gesture of the view's starts from it.
     pub fn owns_button(&self) -> bool {
         self.dragging.is_some() || self.ended.is_some()
     }
@@ -1539,16 +1540,18 @@ fn drive(
             // A gizmo taken away mid-drag lets go as one gone inert does, so
             // its release is no click. There is no gizmo left to trigger a
             // `Cancel` on; the controls close such a drag for their own.
-            let Ok((_, gizmo, ..)) = gizmos.get(drag.gizmo) else {
+            let Ok((_, gizmo, visible, _)) = gizmos.get(drag.gizmo) else {
                 *held = None;
                 pointer.readings.clear();
                 let_go(&mut pointer, button_up, false);
                 return;
             };
-            // Going inert with the button down abandons the drag; only the
-            // button coming up ends what the pointer is doing (see
-            // `button_up`).
-            if cancel || (!gizmo.interactive && !button_up) {
+            let live = takes_pointer(gizmo.interactive, visible);
+            // Going inert or hidden with the button down abandons the drag;
+            // only the button coming up ends what the pointer is doing (see
+            // `button_up`), so a release in the frame the gizmo stops taking
+            // the pointer still finishes the drag with `End`.
+            if cancel || (!live && !button_up) {
                 if gizmo.apply {
                     if let Ok(mut transform) = locals.get_mut(gizmo.target) {
                         if *transform != drag.start_local {
@@ -1566,7 +1569,7 @@ fn drive(
                 });
                 *held = None;
                 pointer.readings.clear();
-                let_go(&mut pointer, button_up, gizmo.interactive);
+                let_go(&mut pointer, button_up, live);
                 return;
             }
             let released = button_up;
@@ -1625,7 +1628,7 @@ fn drive(
             if released {
                 *held = None;
                 pointer.readings.clear();
-                let_go(&mut pointer, button_up, gizmo.interactive);
+                let_go(&mut pointer, button_up, live);
             } else {
                 *held = Some(Held::Transform(Drag {
                     last,
@@ -1641,12 +1644,14 @@ fn drive(
             start,
         }) => {
             // Taken away mid-drag: as for a transform gizmo, above.
-            let Ok((_, mut gizmo, rest, _)) = joints.get_mut(grip.gizmo) else {
+            let Ok((_, mut gizmo, rest, visible)) = joints.get_mut(grip.gizmo) else {
                 *held = None;
                 let_go(&mut pointer, button_up, false);
                 return;
             };
-            if cancel || (!gizmo.interactive && !button_up) {
+            // Inert or hidden: as for a transform gizmo, above.
+            let live = takes_pointer(gizmo.interactive, visible);
+            if cancel || (!live && !button_up) {
                 // Back to the value the joint stands at without the drag. A
                 // gizmo that poses its body itself left it where the drag
                 // began; otherwise the body stands wherever its host last
@@ -1671,7 +1676,7 @@ fn drive(
                     value: back,
                 });
                 *held = None;
-                let_go(&mut pointer, button_up, gizmo.interactive);
+                let_go(&mut pointer, button_up, live);
                 return;
             }
             let released = button_up;
@@ -1696,7 +1701,7 @@ fn drive(
             }
             if released {
                 *held = None;
-                let_go(&mut pointer, button_up, gizmo.interactive);
+                let_go(&mut pointer, button_up, live);
             }
             return;
         }
@@ -1801,14 +1806,25 @@ fn drive(
     pointer.dragging = Some(hovered);
 }
 
-/// Ends the drag in hand. One its gizmo ended by going inert, with the
-/// button still down, stays the pointer's as `ended` until the button comes
-/// up, so its release is not taken for a click on what lies beneath.
+/// Whether a gizmo holding a drag still takes the pointer: it must be
+/// `interactive` and visible, as it must be to be hovered or taken. A gizmo
+/// hidden by anything — its control, or an ancestor's `Visibility` set by a
+/// host — cannot be seen to be dragged, so a drag in hand on it is
+/// abandoned. Visibility is propagated in `PostUpdate`, so a gizmo hidden
+/// in one frame lets go of its drag in the next; a drag carries on for that
+/// one frame, which no one can see.
+fn takes_pointer(interactive: bool, visible: &InheritedVisibility) -> bool {
+    interactive && visible.get()
+}
+
+/// Ends the drag in hand. One its gizmo ended by going inert or hidden, with
+/// the button still down, stays the pointer's as `ended` until the button
+/// comes up, so its release is not taken for a click on what lies beneath.
 ///
-/// A gizmo gone inert is under the pointer no more either: the handle held
-/// stays `hovered` through a drag wherever the pointer goes, and left there
-/// it would read as hovered, inert and perhaps far from the pointer, until
-/// the next frame looks again.
+/// A gizmo gone inert or hidden is under the pointer no more either: the
+/// handle held stays `hovered` through a drag wherever the pointer goes, and
+/// left there it would read as hovered, inert or unseen, and perhaps far
+/// from the pointer, until the next frame looks again.
 fn let_go(pointer: &mut GizmoPointer, button_up: bool, interactive: bool) {
     let dragging = pointer.dragging.take();
     if !button_up {
@@ -2196,16 +2212,21 @@ mod tests {
         Inert,
         /// The host cancels it.
         Host,
+        /// The gizmo is hidden, as an ancestor's `Visibility` hides it. The
+        /// harness propagates no visibility, so the gizmo's own
+        /// `InheritedVisibility` is set, as propagation would set it.
+        Hidden,
     }
 
-    /// A drag abandoned part way through — its gizmo made inert, or
-    /// cancelled by its host — closes at once with one `Cancel`, puts a target
-    /// the gizmo moves back where the drag found it, and sends nothing after
-    /// it while the button stays down, nor when it comes up. Nothing is held
-    /// after it, so the overlay and the guides let go, but the button stays
-    /// the gizmo's until it comes up, which is what keeps a pick on the
-    /// release from taking it for a click on the scene. A fresh press starts
-    /// a drag with a gesture of its own. Holding still sends no move.
+    /// A drag abandoned part way through — its gizmo made inert or hidden,
+    /// or cancelled by its host — closes at once with one `Cancel`, puts a
+    /// target the gizmo moves back where the drag found it, and sends nothing
+    /// after it while the button stays down, nor when it comes up. Nothing is
+    /// held after it, so the overlay and the guides let go, but the button
+    /// stays the gizmo's until it comes up, which is what keeps a pick on the
+    /// release from taking it for a click on the scene. A hidden gizmo is not
+    /// hovered until it shows again. A fresh press starts a drag with a
+    /// gesture of its own. Holding still sends no move.
     ///
     /// `at_start` says whether the gizmo's target stands where the drag found
     /// it.
@@ -2263,6 +2284,11 @@ mod tests {
         match how {
             Abandon::Inert => set_interactive(app.world_mut(), gizmo, false),
             Abandon::Host => app.world_mut().resource_mut::<GizmoDrags>().cancel_drag(),
+            Abandon::Hidden => {
+                app.world_mut()
+                    .entity_mut(gizmo)
+                    .insert(InheritedVisibility::HIDDEN);
+            }
         }
         app.update();
         let (hovered, dragging, owned) = pointer(&app);
@@ -2271,8 +2297,11 @@ mod tests {
             (None, true),
             "in the frame it ends: not held, the button still the gizmo's"
         );
-        if how == Abandon::Inert {
-            assert_eq!(hovered, None, "an inert gizmo is under the pointer no more");
+        if how != Abandon::Host {
+            assert_eq!(
+                hovered, None,
+                "a gizmo that stopped taking the pointer is under it no more"
+            );
         }
         let ended = phases(&app);
         assert_eq!(ended.last(), Some(&DragPhase::Cancel), "{ended:?}");
@@ -2304,8 +2333,16 @@ mod tests {
         assert_eq!(pointer(&app).1, None);
         assert!(!pointer(&app).2, "let go");
 
-        if how == Abandon::Inert {
-            set_interactive(app.world_mut(), gizmo, true);
+        match how {
+            Abandon::Inert => set_interactive(app.world_mut(), gizmo, true),
+            Abandon::Host => {}
+            Abandon::Hidden => {
+                point_at(&mut app, spot);
+                assert!(pointer(&app).0.is_none(), "a hidden gizmo is not hovered");
+                app.world_mut()
+                    .entity_mut(gizmo)
+                    .insert(InheritedVisibility::VISIBLE);
+            }
         }
         point_at(&mut app, spot);
         assert!(pointer(&app).0.is_some(), "live under the cursor");
@@ -2556,6 +2593,26 @@ mod tests {
             |world, gizmo, on| world.get_mut::<JointGizmo>(gizmo).unwrap().interactive = on,
             joint_at_start,
             Abandon::Host,
+        );
+    }
+
+    #[test]
+    fn a_transform_gizmo_hidden_mid_drag_cancels_it_and_keeps_the_release() {
+        abandoned_mid_drag(
+            transform_gizmo,
+            |world, gizmo, on| world.get_mut::<TransformGizmo>(gizmo).unwrap().interactive = on,
+            transform_at_start,
+            Abandon::Hidden,
+        );
+    }
+
+    #[test]
+    fn a_joint_gizmo_hidden_mid_drag_cancels_it_and_keeps_the_release() {
+        abandoned_mid_drag(
+            joint_gizmo,
+            |world, gizmo, on| world.get_mut::<JointGizmo>(gizmo).unwrap().interactive = on,
+            joint_at_start,
+            Abandon::Hidden,
         );
     }
 

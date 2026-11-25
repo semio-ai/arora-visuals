@@ -20,10 +20,14 @@
 //! closing event: `end` when the pointer lets go, `cancel` when the drag is
 //! abandoned instead — by the host ([`GizmoDrags::cancel_drag`]), or by the
 //! control being removed, replaced, hidden or made not `interactive` while
-//! the button is down. Nothing follows the closing event. Every event of a
-//! drag carries the same `gesture`, a number each drag takes in turn, and
-//! the [`Modifiers`] the host says are held. A `cancel` carries no value: a
-//! driver drops what the drag previewed, and keeps nothing.
+//! the button is down. Hidden counts however the gizmo comes not to show:
+//! by its driver or a ghosting, or by anything above it in the hierarchy,
+//! such as a host hiding the instance the gizmo sits under; the drag is
+//! cancelled in the frame after the one it is hidden in. Nothing follows
+//! the closing event. Every event of a drag carries the same `gesture`, a
+//! number each drag takes in turn, and the [`Modifiers`] the host says are
+//! held. A `cancel` carries no value: a driver drops what the drag
+//! previewed, and keeps nothing.
 //!
 //! Every host takes the same commands, through [`ControlCommands`], under the
 //! same rules, and reports the same events. What differs between hosts is
