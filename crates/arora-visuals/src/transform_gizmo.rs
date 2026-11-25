@@ -1254,8 +1254,11 @@ fn axis_vector(axis: usize) -> Vec3 {
     [Vec3::X, Vec3::Y, Vec3::Z][axis]
 }
 
-/// A drag in hand, of either kind of gizmo.
+/// A drag in hand, of either kind of gizmo. Not boxed though its variants
+/// differ in size: there is one, in a `Local`, and copying it out each frame
+/// is what lets the drag be read while the pointer state is changed.
 #[derive(Clone, Copy)]
+#[allow(clippy::large_enum_variant)]
 enum Held {
     Transform(Drag),
     Joint {
