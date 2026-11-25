@@ -72,6 +72,7 @@ pub mod camera_input;
 pub mod control;
 #[cfg(feature = "view")]
 pub mod drawn;
+pub mod euler;
 #[cfg(feature = "view")]
 pub mod ghost;
 pub mod hold;
