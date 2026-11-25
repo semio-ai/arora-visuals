@@ -647,10 +647,10 @@ struct Drag {
     /// pointer cannot be read ends here: with `apply` off the target has not
     /// moved, so its own transform would report the drag undone.
     last: Transform,
-    /// Where the target stood in the world when the drag last reported: a
-    /// drag reports a pose in the world, which its parent moving changes
+    /// The target's position and turn in the world when the drag last
+    /// reported: the pose a drag reports, which its parent moving changes
     /// though the drag's local transform does not.
-    reported: GlobalTransform,
+    reported: (Vec3, Quat),
 }
 
 /// The global transform of `target`'s parent as it stands now, not as last
@@ -1599,11 +1599,13 @@ fn drive(
                 }
             }
             // A move is sent only when what it reports would change — the
-            // target's pose in the world or its own scale — since each asks a
-            // host to show the drag afresh. A parent moving under a still
-            // pointer changes the pose; a target carried along by its parent
-            // without moving in the world does not.
-            let reported = parent.mul_transform(last);
+            // target's position and turn in the world, or its own scale —
+            // since each asks a host to show the drag afresh. A parent moving
+            // under a still pointer changes the pose; a target carried along
+            // by its parent without moving in the world, or a parent rescaled
+            // about a target at its origin, does not.
+            let (_, turn, at) = parent.mul_transform(last).to_scale_rotation_translation();
+            let reported = (at, turn);
             let phase = if released {
                 Some(DragPhase::End)
             } else {
@@ -1758,8 +1760,12 @@ fn drive(
                 start_global: *start_global,
                 start_local: *start_local,
                 last: *start_local,
-                reported: parent_now(gizmo.target, &parents, &locals, &globals)
-                    .mul_transform(*start_local),
+                reported: {
+                    let (_, turn, at) = parent_now(gizmo.target, &parents, &locals, &globals)
+                        .mul_transform(*start_local)
+                        .to_scale_rotation_translation();
+                    (at, turn)
+                },
             }));
             commands.trigger(GizmoDrag {
                 entity,
@@ -2608,6 +2614,21 @@ mod tests {
             } else {
                 assert_eq!(phases.len(), still, "move: {phases:?}");
             }
+
+            // Rescaling the parent about the target, at its origin, changes
+            // nothing a drag reports.
+            if stretch {
+                *app.world_mut().get_mut::<Transform>(parent).unwrap() = Transform::IDENTITY;
+                point_at(&mut app, spot);
+                let before = app.world().resource::<Phases>().0.len();
+                app.world_mut().get_mut::<Transform>(parent).unwrap().scale = Vec3::splat(2.0);
+                point_at(&mut app, spot);
+                assert_eq!(
+                    app.world().resource::<Phases>().0.len(),
+                    before,
+                    "a rescaled parent alone moves nothing reported"
+                );
+            }
         }
     }
 
@@ -2938,7 +2959,7 @@ mod tests {
             start_global: GlobalTransform::IDENTITY,
             start_local: Transform::IDENTITY,
             last: Transform::IDENTITY,
-            reported: GlobalTransform::IDENTITY,
+            reported: (Vec3::ZERO, Quat::IDENTITY),
         }
     }
 
