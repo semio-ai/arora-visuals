@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::lifecycle::{HookContext, RemovedComponents};
-use bevy_ecs::query::{Changed, With, Without};
+use bevy_ecs::query::Changed;
 use bevy_ecs::resource::Resource;
 use bevy_ecs::schedule::SystemSet;
 use bevy_ecs::system::{Commands, Query, ResMut};
@@ -359,84 +359,105 @@ impl InstanceElements {
     }
 }
 
-/// Reconciles each instance's element tags — [`ElementNode`] and
-/// [`ElementOf`] — with its [`SceneBindings`] whenever the instance changes,
-/// so the two always agree: the bindings stay the index a value is applied
-/// through, and the tags are the same joins as ECS data. A node the bindings
-/// no longer name loses its tags; one whose element id changed, or that moved
-/// to this instance, is retagged. An instance whose bindings are not indexed,
-/// or whose [`EntityInstance`] was taken off, names no elements, so its nodes
-/// are untagged. Runs after [`InstanceSystems::Index`], for any host's
-/// indexing.
+/// Reconciles element tags — [`ElementNode`] and [`ElementOf`] — with the
+/// instances' [`SceneBindings`], so the two always agree: the bindings stay
+/// the index a value is applied through, and the tags are the same joins as
+/// ECS data. Runs after [`InstanceSystems::Index`], for any host's indexing.
 ///
-/// A node whose [`ElementOf`] went without this system taking it — its
-/// instance despawned while the node lives on, which the relationship
-/// cleans up by taking `ElementOf` alone — loses its [`ElementNode`] too, so
-/// no node carries an element id for an instance it is not part of.
+/// Only nodes something could have moved are looked at: those a changed
+/// instance names or held, those of an instance whose [`EntityInstance`] was
+/// taken off, and those whose `ElementOf` went because their instance was
+/// despawned. Each is settled once, from every instance that names it now, so
+/// the order instances are visited in cannot matter:
 ///
-/// Every untagging is queued before any tagging, and a node is untagged only
-/// while it is still this instance's: a node that moved from one instance to
-/// another in the same frame keeps the tags of the one it moved to, whichever
-/// instance is visited first.
+/// - An instance names a node only while its bindings are indexed.
+/// - A node keeps its owner while the owner still names it, so a change to
+///   another instance that also names it does not take it over.
+/// - A node whose owner no longer names it goes to the instance naming it
+///   with the lowest id, or, named by none, loses both tags.
+/// - Of several ids one instance names a node by, the node carries the
+///   lowest, the same one each time.
 ///
-/// With ids taken in order, a node two elements name carries the first, the
-/// same one each time.
+/// Two instances naming one node is not a shape anything builds on purpose —
+/// a nested instance's nodes are meant to join only to it — but indexing by
+/// name over descendants can produce it, and the rules above keep the tags
+/// consistent when it does.
 pub fn tag_elements(
     mut commands: Commands,
     changed: Query<(Entity, &EntityInstance), Changed<EntityInstance>>,
     mut unshown: RemovedComponents<EntityInstance>,
     mut unrelated: RemovedComponents<ElementOf>,
+    instances: Query<(Entity, &EntityInstance)>,
     members: Query<&InstanceElements>,
-    tagged: Query<(&ElementNode, &ElementOf)>,
-    orphans: Query<(), (With<ElementNode>, Without<ElementOf>)>,
+    tags: Query<(Option<&ElementNode>, Option<&ElementOf>)>,
 ) {
-    for node in unrelated.read() {
-        if orphans.contains(node) {
-            commands.entity(node).try_remove::<ElementNode>();
-        }
-    }
-    let mut wanted_by: Vec<(Entity, HashMap<Entity, &String>)> = Vec::new();
+    let mut touched: HashSet<Entity> = HashSet::new();
     for (root, instance) in &changed {
-        let mut wanted = HashMap::new();
         if instance.bindings.indexed {
-            let mut ids: Vec<&String> = instance.bindings.elements.keys().collect();
-            ids.sort();
-            for id in ids {
-                wanted
-                    .entry(instance.bindings.elements[id].node)
-                    .or_insert(id);
-            }
+            touched.extend(instance.bindings.elements.values().map(|t| t.node));
         }
-        wanted_by.push((root, wanted));
+        if let Ok(held) = members.get(root) {
+            touched.extend(held.nodes());
+        }
     }
     for root in unshown.read() {
-        if !changed.contains(root) {
-            wanted_by.push((root, HashMap::new()));
+        if let Ok(held) = members.get(root) {
+            touched.extend(held.nodes());
         }
     }
-    for (root, wanted) in &wanted_by {
-        let Ok(members) = members.get(*root) else {
+    touched.extend(unrelated.read());
+    if touched.is_empty() {
+        return;
+    }
+
+    // Every instance naming a touched node — its entity and id — with the
+    // lowest element id it names the node by.
+    let mut naming: HashMap<Entity, Vec<(Entity, &String, &String)>> = HashMap::new();
+    for (root, instance) in &instances {
+        if !instance.bindings.indexed {
             continue;
-        };
-        for node in members.nodes() {
-            if !wanted.contains_key(node) {
-                commands
-                    .entity(*node)
-                    .try_remove::<(ElementNode, ElementOf)>();
-            }
         }
-    }
-    for (root, wanted) in wanted_by {
-        for (node, id) in wanted {
-            if tagged
-                .get(node)
-                .is_ok_and(|(tag, of)| tag.id == *id && of.0 == root)
-            {
+        for (id, targets) in &instance.bindings.elements {
+            if !touched.contains(&targets.node) {
                 continue;
             }
-            commands
-                .entity(node)
-                .try_insert((ElementNode { id: id.clone() }, ElementOf(root)));
+            let claims = naming.entry(targets.node).or_default();
+            match claims.iter_mut().find(|(claimant, ..)| *claimant == root) {
+                Some((.., lowest)) if id < *lowest => *lowest = id,
+                Some(_) => {}
+                None => claims.push((root, &instance.id, id)),
+            }
+        }
+    }
+
+    for node in touched {
+        let Ok((tag, of)) = tags.get(node) else {
+            continue;
+        };
+        let claims = naming.get(&node).map(Vec::as_slice).unwrap_or_default();
+        let kept = of.and_then(|of| claims.iter().find(|(claimant, ..)| *claimant == of.0));
+        // Entities do not order by when they were made, so the fallback is
+        // chosen by instance id, which a host can predict.
+        let owner = kept.or_else(|| {
+            claims
+                .iter()
+                .min_by_key(|(claimant, instance, _)| (*instance, *claimant))
+        });
+        match owner {
+            Some(&(root, _, id)) => {
+                if tag.is_some_and(|tag| tag.id == *id) && of.is_some_and(|of| of.0 == root) {
+                    continue;
+                }
+                commands
+                    .entity(node)
+                    .try_insert((ElementNode { id: id.clone() }, ElementOf(root)));
+            }
+            None if tag.is_some() || of.is_some() => {
+                commands
+                    .entity(node)
+                    .try_remove::<(ElementNode, ElementOf)>();
+            }
+            None => {}
         }
     }
 }
@@ -805,6 +826,80 @@ mod tests {
         assert!(world.get::<ElementNode>(head).is_none());
         assert!(world.get::<ElementOf>(head).is_none());
         assert!(world.get::<InstanceElements>(root).is_none());
+    }
+
+    /// Of two instances naming one node, the one that has it keeps it through
+    /// the other's changes, and it passes to the other once its owner stops
+    /// naming it or is gone — whichever instance is visited first.
+    #[test]
+    fn a_node_two_instances_name_keeps_its_owner_and_falls_back() {
+        use bevy_ecs::schedule::Schedule;
+
+        for first_owns in [false, true] {
+            let mut world = World::new();
+            let node = world.spawn_empty().id();
+            let a = world.spawn(indexed("a", &[("head", node)])).id();
+            let b = world.spawn(indexed("b", &[("face", node)])).id();
+            let mut schedule = Schedule::default();
+            schedule.add_systems(tag_elements);
+            schedule.run(&mut world);
+            assert_eq!(
+                world.get::<ElementOf>(node),
+                Some(&ElementOf(a)),
+                "lowest instance id"
+            );
+
+            let (owner, other, other_id) = if first_owns {
+                (a, b, "face")
+            } else {
+                // Hand it to b: a stops naming it, then names it again.
+                world
+                    .get_mut::<EntityInstance>(a)
+                    .unwrap()
+                    .bindings
+                    .elements
+                    .clear();
+                schedule.run(&mut world);
+                assert_eq!(
+                    world.get::<ElementOf>(node),
+                    Some(&ElementOf(b)),
+                    "fell back"
+                );
+                world
+                    .get_mut::<EntityInstance>(a)
+                    .unwrap()
+                    .bindings
+                    .elements
+                    .insert("head".into(), element(node));
+                schedule.run(&mut world);
+                (b, a, "head")
+            };
+            assert_eq!(
+                world.get::<ElementOf>(node),
+                Some(&ElementOf(owner)),
+                "kept"
+            );
+
+            // A change to the other that leaves its claim as it was.
+            world.get_mut::<EntityInstance>(other).unwrap().ready = true;
+            schedule.run(&mut world);
+            assert_eq!(
+                world.get::<ElementOf>(node),
+                Some(&ElementOf(owner)),
+                "first owns: {first_owns}"
+            );
+
+            // The owner goes: the other, still naming it, takes it.
+            world.despawn(owner);
+            schedule.run(&mut world);
+            assert_eq!(world.get::<ElementOf>(node), Some(&ElementOf(other)));
+            assert_eq!(
+                world.get::<ElementNode>(node),
+                Some(&ElementNode {
+                    id: other_id.into()
+                })
+            );
+        }
     }
 
     /// A node that outlives its instance keeps no element id.
