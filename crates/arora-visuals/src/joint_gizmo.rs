@@ -554,17 +554,31 @@ pub(crate) fn dragged(gizmo: &JointGizmo, held: &JointHeld, ray: Ray3d) -> Optio
 }
 
 /// The value a body posed at `body` stands at, for a joint whose body rests at
-/// `rest`: the inverse of how [`pose_bodies`] poses it. A turn is read as the
-/// angle about the joint's axis, taken the whole turn nearest `near`, so a
-/// joint that turns without end reads as where it has got to rather than
-/// within one turn.
+/// `rest`: the inverse of how [`pose_bodies`] poses it.
+///
+/// A pose shows a turn only to within a whole turn, so of the angles it could
+/// be, a limited joint takes the one between its stops — the one nearest
+/// `near` if more than one fits, or the nearest stop's if none does — and a
+/// joint that turns without end takes the one nearest `near`, the best guess
+/// a pose leaves at which turn it has got to.
 pub(crate) fn value_of(gizmo: &JointGizmo, rest: &Transform, body: &Transform, near: f32) -> f32 {
     match gizmo.motion {
         JointMotion::Turn => {
             let turned = rest.rotation.inverse() * body.rotation;
             let along = turned.xyz().dot(*gizmo.axis);
             let read = gizmo.rest + 2.0 * along.atan2(turned.w);
-            read + ((near - read) / TAU).round() * TAU
+            let nearest = read + ((near - read) / TAU).round() * TAU;
+            if !gizmo.is_limited() {
+                return nearest;
+            }
+            // Every whole turn of `read` between the stops, or failing that,
+            // the stop nearest any of them.
+            let first = read + ((gizmo.min - read) / TAU).ceil() * TAU;
+            let fitting = std::iter::successors(Some(first), |angle| Some(angle + TAU))
+                .take_while(|angle| *angle <= gizmo.max);
+            fitting
+                .min_by(|a, b| (a - near).abs().total_cmp(&(b - near).abs()))
+                .unwrap_or_else(|| gizmo.clamp(nearest))
         }
         JointMotion::Slide => {
             let moved = rest.rotation.inverse() * (body.translation - rest.translation);
@@ -1055,6 +1069,15 @@ mod tests {
             let read = value_of(&gizmo, &rest, &body, value + 0.5);
             assert!((read - value).abs() < 1e-4, "turn {value}: {read}");
         }
+        // Within its stops, however far the start it is read near lies: -2.5
+        // and 2.5 are the same pose less a whole turn and a bit, and only
+        // 2.5 is between -3 and 3.
+        let mut limited = joint(JointMotion::Turn, -3.0, 3.0);
+        limited.axis = Dir3::Y;
+        let body = Transform::from_rotation(Quat::from_rotation_y(2.5));
+        let read = value_of(&limited, &Transform::IDENTITY, &body, -2.5);
+        assert!((read - 2.5).abs() < 1e-4, "limited: {read}");
+
         let mut gizmo = joint(JointMotion::Slide, -1.0, 1.0);
         gizmo.axis = Dir3::Z;
         gizmo.rest = 0.1;

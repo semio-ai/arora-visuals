@@ -647,6 +647,32 @@ struct Drag {
     /// pointer cannot be read ends here: with `apply` off the target has not
     /// moved, so its own transform would report the drag undone.
     last: Transform,
+    /// Where the target stood in the world when the drag last reported: a
+    /// drag reports a pose in the world, which its parent moving changes
+    /// though the drag's local transform does not.
+    reported: GlobalTransform,
+}
+
+/// The global transform of `target`'s parent as it stands now, not as last
+/// propagated; the world's frame for a target with no parent.
+fn parent_now(
+    target: Entity,
+    parents: &Query<&ChildOf>,
+    locals: &Query<&mut Transform>,
+    globals: &Query<&GlobalTransform>,
+) -> GlobalTransform {
+    parents
+        .get(target)
+        .ok()
+        .and_then(|child_of| {
+            current_global(
+                child_of.parent(),
+                |entity| locals.get(entity).ok().copied(),
+                parents,
+                globals,
+            )
+        })
+        .map_or(GlobalTransform::IDENTITY, GlobalTransform::from)
 }
 
 /// The gizmos' pointer handling in `Update`, and their placement in
@@ -1542,26 +1568,15 @@ fn drive(
             }
             let released = button_up;
             let moved = ray_through(gizmo.camera).and_then(|ray| dragged_to(&drag, ray));
+            // Against the parent as it stands now, not as last propagated: a
+            // parent moved this frame would put the target somewhere other
+            // than where it was dragged.
+            let parent = parent_now(gizmo.target, &parents, &locals, &globals);
             let mut last = drag.last;
             if let Some(moved) = moved {
                 pointer.readings = readings(&drag, &moved);
                 last = match moved {
                     Moved::World(global) => {
-                        // Against the parent as it stands now, not as last
-                        // propagated: a parent moved this frame would put the
-                        // target somewhere other than where it was dragged.
-                        let parent = parents
-                            .get(gizmo.target)
-                            .ok()
-                            .and_then(|child_of| {
-                                current_global(
-                                    child_of.parent(),
-                                    |entity| locals.get(entity).ok().copied(),
-                                    &parents,
-                                    &globals,
-                                )
-                            })
-                            .map_or(GlobalTransform::IDENTITY, GlobalTransform::from);
                         // Moving and turning leave the scale as it was; taking
                         // it back out of the world would only add rounding.
                         Transform {
@@ -1580,12 +1595,17 @@ fn drive(
                     }
                 }
             }
-            // A move is sent only when the target would move: each asks a
-            // host to show the drag afresh.
+            // A move is sent only when what it reports would change — the
+            // target's pose in the world or its own scale — since each asks a
+            // host to show the drag afresh. A parent moving under a still
+            // pointer changes the pose; a target carried along by its parent
+            // without moving in the world does not.
+            let reported = parent.mul_transform(last);
             let phase = if released {
                 Some(DragPhase::End)
             } else {
-                (last != drag.last).then_some(DragPhase::Move)
+                (reported != drag.reported || last.scale != drag.last.scale)
+                    .then_some(DragPhase::Move)
             };
             if let Some(phase) = phase {
                 commands.trigger(GizmoDrag {
@@ -1602,7 +1622,11 @@ fn drive(
                 pointer.readings.clear();
                 let_go(&mut pointer, button_up, gizmo.interactive);
             } else {
-                *held = Some(Held::Transform(Drag { last, ..drag }));
+                *held = Some(Held::Transform(Drag {
+                    last,
+                    reported,
+                    ..drag
+                }));
             }
             return;
         }
@@ -1731,6 +1755,8 @@ fn drive(
                 start_global: *start_global,
                 start_local: *start_local,
                 last: *start_local,
+                reported: parent_now(gizmo.target, &parents, &locals, &globals)
+                    .mul_transform(*start_local),
             }));
             commands.trigger(GizmoDrag {
                 entity,
@@ -2524,6 +2550,64 @@ mod tests {
         );
     }
 
+    /// A move is sent when what a drag reports changes: a stretch held still
+    /// while the target's parent moves puts the target somewhere new in the
+    /// world, which is reported; a move held still while the parent moves
+    /// leaves it where it was in the world, which is not.
+    #[test]
+    fn a_held_drag_reports_its_parent_moving_it_in_the_world() {
+        for stretch in [true, false] {
+            let (mut app, window, gizmo) = driving(transform_gizmo);
+            let target = app.world().get::<TransformGizmo>(gizmo).unwrap().target;
+            let parent = app
+                .world_mut()
+                .spawn((Transform::IDENTITY, GlobalTransform::IDENTITY))
+                .id();
+            app.world_mut().entity_mut(target).insert(ChildOf(parent));
+            let point_at = |app: &mut App, at: Vec2| {
+                let mut cursor = app.world_mut().get_mut::<Window>(window).unwrap();
+                cursor.set_cursor_position(Some(at));
+                app.update();
+            };
+            let wanted = |handle: GizmoHandle| match handle {
+                GizmoHandle::Ball(_) => stretch,
+                GizmoHandle::Arrow(_) => !stretch,
+                _ => false,
+            };
+            let spot = (0..80)
+                .flat_map(|y| (0..80).map(move |x| Vec2::new(x as f32 * 5.0, y as f32 * 5.0)))
+                .find(|&at| {
+                    point_at(&mut app, at);
+                    app.world()
+                        .resource::<GizmoPointer>()
+                        .hovered
+                        .is_some_and(|(_, handle)| wanted(handle))
+                })
+                .expect("the handle somewhere in view");
+            app.world_mut().resource_mut::<PressedScene>().0 = true;
+            app.world_mut()
+                .resource_mut::<ButtonInput<MouseButton>>()
+                .press(MouseButton::Left);
+            app.update();
+            app.world_mut()
+                .resource_mut::<ButtonInput<MouseButton>>()
+                .clear();
+            point_at(&mut app, spot);
+            let still = app.world().resource::<Phases>().0.len();
+
+            *app.world_mut().get_mut::<Transform>(parent).unwrap() =
+                Transform::from_xyz(0.0, 0.0, 0.3);
+            point_at(&mut app, spot);
+            let phases = app.world().resource::<Phases>().0.clone();
+            if stretch {
+                assert_eq!(phases.len(), still + 1, "stretch: {phases:?}");
+                assert_eq!(phases.last(), Some(&DragPhase::Move));
+            } else {
+                assert_eq!(phases.len(), still, "move: {phases:?}");
+            }
+        }
+    }
+
     /// A joint gizmo that leaves its body to its host goes back, on a cancel,
     /// to where the body stands — the value its host last wrote, which may
     /// have moved on since the drag began — not to the drag's start.
@@ -2851,6 +2935,7 @@ mod tests {
             start_global: GlobalTransform::IDENTITY,
             start_local: Transform::IDENTITY,
             last: Transform::IDENTITY,
+            reported: GlobalTransform::IDENTITY,
         }
     }
 
