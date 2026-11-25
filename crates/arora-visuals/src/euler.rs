@@ -40,8 +40,10 @@
 //! # The order
 //!
 //! A triple is `[x, y, z]` — roll, pitch, yaw, the order [`FeatureKind::axes`]
-//! names them in — composed as `R = Rz(z)·Ry(y)·Rx(x)`, three.js's default
-//! `XYZ` order and glam's `EulerRot::ZYX`. [`rotation_zyx`] and [`angles_zyx`]
+//! names them in — composed as `R = Rz(z)·Ry(y)·Rx(x)`, which is glam's
+//! `EulerRot::ZYX` and three.js's `"ZYX"` order. It is not three.js's
+//! default `"XYZ"`, which composes `Rx·Ry·Rz`, so a three.js page has to
+//! name `"ZYX"` explicitly to agree with it. [`rotation_zyx`] and [`angles_zyx`]
 //! are that convention in each direction, for a host to use wherever it
 //! converts a rotation outside a write.
 //!
