@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use bevy_ecs::lifecycle::{HookContext, RemovedComponents};
-use bevy_ecs::query::Changed;
+use bevy_ecs::query::{Changed, With, Without};
 use bevy_ecs::resource::Resource;
 use bevy_ecs::schedule::SystemSet;
 use bevy_ecs::system::{Commands, Query, ResMut};
@@ -286,7 +286,11 @@ fn unindex_loading(mut world: DeferredWorld, context: HookContext) {
 
 /// Moves each instance or loading entity whose id was edited in place to the
 /// id it now carries: an edit through a mutable component fires no hook, so
-/// the index learns of it from change detection here.
+/// the index learns of it from change detection here. [`InstancePlugin`] runs
+/// it before [`InstanceSystems::Intake`], for edits made between frames, and
+/// again after [`InstanceSystems::Index`], for edits made by a host's own
+/// intake or indexing, so the control commands that follow look ids up as
+/// they stand.
 pub fn reindex_renamed(
     mut index: ResMut<InstanceIndex>,
     instances: Query<(Entity, &EntityInstance), Changed<EntityInstance>>,
@@ -365,6 +369,11 @@ impl InstanceElements {
 /// are untagged. Runs after [`InstanceSystems::Index`], for any host's
 /// indexing.
 ///
+/// A node whose [`ElementOf`] went without this system taking it — its
+/// instance despawned while the node lives on, which the relationship
+/// cleans up by taking `ElementOf` alone — loses its [`ElementNode`] too, so
+/// no node carries an element id for an instance it is not part of.
+///
 /// Every untagging is queued before any tagging, and a node is untagged only
 /// while it is still this instance's: a node that moved from one instance to
 /// another in the same frame keeps the tags of the one it moved to, whichever
@@ -376,9 +385,16 @@ pub fn tag_elements(
     mut commands: Commands,
     changed: Query<(Entity, &EntityInstance), Changed<EntityInstance>>,
     mut unshown: RemovedComponents<EntityInstance>,
+    mut unrelated: RemovedComponents<ElementOf>,
     members: Query<&InstanceElements>,
     tagged: Query<(&ElementNode, &ElementOf)>,
+    orphans: Query<(), (With<ElementNode>, Without<ElementOf>)>,
 ) {
+    for node in unrelated.read() {
+        if orphans.contains(node) {
+            commands.entity(node).try_remove::<ElementNode>();
+        }
+    }
     let mut wanted_by: Vec<(Entity, HashMap<Entity, &String>)> = Vec::new();
     for (root, instance) in &changed {
         let mut wanted = HashMap::new();
@@ -456,6 +472,9 @@ impl bevy::app::Plugin for InstancePlugin {
                 Update,
                 (
                     reindex_renamed.before(InstanceSystems::Intake),
+                    reindex_renamed
+                        .after(InstanceSystems::Index)
+                        .before(tag_elements),
                     tag_elements
                         .after(InstanceSystems::Index)
                         .before(InstanceSystems::Apply),
@@ -559,6 +578,43 @@ mod tests {
         app.world_mut().get_mut::<EntityInstance>(a).unwrap().id = "b".into();
         app.update();
         assert_eq!(app.world().resource::<InstanceIndex>().get("b"), Some(a));
+    }
+
+    /// An id a host edits in its own intake is looked up as it stands by the
+    /// control commands later in the same frame.
+    #[cfg(feature = "view")]
+    #[test]
+    fn an_id_edited_during_intake_is_found_by_the_commands() {
+        use bevy::prelude::*;
+
+        #[derive(Resource, Default)]
+        struct Found(Option<Entity>);
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, InstancePlugin))
+            .init_resource::<Found>()
+            .add_systems(
+                Update,
+                (
+                    (|mut instances: Query<&mut EntityInstance>| {
+                        for mut instance in &mut instances {
+                            if instance.id == "a" {
+                                instance.id = "b".into();
+                            }
+                        }
+                    })
+                    .in_set(InstanceSystems::Intake),
+                    (|index: Res<InstanceIndex>, mut found: ResMut<Found>| {
+                        found.0 = index.get("b");
+                    })
+                    .after(tag_elements)
+                    .before(InstanceSystems::Apply),
+                ),
+            );
+        let a = app.world_mut().spawn(instance("a")).id();
+        // One frame: a later frame's pass before intake would find it anyway.
+        app.update();
+        assert_eq!(app.world().resource::<Found>().0, Some(a));
     }
 
     /// The same holds for a loading id edited in place.
@@ -749,6 +805,25 @@ mod tests {
         assert!(world.get::<ElementNode>(head).is_none());
         assert!(world.get::<ElementOf>(head).is_none());
         assert!(world.get::<InstanceElements>(root).is_none());
+    }
+
+    /// A node that outlives its instance keeps no element id.
+    #[test]
+    fn a_node_outliving_its_instance_loses_its_element_id() {
+        use bevy_ecs::schedule::Schedule;
+
+        let mut world = World::new();
+        let head = world.spawn_empty().id();
+        let root = world.spawn(indexed("a", &[("head", head)])).id();
+        let mut schedule = Schedule::default();
+        schedule.add_systems(tag_elements);
+        schedule.run(&mut world);
+        assert!(world.get::<ElementNode>(head).is_some());
+
+        world.despawn(root);
+        assert!(world.get::<ElementOf>(head).is_none(), "the relationship's");
+        schedule.run(&mut world);
+        assert!(world.get::<ElementNode>(head).is_none());
     }
 
     /// A node that moves from one instance's bindings to another's in one
