@@ -7,7 +7,9 @@
 // silhouette, so the ghost reads by its outline and what stands behind it
 // shows through. A ghost carrying an image — a screen —
 // shows the image in the same wash at one opacity throughout, since a flat
-// image has no rim to light.
+// image has no rim to light. Either opacity is scaled by the element's own
+// opacity (its colour's alpha) and by the ghost's, so an element faded solid
+// is faded as a ghost too, and a host can fade the ghost itself.
 
 import bevy_pbr::render::{forward_io::VertexOutput, mesh_view_bindings::view};
 
@@ -24,7 +26,9 @@ struct Ghost {
     image: f32,
     // How opaque the rim is against Studio's.
     rim: f32,
-    _padding: vec3<f32>,
+    // How opaque the whole ghost is.
+    opacity: f32,
+    _padding: vec2<f32>,
 }
 
 @group(constants::MATERIAL_BIND_GROUP) @binding(0) var<uniform> ghost: Ghost;
@@ -37,12 +41,13 @@ const IMAGE_OPACITY: f32 = 0.6;
 @fragment
 fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     var base = ghost.colour.rgb;
+    let faded = ghost.colour.a * ghost.opacity;
     if ghost.image > 0.5 {
         var sampled = vec3(1.0);
         @if(VERTEX_UVS_A) {
             sampled = textureSample(image_texture, image_sampler, in.uv).rgb;
         }
-        return vec4(mix(ghost.wash.rgb, base * sampled, ghost.tint), IMAGE_OPACITY);
+        return vec4(mix(ghost.wash.rgb, base * sampled, ghost.tint), IMAGE_OPACITY * faded);
     }
     // From the camera to the fragment, and the surface's outward normal: the
     // dot is -1 looking straight at the surface and 0 along its edge.
@@ -51,6 +56,6 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     let rim = pow(max(ghost.coefficient + dot(normal, toward), 0.0), ghost.power);
     // Studio's mix runs past its end at the very rim, which the clamp keeps an
     // opacity.
-    let alpha = clamp(mix(0.01, 0.25, rim) * ghost.rim, 0.0, 1.0);
+    let alpha = clamp(mix(0.01, 0.25, rim) * ghost.rim, 0.0, 1.0) * faded;
     return vec4(mix(ghost.wash.rgb, base, ghost.tint), alpha);
 }
