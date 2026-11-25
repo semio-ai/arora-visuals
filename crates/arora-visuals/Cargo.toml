@@ -60,7 +60,8 @@ log = { workspace = true }
 # build that only wants the parse.
 #
 # `meta` takes the vector and matrix types; `target` takes an image handle;
-# `hold` takes the `Resource` derive. `tone` and `value` take nothing.
+# `hold` takes the `Resource` derive; `euler` takes `Quat` and `Entity`. `tone`
+# and `value` take nothing.
 bevy_asset = { workspace = true }
 bevy_ecs = { workspace = true }
 bevy_image = { workspace = true }
