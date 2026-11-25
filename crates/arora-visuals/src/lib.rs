@@ -102,7 +102,10 @@ pub mod view_layer;
 
 pub use binding::{ElementTargets, SceneBinding, SceneBindings};
 pub use hold::{HoldTarget, Holds};
-pub use instance::{ClearCamera, EntityInstance, Loading, Superseded, ViewOf, CLEAR_ORDER};
+pub use instance::{
+    ClearCamera, ElementNode, ElementOf, EntityInstance, InstanceElements, InstanceIndex,
+    InstanceSystems, Loading, Superseded, ViewOf, CLEAR_ORDER,
+};
 pub use meta::{glb_json_chunk, AssetMeta, Binding, Element, FeatureKind};
 #[cfg(feature = "view")]
 pub use pick::Picked;
