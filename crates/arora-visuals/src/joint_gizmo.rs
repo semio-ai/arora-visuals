@@ -247,6 +247,10 @@ pub struct JointDrag {
     pub entity: Entity,
     pub target: Entity,
     pub phase: DragPhase,
+    /// The drag this belongs to, the same on all of its events.
+    pub gesture: u32,
+    /// The joint's value as the drag has it now; on a `Cancel`, the value it
+    /// stands at without the drag.
     pub value: f32,
 }
 
@@ -547,6 +551,26 @@ pub(crate) fn dragged(gizmo: &JointGizmo, held: &JointHeld, ray: Ray3d) -> Optio
         JointMotion::Slide => gizmo.rest + read,
     };
     Some(gizmo.clamp(wanted))
+}
+
+/// The value a body posed at `body` stands at, for a joint whose body rests at
+/// `rest`: the inverse of how [`pose_bodies`] poses it. A turn is read as the
+/// angle about the joint's axis, taken the whole turn nearest `near`, so a
+/// joint that turns without end reads as where it has got to rather than
+/// within one turn.
+pub(crate) fn value_of(gizmo: &JointGizmo, rest: &Transform, body: &Transform, near: f32) -> f32 {
+    match gizmo.motion {
+        JointMotion::Turn => {
+            let turned = rest.rotation.inverse() * body.rotation;
+            let along = turned.xyz().dot(*gizmo.axis);
+            let read = gizmo.rest + 2.0 * along.atan2(turned.w);
+            read + ((near - read) / TAU).round() * TAU
+        }
+        JointMotion::Slide => {
+            let moved = rest.rotation.inverse() * (body.translation - rest.translation);
+            gizmo.rest + moved.dot(*gizmo.axis)
+        }
+    }
 }
 
 /// Poses each body from its gizmo's value, finding its rest pose the first
@@ -1010,6 +1034,38 @@ mod tests {
 
     /// A range shifts to start at zero rather than wrapping, so a range across
     /// the joint's own zero still fills from its start.
+    /// A body posed from a value reads back as that value, for a turn — the
+    /// whole turn nearest the one asked for — and for a slide, from a rest
+    /// that is not the origin.
+    #[test]
+    fn a_posed_body_reads_back_its_value() {
+        let rest = Transform {
+            translation: Vec3::new(0.2, -0.1, 0.3),
+            rotation: Quat::from_rotation_x(0.4),
+            ..default()
+        };
+        let mut gizmo = joint(JointMotion::Turn, -10.0, 10.0);
+        gizmo.axis = Dir3::Y;
+        gizmo.rest = 0.25;
+        for value in [0.25, 1.0, -2.5, 7.0] {
+            let body = Transform {
+                rotation: rest.rotation * Quat::from_axis_angle(Vec3::Y, value - gizmo.rest),
+                ..rest
+            };
+            let read = value_of(&gizmo, &rest, &body, value + 0.5);
+            assert!((read - value).abs() < 1e-4, "turn {value}: {read}");
+        }
+        let mut gizmo = joint(JointMotion::Slide, -1.0, 1.0);
+        gizmo.axis = Dir3::Z;
+        gizmo.rest = 0.1;
+        let body = Transform {
+            translation: rest.translation + rest.rotation * Vec3::Z * 0.3,
+            ..rest
+        };
+        let read = value_of(&gizmo, &rest, &body, 0.0);
+        assert!((read - 0.4).abs() < 1e-5, "slide: {read}");
+    }
+
     #[test]
     fn a_range_is_shifted_not_wrapped() {
         let range = ShownRange::of(Some((-1.0, 1.0)));

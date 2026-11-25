@@ -15,6 +15,16 @@
 //! - A **joint control** is keyed by its joint's value animatable, the key the
 //!   driver writes the joint under.
 //!
+//! **A drag reports a lifecycle a driver can build an edit on.** Each has one
+//! `start`, a `move` for each frame its value changes, and exactly one
+//! closing event: `end` when the pointer lets go, `cancel` when the drag is
+//! abandoned instead — by the host ([`GizmoDrags::cancel_drag`]), or by the
+//! control being removed, replaced, hidden or made not `interactive` while
+//! the button is down. Nothing follows the closing event. Every event of a
+//! drag carries the same `gesture`, a number each drag takes in turn, and
+//! the [`Modifiers`] the host says are held. A `cancel` carries no value: a
+//! driver drops what the drag previewed, and keeps nothing.
+//!
 //! Every host takes the same commands, through [`ControlCommands`], under the
 //! same rules, and reports the same events. What differs between hosts is
 //! told to this module rather than decided by it, in four places.
@@ -139,8 +149,8 @@
 //!   with no transform to set.
 //! - **A control that does not show takes no input.** Hidden by its driver
 //!   or by a ghosting, its gizmo takes no press from the frame after the one
-//!   it is hidden in, and a drag in hand ends, as one does when the control
-//!   is made not `interactive`. A press in the frame it is hidden in can
+//!   it is hidden in, and a drag in hand is cancelled, as one is when the
+//!   control is made not `interactive`. A press in the frame it is hidden in can
 //!   still be reported: a press with another button than the primary is
 //!   taken in `PreUpdate`, before this frame's commands, and so was made on
 //!   a control that showed when it was made. What the driver last asked of
@@ -190,8 +200,8 @@ use crate::ghost::Ghost;
 use crate::instance::{EntityInstance, InstanceIndex, InstanceSystems};
 use crate::joint_gizmo::{JointDrag, JointGizmo};
 use crate::transform_gizmo::{
-    current_global, DragPhase, GizmoDrag, GizmoHandle, GizmoPress, GizmoSize, GizmoSpace,
-    TransformGizmo, TransformGizmoSystems, TransformModes,
+    current_global, DragPhase, GizmoDrag, GizmoDrags, GizmoHandle, GizmoPress, GizmoSize,
+    GizmoSpace, TransformGizmo, TransformGizmoSystems, TransformModes,
 };
 
 /// A pose as a driver sees it: Z up, in metres, with the rotation as a
@@ -621,13 +631,16 @@ pub struct ControlSize {
     pub joint: Option<GizmoSize>,
 }
 
-/// Where a drag is.
+/// Where a drag is ([module docs](self)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Phase {
     Start,
     Move,
+    /// Finished: the pointer let go.
     End,
+    /// Abandoned: nothing of the drag is to be kept.
+    Cancel,
 }
 
 impl From<DragPhase> for Phase {
@@ -636,8 +649,23 @@ impl From<DragPhase> for Phase {
             DragPhase::Start => Self::Start,
             DragPhase::Move => Self::Move,
             DragPhase::End => Self::End,
+            DragPhase::Cancel => Self::Cancel,
         }
     }
+}
+
+/// The modifier keys held, as the host has them. The host says, from its
+/// own pointer or keyboard events, because the scene's view of the keyboard
+/// is stale whenever its canvas lacks focus. Stamped on every [`ControlEvent`]
+/// and given no meaning here: what a key changes about a drag is the
+/// driver's to decide.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Modifiers {
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+    pub ctrl: bool,
 }
 
 /// A drag on a control: what it asks its target to become. Nothing has moved;
@@ -647,13 +675,20 @@ impl From<DragPhase> for Phase {
 pub struct ControlEvent {
     pub key: String,
     pub phase: Phase,
-    /// A joint control's value.
+    /// The drag this belongs to: the same on every event of one drag, and
+    /// different from every other drag's in this app.
+    pub gesture: u32,
+    /// The modifier keys held when it was sent.
+    pub modifiers: Modifiers,
+    /// A joint control's value; none on a `cancel`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<f32>,
-    /// A transform control's target's pose, in the world.
+    /// A transform control's target's pose, in the world; none on a
+    /// `cancel`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pose: Option<Pose>,
-    /// A transform control's target's scale, along its own axes.
+    /// A transform control's target's scale, along its own axes; none on a
+    /// `cancel`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scale: Option<[f32; 3]>,
 }
@@ -661,6 +696,32 @@ pub struct ControlEvent {
 /// Drags since a host last drained them.
 #[derive(Resource, Default)]
 pub struct ControlEvents(pub Vec<ControlEvent>);
+
+/// The drag in hand on a control, from its `start` until its closing event:
+/// its key, its gesture and the gizmo it is on. Kept so a drag whose control
+/// is taken away — when there is no gizmo left to report it — still closes.
+#[derive(Resource, Default)]
+struct InHand(Option<(String, u32, Entity)>);
+
+impl InHand {
+    /// Notes an event reported for a control: a start puts its drag in hand,
+    /// and a closing event of the drag in hand lets it go.
+    fn note(&mut self, event: &ControlEvent, gizmo: Entity) {
+        match event.phase {
+            Phase::Start => self.0 = Some((event.key.clone(), event.gesture, gizmo)),
+            Phase::Move => {}
+            Phase::End | Phase::Cancel => {
+                if self
+                    .0
+                    .as_ref()
+                    .is_some_and(|(_, gesture, _)| *gesture == event.gesture)
+                {
+                    self.0 = None;
+                }
+            }
+        }
+    }
+}
 
 /// The button of a press on a control that is the host's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -846,6 +907,9 @@ impl Plugin for ControlsPlugin {
         app.add_plugins(crate::instance::InstancePlugin);
         app.init_resource::<ControlCommands>()
             .init_resource::<ControlEvents>()
+            .init_resource::<InHand>()
+            .init_resource::<Modifiers>()
+            .init_resource::<GizmoDrags>()
             .init_resource::<ControlPresses>()
             .init_resource::<Controls>()
             .init_resource::<DefaultDriverFrame>()
@@ -911,6 +975,14 @@ impl Plugin for ControlsPlugin {
                     (fade, take_input_only_while_shown)
                         .chain()
                         .in_set(ControlSystems::Fade),
+                    // After the commands and the fade, which take controls
+                    // away and forget them, and before the gizmos' own
+                    // pointer handling, which lets go of a drag whose gizmo
+                    // is gone without a word and could start another in the
+                    // same frame.
+                    cancel_taken_away
+                        .after(ControlSystems::Fade)
+                        .before(TransformGizmoSystems),
                 ),
             )
             .add_observer(report_transform_drag)
@@ -1948,12 +2020,20 @@ fn report_transform_drag(
     globals: Query<&GlobalTransform>,
     app_frame: Res<DefaultDriverFrame>,
     frames: Query<&DriverFrame>,
+    modifiers: Res<Modifiers>,
+    mut in_hand: ResMut<InHand>,
     mut events: ResMut<ControlEvents>,
 ) {
     let Ok(gizmo) = gizmos.get(drag.entity) else {
         return;
     };
     if !controls.owns(&gizmo.key, drag.entity) {
+        return;
+    }
+    if drag.phase == DragPhase::Cancel {
+        let event = cancelled(&gizmo.key, drag.gesture, *modifiers);
+        in_hand.note(&event, drag.entity);
+        events.0.push(event);
         return;
     }
     // The drag gives the target's transform in its parent's frame, and the
@@ -1970,16 +2050,52 @@ fn report_transform_drag(
         Some(parent) => Transform::from_matrix((parent * drag.transform.compute_affine()).into()),
         None => drag.transform,
     };
-    events.0.push(ControlEvent {
+    let event = ControlEvent {
         key: gizmo.key.clone(),
         phase: drag.phase.into(),
+        gesture: drag.gesture,
+        modifiers: *modifiers,
         value: None,
         pose: Some(Pose::from_world(
             &world,
             &DriverFrame::of(gizmo.camera, &frames, &app_frame),
         )),
         scale: Some(drag.transform.scale.to_array()),
-    });
+    };
+    in_hand.note(&event, drag.entity);
+    events.0.push(event);
+}
+
+/// The closing event of a drag abandoned on the control under `key`.
+fn cancelled(key: &str, gesture: u32, modifiers: Modifiers) -> ControlEvent {
+    ControlEvent {
+        key: key.to_owned(),
+        phase: Phase::Cancel,
+        gesture,
+        modifiers,
+        value: None,
+        pose: None,
+        scale: None,
+    }
+}
+
+/// Cancels the drag in hand on a control that has been taken away — removed,
+/// replaced under its key, or forgotten with its instance — since its gizmo
+/// is gone and can report nothing.
+fn cancel_taken_away(
+    controls: Res<Controls>,
+    modifiers: Res<Modifiers>,
+    mut in_hand: ResMut<InHand>,
+    mut events: ResMut<ControlEvents>,
+) {
+    let Some((key, gesture, gizmo)) = &in_hand.0 else {
+        return;
+    };
+    if controls.owns(key, *gizmo) {
+        return;
+    }
+    events.0.push(cancelled(key, *gesture, *modifiers));
+    in_hand.0 = None;
 }
 
 fn report_press(
@@ -2017,6 +2133,8 @@ fn report_joint_drag(
     drag: On<JointDrag>,
     controls: Res<Controls>,
     gizmos: Query<&JointGizmo>,
+    modifiers: Res<Modifiers>,
+    mut in_hand: ResMut<InHand>,
     mut events: ResMut<ControlEvents>,
 ) {
     let Ok(gizmo) = gizmos.get(drag.entity) else {
@@ -2025,13 +2143,21 @@ fn report_joint_drag(
     if !controls.owns(&gizmo.key, drag.entity) {
         return;
     }
-    events.0.push(ControlEvent {
-        key: gizmo.key.clone(),
-        phase: drag.phase.into(),
-        value: Some(drag.value),
-        pose: None,
-        scale: None,
-    });
+    let event = if drag.phase == DragPhase::Cancel {
+        cancelled(&gizmo.key, drag.gesture, *modifiers)
+    } else {
+        ControlEvent {
+            key: gizmo.key.clone(),
+            phase: drag.phase.into(),
+            gesture: drag.gesture,
+            modifiers: *modifiers,
+            value: Some(drag.value),
+            pose: None,
+            scale: None,
+        }
+    };
+    in_hand.note(&event, drag.entity);
+    events.0.push(event);
 }
 
 #[cfg(test)]
@@ -2346,6 +2472,7 @@ mod tests {
             entity: gizmo,
             target: body,
             phase: DragPhase::Move,
+            gesture: 0,
             value: 0.3,
         });
         let events = events(&mut app);
@@ -2499,6 +2626,7 @@ mod tests {
             target: goal,
             handle: GizmoHandle::Arrow(2),
             phase: DragPhase::End,
+            gesture: 0,
             transform: asked,
         });
         let events = events(&mut app);
@@ -2813,6 +2941,78 @@ mod tests {
 
     fn red() -> Color {
         Srgba::hex("#ff0000").unwrap().into()
+    }
+
+    fn drag_goal(app: &mut App, gizmo: Entity, phase: DragPhase, gesture: u32) {
+        let target = app.world().get::<TransformGizmo>(gizmo).unwrap().target;
+        app.world_mut().trigger(GizmoDrag {
+            entity: gizmo,
+            target,
+            handle: GizmoHandle::Arrow(0),
+            phase,
+            gesture,
+            transform: Transform::default(),
+        });
+    }
+
+    /// A drag in hand on a control that is removed, or replaced under its
+    /// key, closes with one `cancel` under its key and gesture, carrying the
+    /// modifiers held and no value. A drag that has already closed sends
+    /// nothing more when its control goes.
+    #[test]
+    fn a_drag_on_a_control_taken_away_is_cancelled() {
+        let (mut app, body) = scene();
+        robot(&mut app, body);
+        app.world_mut().resource_mut::<Modifiers>().shift = true;
+        let cancel = |gesture| ControlEvent {
+            key: "goal".into(),
+            phase: Phase::Cancel,
+            gesture,
+            modifiers: Modifiers {
+                shift: true,
+                ..default()
+            },
+            value: None,
+            pose: None,
+            scale: None,
+        };
+        for replace in [false, true] {
+            let gizmo = add_goal(&mut app, "goal", None);
+            drag_goal(&mut app, gizmo, DragPhase::Start, 7);
+            let started = events(&mut app);
+            assert_eq!(started.len(), 1);
+            assert_eq!((started[0].phase, started[0].gesture), (Phase::Start, 7));
+            assert!(started[0].modifiers.shift, "the modifiers held");
+
+            if replace {
+                send(&mut app, add("goal", goal_at([1.0, 0.0, 1.0])));
+            } else {
+                send(&mut app, ControlCommand::Remove { key: "goal".into() });
+            }
+            assert_eq!(events(&mut app), [cancel(7)], "replaced: {replace}");
+            app.update();
+            assert!(events(&mut app).is_empty(), "closed once");
+            if replace {
+                send(&mut app, ControlCommand::Remove { key: "goal".into() });
+            }
+        }
+
+        // Cancelled by its gizmo: no value, and nothing more when it goes.
+        let gizmo = add_goal(&mut app, "goal", None);
+        drag_goal(&mut app, gizmo, DragPhase::Start, 8);
+        drag_goal(&mut app, gizmo, DragPhase::Cancel, 8);
+        let sent = events(&mut app);
+        assert_eq!(sent.last(), Some(&cancel(8)));
+        send(&mut app, ControlCommand::Remove { key: "goal".into() });
+        assert!(events(&mut app).is_empty(), "already closed");
+
+        // Ended: nothing more when it goes.
+        let gizmo = add_goal(&mut app, "goal", None);
+        drag_goal(&mut app, gizmo, DragPhase::Start, 9);
+        drag_goal(&mut app, gizmo, DragPhase::End, 9);
+        events(&mut app);
+        send(&mut app, ControlCommand::Remove { key: "goal".into() });
+        assert!(events(&mut app).is_empty(), "already ended");
     }
 
     /// A transform control keeps its arrows on the positive side unless
@@ -3783,6 +3983,7 @@ mod tests {
                 target,
                 handle: GizmoHandle::Arrow(2),
                 phase: DragPhase::End,
+                gesture: 0,
                 transform,
             });
         }
@@ -4790,6 +4991,7 @@ mod tests {
                 target: body,
                 handle: GizmoHandle::Arrow(0),
                 phase: DragPhase::Move,
+                gesture: 0,
                 transform: Transform::default(),
             });
             app.world_mut().trigger(GizmoPress {
@@ -4819,6 +5021,7 @@ mod tests {
             entity: joint,
             target: body,
             phase: DragPhase::Move,
+            gesture: 0,
             value: 0.5,
         });
         let events = events(&mut app);
@@ -4929,6 +5132,7 @@ mod tests {
             target: face,
             handle: GizmoHandle::Arrow(0),
             phase: DragPhase::End,
+            gesture: 0,
             transform: Transform::default(),
         });
         let pose = events(&mut app)[0].pose.unwrap();

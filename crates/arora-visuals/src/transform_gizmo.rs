@@ -82,8 +82,8 @@ use bevy::shader::ShaderRef;
 
 use crate::axis_line::{AxisLine, AxisLinePlugin, AxisLineSystems};
 use crate::joint_gizmo::{
-    distance as joint_distance, dragged, reach as joint_reach, take, JointDrag, JointGizmo,
-    JointHeld, JointReach, Rest,
+    distance as joint_distance, dragged, reach as joint_reach, take, value_of, JointDrag,
+    JointGizmo, JointHeld, JointReach, Rest,
 };
 use crate::pick::on_the_scene;
 
@@ -307,12 +307,20 @@ impl GizmoHandle {
     ];
 }
 
-/// Where a drag is.
+/// Where a drag is. Every drag has one `Start`, a `Move` for each frame its
+/// value changes, and then exactly one of `End` or `Cancel`, and nothing after
+/// it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DragPhase {
     Start,
     Move,
+    /// The pointer let go: the drag is finished, at its last value.
     End,
+    /// The drag was abandoned rather than finished: a host cancelled it
+    /// ([`GizmoDrags::cancel_drag`]) or its gizmo went inert with the
+    /// button still down. A gizmo that moves its target itself puts the
+    /// target back where the drag found it.
+    Cancel,
 }
 
 /// A drag on a gizmo's handle, triggered on the gizmo.
@@ -323,7 +331,11 @@ pub struct GizmoDrag {
     pub target: Entity,
     pub handle: GizmoHandle,
     pub phase: DragPhase,
-    /// The target's local transform as the drag has it now.
+    /// The drag this belongs to, the same on all of its events
+    /// ([`GizmoDrags`] numbers them).
+    pub gesture: u32,
+    /// The target's local transform as the drag has it now; on a `Cancel`,
+    /// as the drag found it.
     pub transform: Transform,
 }
 
@@ -356,6 +368,16 @@ pub struct GizmoPointer {
     /// How far the transform gizmo's drag in hand has gone, in its handle's
     /// own measure ([`Reading`]); empty when no transform handle is held.
     pub readings: Vec<Reading>,
+}
+
+/// The numbering of drags, and a host's way to abandon the one in hand.
+#[derive(Resource, Default, Debug)]
+pub struct GizmoDrags {
+    /// The number the next drag takes: each drag, of either kind of gizmo,
+    /// takes the next, so a host can tell one drag's events from another's.
+    next_gesture: u32,
+    /// Whether a host has asked for the drag in hand to be cancelled.
+    cancel: bool,
 }
 
 /// One amount a held handle has moved its target by, for a host to show
@@ -445,6 +467,25 @@ impl GizmoPointer {
     /// gesture of the view's starts from it.
     pub fn owns_button(&self) -> bool {
         self.dragging.is_some() || self.ended.is_some()
+    }
+}
+
+impl GizmoDrags {
+    /// Abandons the drag in hand, if there is one, at the start of the next
+    /// frame's drag handling: it closes with [`DragPhase::Cancel`], and
+    /// nothing more is sent for it — the button later coming up included,
+    /// which is not taken for a click either. A host calls this for what the
+    /// scene cannot see for itself: Escape, the window losing focus, the
+    /// pointer being cancelled, the page being hidden. Asked between frames,
+    /// it takes effect before anything else happens to the drag.
+    pub fn cancel_drag(&mut self) {
+        self.cancel = true;
+    }
+
+    fn take_gesture(&mut self) -> u32 {
+        let gesture = self.next_gesture;
+        self.next_gesture = self.next_gesture.wrapping_add(1);
+        gesture
     }
 }
 
@@ -590,6 +631,7 @@ struct Built {
 struct Drag {
     gizmo: Entity,
     handle: GizmoHandle,
+    gesture: u32,
     /// The gizmo's origin and axes when the drag began.
     origin: Vec3,
     axes: Quat,
@@ -653,6 +695,7 @@ impl Plugin for TransformGizmoPlugin {
         add_handle_material(app);
         app.add_plugins(AxisLinePlugin);
         app.init_resource::<GizmoPointer>()
+            .init_resource::<GizmoDrags>()
             .init_resource::<PressedScene>()
             .add_observer(note_scene_press)
             .add_observer(report_other_press)
@@ -1189,7 +1232,12 @@ fn axis_vector(axis: usize) -> Vec3 {
 #[derive(Clone, Copy)]
 enum Held {
     Transform(Drag),
-    Joint(JointHeld),
+    Joint {
+        grip: JointHeld,
+        gesture: u32,
+        /// The joint's value when the drag began.
+        start: f32,
+    },
 }
 
 /// A handle under the pointer, of either kind of gizmo, with what taking it
@@ -1414,6 +1462,7 @@ fn drive(
     primary: Query<Entity, With<bevy::window::PrimaryWindow>>,
     buttons: Res<ButtonInput<MouseButton>>,
     mut pointer: ResMut<GizmoPointer>,
+    mut drags: ResMut<GizmoDrags>,
     mut pressed_scene: ResMut<PressedScene>,
     mut held: Local<Option<Held>>,
 ) {
@@ -1453,24 +1502,50 @@ fn drive(
         pointer.ended = None;
     }
 
+    // A host's cancel, asked between frames, is seen before the button is:
+    // a drag cancelled sends nothing more, its release included.
+    let cancel = std::mem::take(&mut drags.cancel);
     match *held {
         Some(Held::Transform(drag)) => {
             // A gizmo taken away mid-drag lets go as one gone inert does, so
-            // its release is no click either. There is no gizmo left to
-            // trigger an `End` on; whoever took it away knows.
+            // its release is no click. There is no gizmo left to trigger a
+            // `Cancel` on; the controls close such a drag for their own.
             let Ok((_, gizmo, ..)) = gizmos.get(drag.gizmo) else {
                 *held = None;
                 pointer.readings.clear();
                 let_go(&mut pointer, button_up, false);
                 return;
             };
-            // Going inert ends a drag at once; only the button coming up
-            // ends what the pointer is doing (see `button_up`).
-            let released = button_up || !gizmo.interactive;
+            // Going inert with the button down abandons the drag; only the
+            // button coming up ends what the pointer is doing (see
+            // `button_up`).
+            if cancel || (!gizmo.interactive && !button_up) {
+                if gizmo.apply {
+                    if let Ok(mut transform) = locals.get_mut(gizmo.target) {
+                        if *transform != drag.start_local {
+                            *transform = drag.start_local;
+                        }
+                    }
+                }
+                commands.trigger(GizmoDrag {
+                    entity: drag.gizmo,
+                    target: gizmo.target,
+                    handle: drag.handle,
+                    phase: DragPhase::Cancel,
+                    gesture: drag.gesture,
+                    transform: drag.start_local,
+                });
+                *held = None;
+                pointer.readings.clear();
+                let_go(&mut pointer, button_up, gizmo.interactive);
+                return;
+            }
+            let released = button_up;
             let moved = ray_through(gizmo.camera).and_then(|ray| dragged_to(&drag, ray));
+            let mut last = drag.last;
             if let Some(moved) = moved {
                 pointer.readings = readings(&drag, &moved);
-                let local = match moved {
+                last = match moved {
                     Moved::World(global) => {
                         // Against the parent as it stands now, not as last
                         // propagated: a parent moved this frame would put the
@@ -1501,66 +1576,95 @@ fn drive(
                 };
                 if gizmo.apply {
                     if let Ok(mut transform) = locals.get_mut(gizmo.target) {
-                        *transform = local;
+                        *transform = last;
                     }
                 }
+            }
+            // A move is sent only when the target would move: each asks a
+            // host to show the drag afresh.
+            let phase = if released {
+                Some(DragPhase::End)
+            } else {
+                (last != drag.last).then_some(DragPhase::Move)
+            };
+            if let Some(phase) = phase {
                 commands.trigger(GizmoDrag {
                     entity: drag.gizmo,
                     target: gizmo.target,
                     handle: drag.handle,
-                    phase: if released {
-                        DragPhase::End
-                    } else {
-                        DragPhase::Move
-                    },
-                    transform: local,
-                });
-                *held = Some(Held::Transform(Drag {
-                    last: local,
-                    ..drag
-                }));
-            } else if released {
-                commands.trigger(GizmoDrag {
-                    entity: drag.gizmo,
-                    target: gizmo.target,
-                    handle: drag.handle,
-                    phase: DragPhase::End,
-                    transform: drag.last,
+                    phase,
+                    gesture: drag.gesture,
+                    transform: last,
                 });
             }
             if released {
                 *held = None;
                 pointer.readings.clear();
                 let_go(&mut pointer, button_up, gizmo.interactive);
+            } else {
+                *held = Some(Held::Transform(Drag { last, ..drag }));
             }
             return;
         }
-        Some(Held::Joint(grip)) => {
+        Some(Held::Joint {
+            grip,
+            gesture,
+            start,
+        }) => {
             // Taken away mid-drag: as for a transform gizmo, above.
-            let Ok((_, mut gizmo, ..)) = joints.get_mut(grip.gizmo) else {
+            let Ok((_, mut gizmo, rest, _)) = joints.get_mut(grip.gizmo) else {
                 *held = None;
                 let_go(&mut pointer, button_up, false);
                 return;
             };
-            // Going inert ends a drag at once; only the button coming up
-            // ends what the pointer is doing (see `button_up`).
-            let released = button_up || !gizmo.interactive;
-            let value = ray_through(gizmo.camera).and_then(|ray| dragged(&gizmo, &grip, ray));
-            if let Some(value) = value {
-                if gizmo.value != value {
-                    gizmo.value = value;
-                }
-            }
-            commands.trigger(JointDrag {
-                entity: grip.gizmo,
-                target: gizmo.target,
-                phase: if released {
-                    DragPhase::End
+            if cancel || (!gizmo.interactive && !button_up) {
+                // Back to the value the joint stands at without the drag. A
+                // gizmo that poses its body itself left it where the drag
+                // began; otherwise the body stands wherever its host last
+                // put it, which a host may have moved on since the drag
+                // began, so it is read from the body rather than taken from
+                // the start.
+                let back = if gizmo.apply {
+                    start
                 } else {
-                    DragPhase::Move
-                },
-                value: gizmo.value,
-            });
+                    rest.filter(|rest| rest.1 == gizmo.target)
+                        .zip(locals.get(gizmo.target).ok())
+                        .map_or(start, |(rest, body)| value_of(&gizmo, &rest.0, body, start))
+                };
+                if gizmo.value != back {
+                    gizmo.value = back;
+                }
+                commands.trigger(JointDrag {
+                    entity: grip.gizmo,
+                    target: gizmo.target,
+                    phase: DragPhase::Cancel,
+                    gesture,
+                    value: back,
+                });
+                *held = None;
+                let_go(&mut pointer, button_up, gizmo.interactive);
+                return;
+            }
+            let released = button_up;
+            let value = ray_through(gizmo.camera).and_then(|ray| dragged(&gizmo, &grip, ray));
+            let changed = value.is_some_and(|value| value != gizmo.value);
+            if let Some(value) = value.filter(|_| changed) {
+                gizmo.value = value;
+            }
+            let phase = if released {
+                Some(DragPhase::End)
+            } else {
+                changed.then_some(DragPhase::Move)
+            };
+            if let Some(phase) = phase {
+                commands.trigger(JointDrag {
+                    entity: grip.gizmo,
+                    target: gizmo.target,
+                    phase,
+                    gesture,
+                    value: gizmo.value,
+                });
+            }
             if released {
                 *held = None;
                 let_go(&mut pointer, button_up, gizmo.interactive);
@@ -1614,9 +1718,11 @@ fn drive(
             let Some(grabbed) = meet_plane(ray, plane, place.origin) else {
                 return;
             };
+            let gesture = drags.take_gesture();
             *held = Some(Held::Transform(Drag {
                 gizmo: entity,
                 handle,
+                gesture,
                 origin: place.origin,
                 axes: place.axes,
                 stretch_along: nearest_component(start_global.rotation(), axis),
@@ -1631,6 +1737,7 @@ fn drive(
                 target: gizmo.target,
                 handle,
                 phase: DragPhase::Start,
+                gesture,
                 transform: *start_local,
             });
         }
@@ -1641,11 +1748,17 @@ fn drive(
             let Some(grip) = take(entity, gizmo, &reach, ray) else {
                 return;
             };
-            *held = Some(Held::Joint(grip));
+            let gesture = drags.take_gesture();
+            *held = Some(Held::Joint {
+                grip,
+                gesture,
+                start: gizmo.value,
+            });
             commands.trigger(JointDrag {
                 entity,
                 target: gizmo.target,
                 phase: DragPhase::Start,
+                gesture,
                 value: gizmo.value,
             });
         }
@@ -1940,6 +2053,10 @@ mod tests {
     #[derive(Resource, Default)]
     struct Phases(Vec<DragPhase>);
 
+    /// The gesture of every drag event, in the same order.
+    #[derive(Resource, Default)]
+    struct Gestures(Vec<u32>);
+
     /// A world that runs only [`drive`]: a target at the origin seen square
     /// on by a camera drawing 400 pixels a side, a window to carry the
     /// cursor, and the gizmo `spawn` makes for the target and camera. The
@@ -1953,13 +2070,25 @@ mod tests {
             .init_resource::<ButtonInput<MouseButton>>()
             .init_resource::<GizmoPointer>()
             .init_resource::<PressedScene>()
+            .init_resource::<GizmoDrags>()
             .init_resource::<Phases>()
-            .add_observer(|drag: On<GizmoDrag>, mut phases: ResMut<Phases>| {
-                phases.0.push(drag.phase)
-            })
-            .add_observer(|drag: On<JointDrag>, mut phases: ResMut<Phases>| {
-                phases.0.push(drag.phase)
-            })
+            .init_resource::<Gestures>()
+            .add_observer(
+                |drag: On<GizmoDrag>,
+                 mut phases: ResMut<Phases>,
+                 mut gestures: ResMut<Gestures>| {
+                    phases.0.push(drag.phase);
+                    gestures.0.push(drag.gesture);
+                },
+            )
+            .add_observer(
+                |drag: On<JointDrag>,
+                 mut phases: ResMut<Phases>,
+                 mut gestures: ResMut<Gestures>| {
+                    phases.0.push(drag.phase);
+                    gestures.0.push(drag.gesture);
+                },
+            )
             .add_systems(Update, drive);
         let world = app.world_mut();
         let window = world.spawn(Window::default()).id();
@@ -1994,12 +2123,6 @@ mod tests {
         (app, window, gizmo)
     }
 
-    /// A gizmo made inert part way through a drag ends that drag at once,
-    /// with one `End` and nothing after it while the button stays down.
-    /// Nothing is held after it, so the overlay and the guides let go, but
-    /// the button stays the gizmo's until it comes up, which is what keeps a
-    /// pick on the release from taking it for a click on the scene. Made
-    /// interactive again, the gizmo takes a fresh press.
     /// A gizmo seen through a camera drawing into an image — a screen's
     /// texture — is nowhere on the window, so the cursor there finds none of
     /// its handles, wherever they project to.
@@ -2031,9 +2154,31 @@ mod tests {
         assert!(!under_cursor(true));
     }
 
-    fn inert_mid_drag(
+    /// How a test abandons a drag in hand.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Abandon {
+        /// The gizmo is made inert.
+        Inert,
+        /// The host cancels it.
+        Host,
+    }
+
+    /// A drag abandoned part way through — its gizmo made inert, or
+    /// cancelled by its host — closes at once with one `Cancel`, puts a target
+    /// the gizmo moves back where the drag found it, and sends nothing after
+    /// it while the button stays down, nor when it comes up. Nothing is held
+    /// after it, so the overlay and the guides let go, but the button stays
+    /// the gizmo's until it comes up, which is what keeps a pick on the
+    /// release from taking it for a click on the scene. A fresh press starts
+    /// a drag with a gesture of its own. Holding still sends no move.
+    ///
+    /// `at_start` says whether the gizmo's target stands where the drag found
+    /// it.
+    fn abandoned_mid_drag(
         spawn: impl FnOnce(&mut World, Entity, Entity) -> Entity,
         set_interactive: fn(&mut World, Entity, bool),
+        at_start: fn(&World, Entity) -> bool,
+        how: Abandon,
     ) {
         let (mut app, window, gizmo) = driving(spawn);
         let point_at = |app: &mut App, at: Vec2| {
@@ -2073,23 +2218,41 @@ mod tests {
         press(&mut app);
         assert_eq!(phases(&app), [DragPhase::Start]);
         assert!(pointer(&app).1.is_some(), "the drag is the pointer's");
+        point_at(&mut app, spot);
+        point_at(&mut app, spot);
+        assert_eq!(phases(&app), [DragPhase::Start], "no move while held still");
         point_at(&mut app, spot + Vec2::new(4.0, -3.0));
+        assert_eq!(phases(&app).last(), Some(&DragPhase::Move));
+        assert!(!at_start(app.world(), gizmo), "the drag moved its target");
 
-        set_interactive(app.world_mut(), gizmo, false);
+        match how {
+            Abandon::Inert => set_interactive(app.world_mut(), gizmo, false),
+            Abandon::Host => app.world_mut().resource_mut::<GizmoDrags>().cancel_drag(),
+        }
         app.update();
+        let (hovered, dragging, owned) = pointer(&app);
         assert_eq!(
-            pointer(&app),
-            (None, None, true),
-            "in the frame it ends: neither hovered nor held, the button still the gizmo's"
+            (dragging, owned),
+            (None, true),
+            "in the frame it ends: not held, the button still the gizmo's"
         );
+        if how == Abandon::Inert {
+            assert_eq!(hovered, None, "an inert gizmo is under the pointer no more");
+        }
         let ended = phases(&app);
-        assert_eq!(ended.last(), Some(&DragPhase::End), "{ended:?}");
-        assert_eq!(
-            ended
-                .iter()
-                .filter(|&&phase| phase == DragPhase::End)
-                .count(),
-            1
+        assert_eq!(ended.last(), Some(&DragPhase::Cancel), "{ended:?}");
+        assert!(
+            !ended.contains(&DragPhase::End),
+            "abandoned, not finished: {ended:?}"
+        );
+        assert!(
+            at_start(app.world(), gizmo),
+            "put back where the drag found it"
+        );
+        let gestures = app.world().resource::<Gestures>().0.clone();
+        assert!(
+            gestures.iter().all(|&gesture| gesture == gestures[0]),
+            "one drag, one gesture: {gestures:?}"
         );
         for at in [Vec2::new(8.0, -6.0), Vec2::ZERO, Vec2::new(-5.0, 2.0)] {
             point_at(&mut app, spot + at);
@@ -2103,15 +2266,20 @@ mod tests {
         app.update();
         buttons(&mut app).clear();
         assert_eq!(phases(&app), ended, "the release ends nothing more");
-        assert_eq!(pointer(&app), (None, None, false), "inert, and let go");
+        assert_eq!(pointer(&app).1, None);
+        assert!(!pointer(&app).2, "let go");
 
-        set_interactive(app.world_mut(), gizmo, true);
+        if how == Abandon::Inert {
+            set_interactive(app.world_mut(), gizmo, true);
+        }
         point_at(&mut app, spot);
-        assert!(pointer(&app).0.is_some(), "live again under the cursor");
+        assert!(pointer(&app).0.is_some(), "live under the cursor");
         press(&mut app);
         let again = phases(&app);
         assert_eq!(again.len(), ended.len() + 1);
         assert_eq!(again.last(), Some(&DragPhase::Start), "a fresh drag");
+        let fresh = *app.world().resource::<Gestures>().0.last().unwrap();
+        assert_ne!(fresh, gestures[0], "a gesture of its own");
 
         // An ordinary release frees the button in the frame it comes up, so
         // the very next press can be the view's.
@@ -2166,8 +2334,14 @@ mod tests {
             pointer.readings
         );
 
+        let sent = app.world().resource::<Phases>().0.len();
         app.world_mut().despawn(gizmo);
         app.update();
+        assert_eq!(
+            app.world().resource::<Phases>().0.len(),
+            sent,
+            "nothing is left to report on; the controls close such a drag"
+        );
         let pointer = app.world().resource::<GizmoPointer>();
         assert_eq!((pointer.hovered, pointer.dragging), (None, None));
         assert!(pointer.readings.is_empty(), "nothing left to read");
@@ -2278,39 +2452,120 @@ mod tests {
         );
     }
 
+    fn transform_gizmo(world: &mut World, target: Entity, camera: Entity) -> Entity {
+        world
+            .spawn(TransformGizmo::new(target, camera))
+            .insert(Facing(Vec3::ONE))
+            .id()
+    }
+
+    fn transform_at_start(world: &World, gizmo: Entity) -> bool {
+        let target = world.get::<TransformGizmo>(gizmo).unwrap().target;
+        *world.get::<Transform>(target).unwrap() == Transform::IDENTITY
+    }
+
+    fn joint_gizmo(world: &mut World, target: Entity, camera: Entity) -> Entity {
+        world
+            .spawn(JointGizmo::new(
+                target,
+                camera,
+                crate::joint_gizmo::JointMotion::Turn,
+                Dir3::Z,
+                -3.0,
+                3.0,
+                0.0,
+                Color::WHITE,
+            ))
+            .insert(crate::joint_gizmo::Rest(Transform::IDENTITY, target))
+            .id()
+    }
+
+    fn joint_at_start(world: &World, gizmo: Entity) -> bool {
+        world.get::<JointGizmo>(gizmo).unwrap().value == 0.0
+    }
+
     #[test]
-    fn a_transform_gizmo_made_inert_mid_drag_ends_it_and_keeps_the_release() {
-        inert_mid_drag(
-            |world, target, camera| {
-                world
-                    .spawn(TransformGizmo::new(target, camera))
-                    .insert(Facing(Vec3::ONE))
-                    .id()
-            },
+    fn a_transform_gizmo_made_inert_mid_drag_cancels_it_and_keeps_the_release() {
+        abandoned_mid_drag(
+            transform_gizmo,
             |world, gizmo, on| world.get_mut::<TransformGizmo>(gizmo).unwrap().interactive = on,
+            transform_at_start,
+            Abandon::Inert,
         );
     }
 
     #[test]
-    fn a_joint_gizmo_made_inert_mid_drag_ends_it_and_keeps_the_release() {
-        inert_mid_drag(
-            |world, target, camera| {
-                world
-                    .spawn(JointGizmo::new(
-                        target,
-                        camera,
-                        crate::joint_gizmo::JointMotion::Turn,
-                        Dir3::Z,
-                        -3.0,
-                        3.0,
-                        0.0,
-                        Color::WHITE,
-                    ))
-                    .insert(crate::joint_gizmo::Rest(Transform::IDENTITY, target))
-                    .id()
-            },
+    fn a_joint_gizmo_made_inert_mid_drag_cancels_it_and_keeps_the_release() {
+        abandoned_mid_drag(
+            joint_gizmo,
             |world, gizmo, on| world.get_mut::<JointGizmo>(gizmo).unwrap().interactive = on,
+            joint_at_start,
+            Abandon::Inert,
         );
+    }
+
+    #[test]
+    fn a_transform_drag_its_host_cancels_closes_once_and_keeps_the_release() {
+        abandoned_mid_drag(
+            transform_gizmo,
+            |world, gizmo, on| world.get_mut::<TransformGizmo>(gizmo).unwrap().interactive = on,
+            transform_at_start,
+            Abandon::Host,
+        );
+    }
+
+    #[test]
+    fn a_joint_drag_its_host_cancels_closes_once_and_keeps_the_release() {
+        abandoned_mid_drag(
+            joint_gizmo,
+            |world, gizmo, on| world.get_mut::<JointGizmo>(gizmo).unwrap().interactive = on,
+            joint_at_start,
+            Abandon::Host,
+        );
+    }
+
+    /// A joint gizmo that leaves its body to its host goes back, on a cancel,
+    /// to where the body stands — the value its host last wrote, which may
+    /// have moved on since the drag began — not to the drag's start.
+    #[test]
+    fn a_cancelled_joint_shows_what_its_host_last_wrote() {
+        let (mut app, window, gizmo) = driving(|world, target, camera| {
+            let gizmo = joint_gizmo(world, target, camera);
+            world.get_mut::<JointGizmo>(gizmo).unwrap().apply = false;
+            gizmo
+        });
+        let point_at = |app: &mut App, at: Vec2| {
+            let mut cursor = app.world_mut().get_mut::<Window>(window).unwrap();
+            cursor.set_cursor_position(Some(at));
+            app.update();
+        };
+        let spot = (0..200)
+            .map(|x| Vec2::new(200.0 + x as f32, 200.0))
+            .find(|&at| {
+                point_at(&mut app, at);
+                app.world().resource::<GizmoPointer>().hovered.is_some()
+            })
+            .expect("the ring on the row through the target");
+        app.world_mut().resource_mut::<PressedScene>().0 = true;
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .press(MouseButton::Left);
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear();
+        point_at(&mut app, spot + Vec2::new(-30.0, 20.0));
+        let dragged = app.world().get::<JointGizmo>(gizmo).unwrap().value;
+        assert!(dragged != 0.0, "the drag turned the joint");
+
+        // The host previews a value of its own on the body.
+        let target = app.world().get::<JointGizmo>(gizmo).unwrap().target;
+        *app.world_mut().get_mut::<Transform>(target).unwrap() =
+            Transform::from_rotation(Quat::from_rotation_z(0.7));
+        app.world_mut().resource_mut::<GizmoDrags>().cancel_drag();
+        app.update();
+        let value = app.world().get::<JointGizmo>(gizmo).unwrap().value;
+        assert!((value - 0.7).abs() < 1e-5, "{value}");
     }
 
     /// A press with a button other than the primary on a handle is the
@@ -2587,6 +2842,7 @@ mod tests {
         Drag {
             gizmo: Entity::PLACEHOLDER,
             handle,
+            gesture: 0,
             origin: Vec3::ZERO,
             axes: Quat::IDENTITY,
             stretch_along: axis_vector(handle.axis()),
